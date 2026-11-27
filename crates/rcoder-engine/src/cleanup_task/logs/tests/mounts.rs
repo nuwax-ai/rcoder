@@ -311,11 +311,7 @@ async fn a_directory_registered_after_the_inventory_is_still_kept() {
     let orphan = aged_dir(temp_dir.path(), "runner-gone-20261029035324", 15);
     std::fs::write(reused.join("keep.log"), b"still bound").unwrap();
     let old_time = std::time::SystemTime::now() - Duration::from_secs(15 * 24 * 60 * 60);
-    std::fs::set_times(
-        &reused,
-        std::fs::FileTimes::new().set_modified(old_time),
-    )
-    .unwrap();
+    std::fs::set_times(&reused, std::fs::FileTimes::new().set_modified(old_time)).unwrap();
     let inventory = FakeInventory::new(&[]);
     // 清单读不到它：创建方登记在清理器取完清单之后
     inventory.refuse_reclaim(&reused);
@@ -329,10 +325,7 @@ async fn a_directory_registered_after_the_inventory_is_still_kept() {
         reused.exists(),
         "a directory a starting container registered after the inventory must be kept"
     );
-    assert!(
-        !orphan.exists(),
-        "a decidable orphan is still reclaimed"
-    );
+    assert!(!orphan.exists(), "a decidable orphan is still reclaimed");
     assert_eq!(stats.dirs_deleted, 1);
     assert_eq!(stats.dirs_skipped_in_use, 1);
     assert!(

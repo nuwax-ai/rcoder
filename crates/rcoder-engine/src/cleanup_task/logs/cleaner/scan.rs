@@ -1,6 +1,6 @@
 //! 初次扫描：列日志根的第一层，读每个条目的 metadata，认出已经过期的目录和文件。扫描里
-//! **只读不删**，删除在 [`LogCleaner::reclaim_expired_dirs`] 和
-//! [`LogCleaner::delete_expired_files`]。
+//! **只读不删**：目录在 `LogCleaner::reclaim_expired_dirs` 里回收，文件在
+//! `LogCleaner::delete_expired_files` 里删。
 //!
 //! 整个扫描有限时（[`LogCleaner::cleanup_once`]），单个条目也有限时
 //! （[`SCAN_ENTRY_TIMEOUT`]）：一个条目的 metadata 一直读不回来，记一轮、跳过它，继续扫
@@ -29,8 +29,8 @@ pub(super) const SCAN_ENTRY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) struct Scanned {
     /// 确认已过期的目录，等回收
     pub(super) expired_dirs: Vec<PathBuf>,
-    /// 确认已过期的文件，连同扫描时读到的它的大小
-    pub(super) expired_files: Vec<(PathBuf, u64)>,
+    /// 确认已过期的文件，连同扫描时读到的它
+    pub(super) expired_files: Vec<ExpiredFile>,
     /// 隔离中、这一轮连 metadata 都没读的目录
     pub(super) quarantined: Vec<PathBuf>,
 }
@@ -40,6 +40,15 @@ pub(super) struct Scanned {
 pub(super) enum ScanOutcome {
     Scanned,
     Absent,
+}
+
+/// 扫描时认出的一个过期文件
+#[derive(Debug)]
+pub(super) struct ExpiredFile {
+    /// 它的名字
+    pub(super) path: PathBuf,
+    /// 扫描时读到的它。删除之前拿它核对"这个名字下面还是不是同一个文件、是不是还过期"
+    pub(super) scanned: std::fs::Metadata,
 }
 
 impl LogCleaner {
@@ -124,7 +133,10 @@ impl LogCleaner {
             // 判断是否过期（基于修改时间）
             if modified_secs < cutoff {
                 if metadata.is_file() {
-                    scanned.expired_files.push((path, metadata.len()));
+                    scanned.expired_files.push(ExpiredFile {
+                        path,
+                        scanned: metadata,
+                    });
                 } else if metadata.is_dir() {
                     scanned.expired_dirs.push(path);
                 }

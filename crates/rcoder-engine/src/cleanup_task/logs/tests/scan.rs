@@ -144,6 +144,116 @@ async fn a_slow_file_removal_does_not_abort_the_sweep() {
     assert_eq!(stats.failed_deletions, 0);
 }
 
+/// 回归（Codex 第五轮 P2）：扫描和删除分两阶段。目录回收那一段里日志轮转了——旧文件改名，同一个
+/// 名字下写出新文件。只认扫描时记下的路径，删掉的是新文件；删之前要核对还是不是同一个文件。
+#[tokio::test]
+async fn a_file_rotated_after_the_scan_is_not_deleted() {
+    let root = TempDir::new().unwrap();
+    let rotated_from = aged_file(root.path(), "runner.log", 15);
+    let rotated_to = root.path().join("runner.log.1");
+    // 要有过期目录，清理器才会去问挂载判定；问的时候轮转
+    aged_dir(root.path(), "runner-gone-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+    inventory.rotate_on_probe(&rotated_from, &rotated_to);
+
+    let stats = cleaner(root.path(), inventory)
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&rotated_to).unwrap(),
+        "old",
+        "the rotated file is where rotation put it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rotated_from).unwrap(),
+        "new",
+        "the new file under the same name survives"
+    );
+    assert_eq!(stats.files_deleted, 0);
+    assert_eq!(stats.bytes_freed, 0, "nothing was freed");
+    assert_eq!(stats.failed_deletions, 0);
+    assert_eq!(stats.dirs_deleted, 1, "directories are reclaimed as usual");
+}
+
+/// 换进来的也是一个早就过期的文件——比如把轮转出去的旧日志又挪回原名。它仍然过期，光核对时间
+/// 拦不住：要核对还是不是扫描时那一个（设备号加 inode）。
+#[tokio::test]
+async fn another_expired_file_moved_under_the_name_is_not_deleted() {
+    let root = TempDir::new().unwrap();
+    let scanned = aged_file(root.path(), "runner.log", 15);
+    // 挪进来的旧文件先待在一个新鲜的子目录里：清理器只扫第一层，扫描时它不是候选
+    std::fs::create_dir(root.path().join("kept")).unwrap();
+    let incoming = root.path().join("kept/old.log");
+    std::fs::write(&incoming, b"older").unwrap();
+    let old_time = std::time::SystemTime::now() - Duration::from_secs(20 * 24 * 60 * 60);
+    std::fs::set_times(&incoming, std::fs::FileTimes::new().set_modified(old_time)).unwrap();
+    // 要有过期目录，清理器才会去问挂载判定；问的时候换文件
+    aged_dir(root.path(), "runner-gone-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+    inventory.swap_in_on_probe(&scanned, &incoming);
+
+    let stats = cleaner(root.path(), inventory)
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&scanned).unwrap(),
+        "older",
+        "the file moved under the name is kept"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("runner.moved-aside")).unwrap(),
+        "old",
+        "the scanned file is where the swap put it"
+    );
+    assert!(!incoming.exists());
+    assert_eq!(stats.files_deleted, 0);
+    assert_eq!(stats.bytes_freed, 0, "nothing was freed");
+    assert_eq!(stats.failed_deletions, 0);
+}
+
+/// 扫描之后同一个文件又被写了（还是那个 inode）：它不再过期，留着
+#[tokio::test]
+async fn a_file_written_after_the_scan_is_no_longer_expired() {
+    let root = TempDir::new().unwrap();
+    let refreshed = aged_file(root.path(), "runner.log", 15);
+    aged_dir(root.path(), "runner-gone-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+    inventory.rewrite_on_probe(&refreshed);
+
+    let stats = cleaner(root.path(), inventory)
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&refreshed).unwrap(),
+        "written after the scan"
+    );
+    assert_eq!(stats.files_deleted, 0);
+    assert_eq!(stats.failed_deletions, 0);
+}
+
+/// 对照：扫描之后没人动过的过期文件照常删除
+#[tokio::test]
+async fn an_untouched_expired_file_is_deleted() {
+    let root = TempDir::new().unwrap();
+    let expired = aged_file(root.path(), "runner.log", 15);
+    aged_dir(root.path(), "runner-gone-20261029035324", 15);
+
+    let stats = cleaner(root.path(), FakeInventory::new(&[]))
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert!(!expired.exists());
+    assert_eq!(stats.files_deleted, 1);
+    assert_eq!(stats.bytes_freed, 3, "the size read at scan time");
+}
+
 /// 扫描超时：超时之前已经确认的那一批照常回收，然后这一轮按"没扫完"报告。
 ///
 /// 回归（Codex 第四轮 P2）：以前扫描超时会丢掉整轮，排在卡住条目后面的健康目录什么都删不掉。

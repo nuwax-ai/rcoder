@@ -23,6 +23,13 @@ pub(in crate::cleanup_task) struct FakeInventory {
     pub(in crate::cleanup_task) vanish_on_probe: Mutex<Vec<PathBuf>>,
     /// 被询问时顺手建出来的目录，用来模拟"扫描之后有容器刚启动"
     pub(in crate::cleanup_task) create_on_probe: Mutex<Vec<PathBuf>>,
+    /// 被询问时顺手轮转的文件：（旧文件，改名后的位置），用来模拟"扫描之后日志轮转"
+    pub(in crate::cleanup_task) rotate_on_probe: Mutex<Vec<(PathBuf, PathBuf)>>,
+    /// 被询问时顺手重写的文件（同一个 inode，修改时间变成现在）
+    pub(in crate::cleanup_task) rewrite_on_probe: Mutex<Vec<PathBuf>>,
+    /// 被询问时顺手换进来的文件：（原来的名字，挪进来的旧文件）。先把原来那个改名挪开，再把这个
+    /// 旧文件放到原来的名字下——它也早就过期，光核对时间拦不住
+    pub(in crate::cleanup_task) swap_in_on_probe: Mutex<Vec<(PathBuf, PathBuf)>>,
     /// 最后一次确认时拒绝删除的目录：模拟"创建方在清理器取完清单之后才登记了它"
     pub(in crate::cleanup_task) refused_reclaims: Mutex<Vec<PathBuf>>,
     /// 最后一次确认问过的目录，按询问顺序
@@ -42,6 +49,9 @@ impl FakeInventory {
             unconfirmed: Mutex::new(Vec::new()),
             vanish_on_probe: Mutex::new(Vec::new()),
             create_on_probe: Mutex::new(Vec::new()),
+            rotate_on_probe: Mutex::new(Vec::new()),
+            rewrite_on_probe: Mutex::new(Vec::new()),
+            swap_in_on_probe: Mutex::new(Vec::new()),
             refused_reclaims: Mutex::new(Vec::new()),
             reclaim_checks: Mutex::new(Vec::new()),
             reclaim_unconfirmed: Mutex::new(false),
@@ -97,6 +107,30 @@ impl FakeInventory {
         self.reclaim_checks.lock().unwrap().clone()
     }
 
+    /// 被询问时顺手把 `from` 改名到 `to`，再在原来的名字下写一个新文件（日志轮转）
+    pub(in crate::cleanup_task) fn rotate_on_probe(&self, from: &Path, to: &Path) {
+        self.rotate_on_probe
+            .lock()
+            .unwrap()
+            .push((from.to_path_buf(), to.to_path_buf()));
+    }
+
+    /// 被询问时顺手把 `incoming` 挪到 `name` 下，原来在那儿的挪到一边
+    pub(in crate::cleanup_task) fn swap_in_on_probe(&self, name: &Path, incoming: &Path) {
+        self.swap_in_on_probe
+            .lock()
+            .unwrap()
+            .push((name.to_path_buf(), incoming.to_path_buf()));
+    }
+
+    /// 被询问时顺手重写 `path`：还是同一个文件，修改时间变成现在
+    pub(in crate::cleanup_task) fn rewrite_on_probe(&self, path: &Path) {
+        self.rewrite_on_probe
+            .lock()
+            .unwrap()
+            .push(path.to_path_buf());
+    }
+
     pub(in crate::cleanup_task) fn set_failing(&self, failing: bool) {
         *self.failing.lock().unwrap() = failing;
     }
@@ -130,6 +164,19 @@ impl MountedPathsProbe for FakeInventory {
         for path in self.create_on_probe.lock().unwrap().drain(..) {
             std::fs::create_dir_all(&path).expect("create the directory of a starting container");
         }
+        for (from, to) in self.rotate_on_probe.lock().unwrap().drain(..) {
+            std::fs::rename(&from, &to).expect("rotate the old log");
+            std::fs::write(&from, b"new").expect("write the new log under the same name");
+        }
+        for path in self.rewrite_on_probe.lock().unwrap().drain(..) {
+            std::fs::write(&path, b"written after the scan").expect("rewrite the file");
+        }
+        for (name, incoming) in self.swap_in_on_probe.lock().unwrap().drain(..) {
+            let aside = name.with_extension("moved-aside");
+            std::fs::rename(&name, &aside).expect("move the scanned file aside");
+            std::fs::rename(&incoming, &name)
+                .expect("move another expired file under the scanned name");
+        }
         Ok(LogDirectoryMounts {
             mounted: self.mounted.lock().unwrap().clone(),
             unconfirmed: self
@@ -144,7 +191,10 @@ impl MountedPathsProbe for FakeInventory {
     }
 
     async fn begin_reclaim(&self, candidate: &Path) -> Result<ReclaimPermit, ReclaimRefused> {
-        self.reclaim_checks.lock().unwrap().push(candidate.to_path_buf());
+        self.reclaim_checks
+            .lock()
+            .unwrap()
+            .push(candidate.to_path_buf());
         if self
             .refused_reclaims
             .lock()

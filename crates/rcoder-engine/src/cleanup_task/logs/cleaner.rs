@@ -84,8 +84,12 @@
 //! 超时记录早已过期。
 //!
 //! 删除不设时限，也不放弃：发起的删除一律等到它返回。放弃的话，底层可能还在删，这个任务却
-//! 以为它停了；按路径发起的删除如果在放弃之后才执行，删掉的可能已经是同一路径上后来的东西。
-//! 一次删除超过 [`SLOW_REMOVAL`] 还没返回时告警一次，然后继续等。
+//! 以为它停了。一次删除超过 [`SLOW_REMOVAL`] 还没返回时告警一次，然后继续等。
+//!
+//! 删文件之前先核对这个名字下面还是不是扫描时那个文件、是不是还过期（设备号加 inode 加修改
+//! 时间）。扫描和删除之间隔着整个目录回收阶段，这中间日志可能轮转——旧文件改名、同一个名字下
+//! 写出新文件——只认路径删掉的就是新文件。目录的对应核对是删前那次复查（还在、仍是目录、仍然
+//! 过期）加上删除许可。
 //!
 //! 一轮的统计见 [`LogCleanupStats`]。
 
@@ -101,7 +105,7 @@ use tracing::{debug, info, warn};
 
 use super::owner::MountedPathsProbe;
 use super::stats::LogCleanupStats;
-use scan::{SCAN_ENTRY_TIMEOUT, ScanOutcome, Scanned};
+use scan::{ExpiredFile, SCAN_ENTRY_TIMEOUT, ScanOutcome, Scanned};
 
 /// 一天的秒数：保留天数换算秒数的乘数
 const SECS_PER_DAY: u64 = 24 * 60 * 60;
@@ -329,8 +333,12 @@ impl LogCleaner {
             &mut stats,
         )
         .await;
-        self.delete_expired_files(std::mem::take(&mut scanned.expired_files), &mut stats)
-            .await;
+        self.delete_expired_files(
+            std::mem::take(&mut scanned.expired_files),
+            cutoff_time,
+            &mut stats,
+        )
+        .await;
 
         if stats.files_deleted > 0 || stats.dirs_deleted > 0 {
             info!(
@@ -527,9 +535,7 @@ impl LogCleaner {
                 let _permit = permit;
                 #[cfg(test)]
                 if refuse {
-                    return Err(std::io::Error::other(
-                        "fixture: directory deletion refused",
-                    ));
+                    return Err(std::io::Error::other("fixture: directory deletion refused"));
                 }
                 std::fs::remove_dir_all(&target)
             })
@@ -549,28 +555,31 @@ impl LogCleaner {
         }
     }
 
-    /// 删掉扫描时确认已过期的文件。不设时限、不放弃，见模块说明"扫描的时限"
+    /// 删掉扫描时确认已过期的文件。放在目录回收之后：文件删得慢（或者卡住）不该拖住目录回收。
+    /// 不设时限、不放弃，见模块说明"扫描的时限"
     async fn delete_expired_files(
         &self,
-        files: Vec<(PathBuf, u64)>,
+        files: Vec<ExpiredFile>,
+        cutoff: u64,
         stats: &mut LogCleanupStats,
     ) {
-        for (path, file_size) in files {
+        for ExpiredFile { path, scanned } in files {
             #[cfg(test)]
             let delay_ms = self
                 .removal_delay_ms
                 .load(std::sync::atomic::Ordering::SeqCst);
+            let file_size = scanned.len();
             let target = path.clone();
             let removed = await_removal("file", &path, move || {
                 #[cfg(test)]
                 if delay_ms > 0 {
                     std::thread::sleep(Duration::from_millis(delay_ms));
                 }
-                std::fs::remove_file(&target)
+                remove_file_if_unchanged(&target, &scanned, cutoff)
             })
             .await;
             match removed {
-                Ok(()) => {
+                Ok(FileRemoval::Deleted) => {
                     stats.files_deleted += 1;
                     stats.bytes_freed += file_size;
                     debug!(
@@ -579,9 +588,19 @@ impl LogCleaner {
                         file_size as f64 / 1024.0 / 1024.0
                     );
                 }
+                // 扫描之后这个名字换了主人（日志轮转）：删的就不是扫描时那个文件了，留着
+                Ok(FileRemoval::Replaced) => {
+                    debug!(
+                        ?path,
+                        "[log_cleaner] The file at this name changed since the scan, keeping it"
+                    );
+                }
                 Err(error) => {
                     stats.failed_deletions += 1;
-                    warn!("[log_cleaner] Failed to delete file: {:?} - {}", path, error);
+                    warn!(
+                        "[log_cleaner] Failed to delete file: {:?} - {}",
+                        path, error
+                    );
                 }
             }
         }
@@ -663,13 +682,62 @@ fn is_older_than(metadata: &std::fs::Metadata, cutoff: u64) -> bool {
         .is_some_and(|modified| modified.as_secs() < cutoff)
 }
 
+/// 删一个文件的结果
+enum FileRemoval {
+    Deleted,
+    /// 这个名字下面已经不是扫描时那个文件，或者它不再过期：没删
+    Replaced,
+}
+
+/// 删掉 `path`，前提是它还是扫描时的那个文件、而且仍然过期。
+///
+/// 扫描和删除隔着整个目录回收阶段。这中间日志可能轮转：旧文件改名，同一个名字下写出新文件。
+/// 只认扫描时记下的路径，删掉的是新文件。所以删之前核对和删除放在同一次阻塞调用里连着做。
+///
+/// 核对和删除仍是两次系统调用，中间有一次调用的间隔。要连它也消掉，得先把文件原子地改名再
+/// 核对，认错了再改回去——改不回去的时候，用户的新文件就留在一个陌生的名字下。这个间隔里
+/// 正好发生轮转，轮转的还得是早就过了保留期的文件，不值得为它冒那个险
+fn remove_file_if_unchanged(
+    path: &Path,
+    scanned: &std::fs::Metadata,
+    cutoff: u64,
+) -> std::io::Result<FileRemoval> {
+    let now = std::fs::symlink_metadata(path)?;
+    if !now.is_file() || !is_same_file(scanned, &now) || !is_older_than(&now, cutoff) {
+        return Ok(FileRemoval::Replaced);
+    }
+    std::fs::remove_file(path)?;
+    Ok(FileRemoval::Deleted)
+}
+
+/// 两份 metadata 是不是同一个文件：Unix 上比设备号加 inode，读不到身份的平台退回到修改时间
+/// 加长度
+fn is_same_file(scanned: &std::fs::Metadata, now: &std::fs::Metadata) -> bool {
+    match (file_identity(scanned), file_identity(now)) {
+        (Some(scanned), Some(now)) => scanned == now,
+        _ => scanned.len() == now.len() && scanned.modified().ok() == now.modified().ok(),
+    }
+}
+
+/// 文件的身份：设备号加 inode
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
 /// 发起一次删除并等到它返回，不设时限。超过 [`SLOW_REMOVAL`] 还没返回就先告警一次，然后
 /// 继续等，见模块说明"扫描的时限"
-async fn await_removal(
+async fn await_removal<T: Send + 'static>(
     what: &str,
     path: &Path,
-    remove: impl FnOnce() -> std::io::Result<()> + Send + 'static,
-) -> std::io::Result<()> {
+    remove: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
     let mut removal = tokio::task::spawn_blocking(remove);
     match tokio::time::timeout(SLOW_REMOVAL, &mut removal).await {
         Ok(joined) => joined.unwrap_or_else(|error| Err(std::io::Error::other(error))),
