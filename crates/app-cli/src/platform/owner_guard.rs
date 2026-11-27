@@ -240,7 +240,7 @@ time.sleep(300)
             .expect("lock must be acquirable after owner death despite descendants");
 
         // 清理后代
-        let _ = std::process::Command::new("taskkill")
+        let _killed = std::process::Command::new("taskkill")
             .args(["/PID", &descendant_pid.to_string(), "/F", "/T"])
             .output();
     }

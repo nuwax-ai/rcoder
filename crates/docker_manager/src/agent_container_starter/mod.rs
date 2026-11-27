@@ -182,7 +182,15 @@ impl<'a> AgentContainerStarter<'a> {
             .name_prefix(service_config.container_prefix())
             .work_dir(service_config.work_dir.clone())
             .network_mode(service_config.network_mode.clone())
-            .auto_remove(true)
+            // **不自动删除**：auto_remove=true 会让 OOM 的容器连同
+            // `State.OOMKilled / ExitCode / FinishedAt` 一起消失，OOM 归因
+            // 只能退回 Docker events（只回放最近 256 条，繁忙 daemon 上仅
+            // 覆盖几分钟）。保留尸体让 /computer/pod/health 能直接 inspect
+            // 真实死因；由 60s 的容器对账任务在保留窗口（10 分钟）后回收，
+            // 见 docker_manager/src/manager/sync.rs::reap_stopped_agent。
+            // 不会导致"复用旧镜像"：start_prepared 每次创建前都会
+            // clear_previous_container_for_rebuild 删掉旧容器。
+            .auto_remove(false)
             // 结构化身份 label（对齐 K8s build_standard_labels / Docker Userapp
             // 容器的身份载体）：rcoder 重启后 Docker API list 按 label 还原身份
             // （消费侧暂未切换，铺重启窗口的 label 直读）
@@ -344,9 +352,16 @@ impl<'a> AgentContainerStarter<'a> {
         let network_name = self.manager.get_main_network_name().await;
         builder = builder.network_name(network_name);
 
-        let builder = mounts::apply_auto_mounts(
+        // 给容器加挂载。判断哪些 bind 源落在可回收的日志根里用的是清理器那个路径空间；判不出
+        // 来的不拒绝创建，那条源登记到创建结束
+        let mounts::AppliedMounts {
+            builder,
+            mut pending_binds,
+        } = mounts::prepare_auto_mounts(
+            self.manager,
             builder,
             &mounts::MountContext {
+                log_reclaim_root: &self.manager.config.log_reclaim_root,
                 container_id: &container_id,
                 container_prefix: &container_prefix,
                 service_config: &service_config,
@@ -361,6 +376,7 @@ impl<'a> AgentContainerStarter<'a> {
                 tenant_id: tenant_id.as_deref(),
                 space_id: space_id.as_deref(),
             },
+            &mounts::ProcessMounts,
         )
         .await?;
 
@@ -381,7 +397,12 @@ impl<'a> AgentContainerStarter<'a> {
         }
         // Never cancel this future: Docker may still be creating or starting
         // the container. Only acknowledged writes permit handing over the lease.
-        let created = self.manager.create_container(config).await?;
+        // 请求马上发出，登记跟着结果走：建出来了就注销；请求报错或者这个 future 等应答时被
+        // 取消，登记转去"结果不明"、保留到过期——Docker 可能已经建出了容器，正绑着这些目录
+        let created = pending_binds
+            .until_settled(self.manager.create_container(config))
+            .await?;
+        drop(pending_binds);
         if is_cancelled() {
             return Err(DockerError::BuilderCreationCancelled);
         }

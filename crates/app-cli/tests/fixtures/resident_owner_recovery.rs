@@ -263,7 +263,7 @@ impl Drop for CapturedOwnerCleanup {
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).trim() == self.invocation
         }) {
-            let _ = Command::new("kill")
+            let _unused = Command::new("kill")
                 .args(["-KILL", &self.pid.to_string()])
                 .status();
         }

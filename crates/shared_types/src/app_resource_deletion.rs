@@ -361,7 +361,14 @@ pub struct UserAppStorageResizeTarget {
 }
 
 /// Durable mutation ownership inside an exclusively locked application lock file.
-/// A nonempty marker is never reclaimed by time or process liveness heuristics.
+///
+/// Reclamation follows flock liveness proof, never time or process-liveness
+/// heuristics: a nonempty marker observed while the caller holds the file's
+/// exclusive flock is necessarily a dead (or finished-but-uncleanly released)
+/// holder's remnant, because the kernel releases flock when the holder dies.
+/// Logical fencing — operation records, recovery states, business execution
+/// guards — lives in durable storage and stays independent of this physical
+/// remnant.
 pub struct AppFileMutationMarker {
     operation_id: String,
 }
@@ -393,13 +400,49 @@ impl AppFileMutationMarker {
             operation_id: uuid::Uuid::new_v4().to_string(),
         }
     }
-    pub fn check_clean(file: &std::fs::File) -> std::io::Result<()> {
-        if file.metadata()?.len() == 0 {
-            return Ok(());
+    /// Reclaim an orphaned mutation marker on an exclusively locked file.
+    ///
+    /// Precondition: the caller holds the file's exclusive flock. Under that
+    /// proof a nonempty marker can only be a former holder's remnant — no live
+    /// mutation window can be open, or the flock would not have been
+    /// acquirable. The marker is truncated to zero and the orphaned owner
+    /// (decoded lossily, for audit logging only) is returned; an already-clean
+    /// file returns `None` (idempotent). I/O failures propagate so callers
+    /// keep fencing (fail-safe).
+    /// `archive_to`：截断锁文件前把孤儿内容归档到旁文件（append 时间戳），
+    /// 保留原操作的恢复凭据——抢到 flock 只证明写入进程已停，Docker daemon/
+    /// app-cli 已派发的动作可能仍在执行，其 operation_id 是事后对账的唯一
+    /// 线索（第九轮复审 P1：清零即丢弃凭据）。归档失败按 I/O 错误传播
+    /// （保持围栏，fail-safe）。
+    pub fn reclaim_orphaned(
+        mut file: &std::fs::File,
+        archive_to: Option<&std::path::Path>,
+    ) -> std::io::Result<Option<String>> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut owner = Vec::new();
+        file.seek(SeekFrom::Start(0))?;
+        Read::take(&mut file, 4096).read_to_end(&mut owner)?;
+        if owner.is_empty() {
+            return Ok(None);
         }
-        Err(std::io::Error::other(
-            "incomplete application mutation requires operator recovery",
-        ))
+        if let Some(archive) = archive_to {
+            let mut entry = chrono_or_system_time();
+            entry.push(' ');
+            entry.push_str(&String::from_utf8_lossy(&owner));
+            entry.push('\n');
+            if let Some(parent) = archive.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut archive = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(archive)?;
+            archive.write_all(entry.as_bytes())?;
+            archive.sync_all()?;
+        }
+        file.set_len(0)?;
+        file.sync_all()?;
+        Ok(Some(String::from_utf8_lossy(&owner).into_owned()))
     }
     pub fn begin(&self, mut file: &std::fs::File) -> std::io::Result<()> {
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -499,4 +542,74 @@ mod compute_start_target_tests {
             "volume witness comparison ignores the image field"
         );
     }
+}
+
+#[cfg(test)]
+mod reclaim_orphaned_tests {
+    use super::*;
+
+    fn lock_file(contents: &[u8]) -> std::fs::File {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("app.lock");
+        std::fs::write(&path, contents).expect("write");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        // Keep the directory alive for the file's lifetime.
+        std::mem::forget(directory);
+        file
+    }
+
+    fn file_len(file: &std::fs::File) -> u64 {
+        file.metadata().expect("metadata").len()
+    }
+
+    /// 干净锁文件:无可回收残留,幂等返回 None。
+    #[test]
+    fn clean_file_returns_none() {
+        let file = lock_file(b"");
+        assert_eq!(
+            AppFileMutationMarker::reclaim_orphaned(&file, None).expect("reclaim"),
+            None
+        );
+        assert_eq!(file_len(&file), 0);
+    }
+
+    /// 孤儿 marker:返回其 ID 供审计留痕,并清零文件;再次调用幂等。
+    #[test]
+    fn orphaned_marker_returns_id_and_truncates() {
+        let file = lock_file(b"0192f0ac-1111-4222-8333-444455556666");
+        assert_eq!(
+            AppFileMutationMarker::reclaim_orphaned(&file, None).expect("reclaim"),
+            Some("0192f0ac-1111-4222-8333-444455556666".to_owned())
+        );
+        assert_eq!(file_len(&file), 0);
+        assert_eq!(
+            AppFileMutationMarker::reclaim_orphaned(&file, None).expect("reclaim again"),
+            None,
+            "reclaim is idempotent"
+        );
+    }
+
+    /// 非法 UTF-8 残留(文件损坏):仍受控回收,损失解码仅用于日志标签,
+    /// 不把用户挡在永久围栏后面。
+    #[test]
+    fn invalid_utf8_remnant_is_still_reclaimed_lossily() {
+        let file = lock_file(&[
+            0xff, 0xfe, b' ', b'd', b'e', b'a', b'd', b' ', b'h', b'o', b'l', b'd', b'e', b'r',
+        ]);
+        let reclaimed = AppFileMutationMarker::reclaim_orphaned(&file, None)
+            .expect("reclaim corrupted remnant");
+        assert!(reclaimed.is_some());
+        assert_eq!(file_len(&file), 0);
+    }
+}
+
+fn chrono_or_system_time() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("[{}]", d.as_secs()))
+        .unwrap_or_else(|_| "[?]".to_string())
 }

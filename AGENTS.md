@@ -20,7 +20,7 @@ RCoder 是基于 ACP 的 AI 开发平台，主体为 Rust 2024 Cargo workspace�
 | agent 执行、gRPC 服务端 | `crates/agent_runner/` |
 | ACP 连接与协议适配 | `crates/agent_abstraction/` |
 | UserApp 生命周期、存储接口 | `crates/app_manager/`；builder 接入在 `crates/rcoder-engine/src/userapp_builder/` |
-| UserApp 容器内编排、启动、部署与控制协议 | `crates/app-cli/`（独立 Cargo 项目） |
+| UserApp 容器内编排、启动、部署与控制协议 | `crates/app-cli/`（workspace 成员） |
 | 文件、工作区、Git、技能与开发服务 | `crates/file-server/` |
 | UserApp 文件服务接口、构建任务与启动事件 | `crates/file-server-userapp/` |
 | 代理、预览和终端转发 | `crates/rcoder-proxy/` |
@@ -108,21 +108,15 @@ cargo clippy --workspace --all-targets
 cargo nextest run --workspace --no-fail-fast --all-features
 ```
 
-日常可用 `cargo nextest run --no-fail-fast --all-features`，但本仓配置了 `default-members`；需要验证整个根 workspace 时必须显式加 `--workspace`。推荐 Make 入口：`make test`（workspace 全 features）、`make test-default`（默认 features）、`make test-unit`（库单元）、`make test-integration`（Rust 集成测试目标）、`make test-app-cli`（独立项目），均使用 nextest。用 `NEXTEST_ARGS='-p rcoder'` 聚焦单个目标，`TEST_FEATURES=` 选择默认 features。
+日常可用 `cargo nextest run --no-fail-fast --all-features`，但本仓配置了 `default-members`；需要验证整个根 workspace 时必须显式加 `--workspace`。推荐 Make 入口：`make test`（workspace 全 features）、`make test-default`（默认 features）、`make test-unit`（库单元）、`make test-integration`（Rust 集成测试目标）、`make test-app-cli`（app-cli 聚焦），均使用 nextest。用 `NEXTEST_ARGS='-p rcoder'` 聚焦单个目标，`TEST_FEATURES=` 选择默认 features。
 
 `make test-all` 串行执行 workspace、app-cli 和文档测试，收集各部分失败，不包含部署 E2E；crate 专用筛选不要用于该跨项目入口。`make test-doc` 保留 `cargo test --doc`，不接收 nextest 筛选参数。严格 E2E 保留专用启动器，不机械替换其内部测试调用。
 
 需要格式化时使用 `cargo fmt --all`。按受影响 feature 追加编译、Clippy 和测试；涉及 K8s 时必须验证 `kubernetes` feature，也检查默认 Docker 模式（例如 `cargo nextest run -p docker_manager --no-fail-fast`）。发布构建按需执行 `cargo build --release --workspace`。
 
-### app-cli 独立检查
+### app-cli 检查
 
-根 `Cargo.toml` **排除了 `crates/app-cli`**，它有独立 `Cargo.lock`。根 workspace 的 fmt/clippy/test/build 和上述 Make 测试不能代替 app-cli 检查。修改 app-cli 或影响它的共享依赖时，额外执行：
-
-```bash
-cargo fmt --manifest-path crates/app-cli/Cargo.toml -- --check
-cargo clippy --manifest-path crates/app-cli/Cargo.toml --all-targets
-cargo nextest run --manifest-path crates/app-cli/Cargo.toml --no-fail-fast --all-features
-```
+`crates/app-cli` 是 workspace 成员（2026-11-18 并入；独立 `Cargo.lock` 与 `.config/nextest.toml` 移除，端口串行组统一在根 `.config/nextest.toml`。原 exclude 理由——pingap-config 传递依赖 bollard/regex 与主锁冲突——随 bollard 双方同为 0.21.1 消失）。根 workspace 的 fmt/clippy/test 覆盖 app-cli；`make test-app-cli` 等价 `cargo nextest run -p app-cli`。发布（release-app-cli.yml）在 `crates/app-cli` 目录以根锁 `--locked` 构建，产物统一在仓库根 `target/`。
 
 不要让多个 Cargo 任务共用同一 `CARGO_TARGET_DIR` 并发运行。先聚焦、后扩大，必要检查通过后不无理由重复全量测试。workspace 中环境门控用例可能跳过，不能代替显式部署 E2E。
 

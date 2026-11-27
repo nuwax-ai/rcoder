@@ -43,17 +43,22 @@ async fn captured_release_uses_host_root_and_allows_reacquisition() {
                 .join(format!("{prefix}-{}.lock", context.app_id));
         drop(lease); // death releases the flock, not the durable marker
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
-        assert!(
-            runtime
-                .acquire_application_file_lease(&context.app_id, &family)
-                .await
-                .is_err()
-        );
+        // Receipt-based release still clears an untouched orphan marker.
         runtime
             .release_captured_file_lease(&context, &receipt)
             .await
             .unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        // A receipt-less orphan (holder died mid-mutation) is reclaimed by the
+        // next acquisition itself, under the held flock: the next user
+        // operation recovers automatically instead of being fenced forever.
+        drop(
+            runtime
+                .acquire_application_file_lease(&context.app_id, &family)
+                .await
+                .expect("next attempt reclaims the orphan marker"),
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
         runtime
             .acquire_application_file_lease(&context.app_id, &family)
             .await
@@ -328,13 +333,16 @@ async fn durable_operation_marker_echoes_identity_without_authorizing_takeover()
 
     let marker = shared_types::AppFileMutationMarker::for_operation("operation-one").unwrap();
     drop(lock_builder_file_with_marker(root.path(), name, marker).unwrap());
-    // Even an identical durable operation must prove recovery safety first.
+    // A dead holder's marker — even one carrying an identical durable
+    // operation id — is a reclaimable orphan under the held flock; takeover
+    // protection lives in the receipt/record layer, not in this remnant.
     let marker = shared_types::AppFileMutationMarker::for_operation("operation-one").unwrap();
-    assert!(lock_builder_file_with_marker(root.path(), name, marker).is_err());
+    let reclaimed = lock_builder_file_with_marker(root.path(), name, marker).unwrap();
     assert_eq!(
         std::fs::read_to_string(root.path().join(name)).unwrap(),
         "operation-one"
     );
+    Box::new(reclaimed).release().await.unwrap();
 }
 
 #[tokio::test]
@@ -351,15 +359,22 @@ async fn failed_builder_completion_clears_only_confirmed_rejection_marker() {
         let result: container_runtime_api::ContainerRuntimeResult<()> =
             super::super::builder_completion::finish(Box::new(lease), Err(failure)).await;
         assert!(result.is_err());
-        let next = lock_builder_file(root.path(), "builder-test.lock");
-        if matches!(status, 403 | 409) {
-            Box::new(next.expect("confirmed rejection permits retry"))
-                .release()
-                .await
-                .unwrap();
-        } else {
-            assert!(next.is_err(), "unconfirmed outcome must require recovery");
-        }
+        // Only confirmed rejections (403/409) clear the marker on completion;
+        // unconfirmed outcomes retain it as evidence.
+        assert_eq!(
+            !std::fs::read(root.path().join("builder-test.lock"))
+                .unwrap()
+                .is_empty(),
+            !matches!(status, 403 | 409),
+            "only confirmed rejections clear the marker on completion"
+        );
+        // Either way a fresh attempt holding the flock reclaims the marker and
+        // proceeds; unknown-outcome reconciliation is carried by records, not
+        // by a permanent physical fence.
+        Box::new(lock_builder_file(root.path(), "builder-test.lock").unwrap())
+            .release()
+            .await
+            .unwrap();
     }
 }
 
@@ -402,7 +417,12 @@ async fn partial_builder_completion_retains_confirmed_container_and_recovery_mar
             marker,
             "a start rejection must not erase the preceding create's recovery marker"
         );
-        assert!(lock_builder_file(root.path(), "builder-test.lock").is_err());
+        // The marker is retained, yet a fresh attempt reclaims the orphan and
+        // proceeds: reconciliation of the partial creation is record-driven.
+        Box::new(lock_builder_file(root.path(), "builder-test.lock").unwrap())
+            .release()
+            .await
+            .unwrap();
     }
 }
 
@@ -460,7 +480,12 @@ async fn partial_builder_recording_failure_keeps_original_source_and_recovery_ma
             std::fs::read(root.path().join("builder-test.lock")).unwrap(),
             marker
         );
-        assert!(lock_builder_file(root.path(), "builder-test.lock").is_err());
+        // Retained marker, but the next attempt reclaims the orphan under the
+        // held flock and proceeds; the receipt failure is surfaced separately.
+        Box::new(lock_builder_file(root.path(), "builder-test.lock").unwrap())
+            .release()
+            .await
+            .unwrap();
     }
 }
 
@@ -479,7 +504,12 @@ async fn failed_marker_release_does_not_erase_other_owner_or_original_error() {
         std::fs::read_to_string(root.path().join("builder-test.lock")).unwrap(),
         "replacement-owner"
     );
-    assert!(lock_builder_file(root.path(), "builder-test.lock").is_err());
+    // The foreign owner's remnant is an orphan too: the next attempt holding
+    // the flock reclaims it (the original denial has already surfaced).
+    Box::new(lock_builder_file(root.path(), "builder-test.lock").unwrap())
+        .release()
+        .await
+        .unwrap();
 }
 #[tokio::test]
 async fn captured_delete_retires_only_deleted_identity_caches() {
@@ -679,13 +709,25 @@ fn undelivered_lock_acquisition_does_not_strand_marker() {
     drop(UnclaimedBuilderLease(Some(reclaimed)));
 }
 #[test]
-fn uncertain_builder_mutation_retains_marker_after_file_unlock() {
+fn uncertain_builder_marker_survives_unlock_but_next_attempt_reclaims() {
     let root = tempfile::tempdir().unwrap();
     drop(lock_builder_file(root.path(), "builder-one.lock").unwrap());
-    assert!(matches!(
-        lock_builder_file(root.path(), "builder-one.lock"),
-        Err(Error::Conflict(_))
-    ));
+    // Drop retains the durable marker (uncertain-outcome evidence)...
+    assert!(
+        !std::fs::read(root.path().join("builder-one.lock"))
+            .unwrap()
+            .is_empty()
+    );
+    // ...while the next attempt, proven sole holder by the acquired flock,
+    // reclaims the orphan marker and proceeds instead of fencing forever.
+    // (Before flock-proof reclamation this acquisition failed forever with
+    // "builder operation requires recovery".)
+    drop(lock_builder_file(root.path(), "builder-one.lock").unwrap());
+    assert!(
+        !std::fs::read(root.path().join("builder-one.lock"))
+            .unwrap()
+            .is_empty()
+    );
 }
 #[tokio::test]
 async fn builder_drop_unlocks_live_duplicate_and_preserves_only_uncertain_marker() {
@@ -709,4 +751,105 @@ async fn builder_drop_unlocks_live_duplicate_and_preserves_only_uncertain_marker
         next.unlock().expect("next unlock");
         drop(duplicate);
     }
+}
+
+/// codex 复审回归（2026-11-20）：全部走真实 acquire/reclaim/release 路径，
+/// 不手工写归档。场景一：A 被归档后 B 接管并**正常释放**——真实 release 必
+/// 须落 `done B` 归档（此前只有清 marker），A 的裸授权被后继代次撤销。
+#[cfg(unix)]
+#[tokio::test]
+async fn real_release_records_done_and_revokes_archived_authority() {
+    let root = tempfile::tempdir().expect("fixture");
+    let name = "builder-real-release.lock";
+    let lease_a = lock_builder_file_with_marker(
+        root.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("op-a").expect("marker"),
+    )
+    .expect("acquire a");
+    let receipt_a = lease_a.receipt().expect("receipt a");
+    drop(lease_a); // A 死亡：flock 释放，marker 残留
+
+    // B 接管：prepare 持锁后 reclaim 归档 A 的孤儿 marker（真实归档路径）。
+    let lease_b = lock_builder_file_with_marker(
+        root.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("op-b").expect("marker"),
+    )
+    .expect("acquire b");
+    let receipt_b = lease_b.receipt().expect("receipt b");
+    assert!(
+        validate_file_receipt(&root.path().join(name), &receipt_a).is_err(),
+        "B 活跃持锁期间 A 的验证应 Err（锁活跃），而非误判验真"
+    );
+    Box::new(lease_b).release().await.expect("b normal release");
+
+    let archive = std::fs::read_to_string(root.path().join(name).with_extension("lock.orphaned"))
+        .expect("archive readable");
+    assert!(
+        archive.contains("done op-b"),
+        "真实 release 必须落 done 归档（codex 反例：archive_has_B_done=false）: {archive}"
+    );
+    assert_eq!(
+        validate_file_receipt(&root.path().join(name), &receipt_a).ok(),
+        Some(false),
+        "B 正常完成后 A 的裸授权不得复活"
+    );
+    drop(receipt_b);
+}
+
+/// codex 复审回归：场景二（交错时序）——先完成 A，再归档 B（真实
+/// reclaim_orphaned 路径，无后继获取），最后 A 迟到重复 release（真实
+/// release_file_receipt 路径）：更早代次的迟到 done **不撤销** B 的在途
+/// 授权；A 自身结算幂等。
+#[cfg(unix)]
+#[test]
+fn late_duplicate_release_of_older_generation_keeps_successor_authority() {
+    let root = tempfile::tempdir().expect("fixture");
+    let name = "builder-interleave.lock";
+    let lock_path = root.path().join(name);
+    let archive = lock_path.with_extension("lock.orphaned");
+
+    let lease_a = lock_builder_file_with_marker(
+        root.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("op-a").expect("marker"),
+    )
+    .expect("acquire a");
+    let receipt_a = lease_a.receipt().expect("receipt a");
+    drop(lease_a);
+
+    let lease_b = lock_builder_file_with_marker(
+        root.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("op-b").expect("marker"),
+    )
+    .expect("acquire b");
+    let receipt_b = lease_b.receipt().expect("receipt b");
+    drop(lease_b); // B 死亡未结算：marker 残留 op-b
+
+    // 归档 B（生产 reclaim 路径：持 flock → 归档孤儿 marker → 清零）。
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open for reclaim");
+        file.try_lock().expect("flock for reclaim");
+        shared_types::AppFileMutationMarker::reclaim_orphaned(&file, Some(&archive))
+            .expect("archive orphaned b");
+    }
+
+    // A 迟到重复释放（真实恢复路径）：marker 已空 → complete 放行 + 追加 done op-a。
+    release_file_receipt(&lock_path, &receipt_a).expect("late duplicate release a");
+    assert_eq!(
+        validate_file_receipt(&lock_path, &receipt_b).ok(),
+        Some(true),
+        "更早代次的迟到 done 不撤销 B 的在途授权（148a8fa0 语义保持）"
+    );
+    assert_eq!(
+        validate_file_receipt(&lock_path, &receipt_a).ok(),
+        Some(false),
+        "A 已结算，重复释放幂等"
+    );
 }

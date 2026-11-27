@@ -517,7 +517,23 @@ pub struct UserAppOperationRecord {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Evidence recorded after verifying that a historical builder preflight
+/// rejection left no active builder or operation lease.
+pub const LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE: &str =
+    "legacy_creation_preflight_rejected_compute_absent";
+
 impl UserAppOperationRecord {
+    /// Recognize the historical read-side identity rejection before creation.
+    /// A generic `claimed` checkpoint does not prove that no write was sent.
+    pub fn is_legacy_builder_preflight_rejection(&self) -> bool {
+        self.kind == UserAppOperationKind::EnsureBuilder
+            && self.step == "creation_result"
+            && self.checkpoint.is_null()
+            && self.error_message.as_deref().is_some_and(|message| {
+                message.starts_with("ensure UserappBuilder failed: Concurrent resource update: Application resource identity mismatch:")
+            })
+    }
+
     /// Structured conflict detail naming this operation as the blocker of an
     /// admission or replay attempt.
     pub fn blocker(&self) -> UserAppOperationBlocker {
@@ -1318,6 +1334,22 @@ pub trait UserAppLifecycleStore: Send + Sync {
         snapshot: &crate::ComputeControlRecord,
         target: &crate::BuilderControlTarget,
     ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+
+    /// Same CAS as [`Self::resume_builder_restart_start`], but the builder's mount
+    /// witness becomes `volumes` (the `builder_volumes` JSON) instead of the
+    /// snapshot's. Used when the restart deliberately replaced bind sources the
+    /// caller has already verified; the witness must describe the mounts the
+    /// replacement actually has. The default ignores `volumes` and keeps the
+    /// snapshot's witness.
+    async fn resume_builder_restart_start_with_volumes(
+        &self,
+        snapshot: &crate::ComputeControlRecord,
+        target: &crate::BuilderControlTarget,
+        volumes: &serde_json::Value,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        let _ = volumes;
+        self.resume_builder_restart_start(snapshot, target).await
+    }
 
     /// Retain a new private archive only after the same retained builder's
     /// stopped execution, original lease and volumes were observed. This CAS

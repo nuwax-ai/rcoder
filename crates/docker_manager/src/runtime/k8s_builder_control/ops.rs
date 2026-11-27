@@ -7,52 +7,6 @@ pub(crate) struct BuilderReuseSnapshot {
 }
 
 impl KubernetesRuntime {
-    pub(crate) async fn read_builder_file_credentials(
-        &self,
-        target: &BuilderControlTarget,
-    ) -> Result<shared_types::FileServerRequestCredentials> {
-        target.validate().map_err(Error::ConfigurationError)?;
-        let expected = target.pod.as_ref().ok_or(Error::ManagementNotRunning)?;
-        let before = self
-            .capture_builder_compute_with_binding(
-                &target.context,
-                target.resource_binding.as_ref(),
-                false,
-            )
-            .await?;
-        if before.workload.as_ref().map(|value| &value.uid)
-            != target.workload.as_ref().map(|value| &value.uid)
-            || before.pod.as_ref().map(|value| &value.uid) != Some(&expected.uid)
-        {
-            return Err(Error::Conflict(
-                "Builder physical identity changed before credential read".into(),
-            ));
-        }
-        let result = self
-            .exec_pod_container(
-                &expected.name,
-                "agent",
-                super::super::builder_file_credentials::read_command(),
-            )
-            .await?;
-        let after = self
-            .capture_builder_compute_with_binding(
-                &target.context,
-                target.resource_binding.as_ref(),
-                false,
-            )
-            .await?;
-        if after.workload.as_ref().map(|value| &value.uid)
-            != before.workload.as_ref().map(|value| &value.uid)
-            || after.pod.as_ref().map(|value| &value.uid) != Some(&expected.uid)
-        {
-            return Err(Error::Conflict(
-                "Builder physical identity changed during credential read".into(),
-            ));
-        }
-        super::super::builder_file_credentials::credentials(result)
-    }
-
     pub(crate) async fn capture_builder_volume_witness(
         &self,
         target: &BuilderControlTarget,
@@ -311,7 +265,7 @@ impl KubernetesRuntime {
             })?;
         if receipt.as_ref() != Some(&target.context)
             || current.metadata.deletion_timestamp.is_some()
-            || !statefulset_agent_image_matches(&current, target.restart_image.as_deref())
+            || !statefulset_agent_image_satisfies(&current, target.restart_image.as_deref())
             || !statefulset_agent_workspace_matches(
                 &current,
                 target.restart_runtime_workspace.as_deref(),
@@ -330,7 +284,7 @@ impl KubernetesRuntime {
         };
         if pod.metadata.deletion_timestamp.is_some()
             || !builder_agent_running(&pod)
-            || !pod_agent_image_matches(&pod, target.restart_image.as_deref())
+            || !pod_agent_image_satisfies(&pod, target.restart_image.as_deref())
             || !pod_agent_workspace_matches(&pod, target.restart_runtime_workspace.as_deref())
         {
             return Ok(None);
@@ -397,12 +351,12 @@ impl KubernetesRuntime {
         if after.metadata.uid != current.metadata.uid
             || after_receipt.as_ref() != Some(&target.context)
             || after.spec.as_ref().and_then(|spec| spec.replicas) != Some(1)
-            || !statefulset_agent_image_matches(&after, target.restart_image.as_deref())
+            || !statefulset_agent_image_satisfies(&after, target.restart_image.as_deref())
             || !statefulset_agent_workspace_matches(
                 &after,
                 target.restart_runtime_workspace.as_deref(),
             )
-            || !pod_agent_image_matches(&after_pod, target.restart_image.as_deref())
+            || !pod_agent_image_satisfies(&after_pod, target.restart_image.as_deref())
             || !pod_agent_workspace_matches(&after_pod, target.restart_runtime_workspace.as_deref())
         {
             return Ok(None);
@@ -1195,15 +1149,46 @@ impl KubernetesRuntime {
                 let receipt = serde_json::to_string(&target.context).map_err(|error| {
                     Error::ConfigurationError(format!("Encode builder start receipt: {error}"))
                 })?;
+                // 冷唤醒镜像对齐归属守卫（spec sandbox-image-version-drift R1）：
+                // 仅当保留模板的 agent 容器与平台当前引用同仓库时才滚动到新
+                // tag；外部/显式钉住的镜像保留模板原样唤醒。
+                let restart_image = match target.restart_image.as_deref() {
+                    Some(desired) => {
+                        let template_repo = current
+                            .spec
+                            .as_ref()
+                            .and_then(|spec| spec.template.spec.as_ref())
+                            .and_then(|spec| {
+                                spec.containers
+                                    .iter()
+                                    .find(|container| container.name == "agent")
+                            })
+                            .and_then(|container| container.image.as_deref())
+                            .map(container_runtime_api::image_repository);
+                        if template_repo.is_some_and(|repository| {
+                            repository == container_runtime_api::image_repository(desired)
+                        }) {
+                            Some(desired)
+                        } else {
+                            tracing::warn!(
+                                app = %target.context.app_id,
+                                desired,
+                                "builder wake image alignment skipped: agent image is not platform-managed"
+                            );
+                            None
+                        }
+                    }
+                    None => None,
+                };
                 let patch = builder_compute_start_patch(
                     workload,
                     &current,
                     &receipt,
-                    target.restart_image.as_deref(),
+                    restart_image,
                     target.restart_runtime_workspace.as_deref(),
                     target.builder_startup_mode,
                 )?;
-                if target.restart_image.is_some()
+                if restart_image.is_some()
                     || target.restart_runtime_workspace.is_some()
                     || target.builder_startup_mode
                         == shared_types::BuilderStartupMode::ManagementOnly
@@ -1419,7 +1404,7 @@ impl KubernetesRuntime {
                                 "Builder pod changed between observation and verification".into(),
                             ));
                         }
-                        if !pod_agent_image_matches(&pod, target.restart_image.as_deref())
+                        if !pod_agent_image_satisfies(&pod, target.restart_image.as_deref())
                             || !pod_agent_workspace_matches(
                                 &pod,
                                 target.restart_runtime_workspace.as_deref(),
@@ -1448,7 +1433,7 @@ impl KubernetesRuntime {
                         // K02：同上——写后（wake/restart 的 scale 写入已发生）复核
                         // 冲突保持未知结果保护，不当作写前拒绝
                         .map_err(Error::Conflict)?;
-                        if !statefulset_agent_image_matches(
+                        if !statefulset_agent_image_satisfies(
                             &current,
                             target.restart_image.as_deref(),
                         ) || !statefulset_agent_workspace_matches(

@@ -5,7 +5,6 @@
 
 pub(crate) mod builder_completion;
 mod builder_creation_receipt;
-mod builder_file_credentials;
 mod docker_agent_retirement;
 mod docker_agent_stop;
 mod docker_app_configuration;
@@ -16,6 +15,14 @@ pub(crate) mod docker_app_runtime;
 mod docker_builder_control;
 mod docker_builder_restart;
 mod docker_compute_receipt;
+
+/// prod 应用换镜像重建经假 daemon
+#[cfg(test)]
+mod docker_app_recreate_tests;
+/// 测试用的假 Docker daemon
+#[cfg(test)]
+pub(crate) mod fake_daemon;
+
 mod docker_readiness;
 pub mod docker_runtime;
 pub(crate) mod docker_workspace;
@@ -83,6 +90,8 @@ mod k8s_readiness;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_resolution;
 #[cfg(feature = "kubernetes")]
+pub mod k8s_sandbox;
+#[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_service;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_statefulset;
@@ -103,3 +112,5 @@ mod lifecycle_discovery;
 
 #[cfg(feature = "kubernetes")]
 mod k8s_default_recovery;
+#[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_drift_watch;

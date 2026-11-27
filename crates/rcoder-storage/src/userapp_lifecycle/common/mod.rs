@@ -64,6 +64,40 @@ pub struct ToastyUserAppStore {
     #[cfg(test)]
     admission_gate: Option<std::sync::Arc<admission_cancellation_tests::AdmissionGate>>,
 }
+#[cfg(any(test, feature = "test-support"))]
+impl ToastyUserAppStore {
+    /// 测试辅助：把一条操作记录的执行者清空，构造"历史版本数据 / 人工 SQL"
+    /// 产生的无执行者声明形态（当前 API 产生不了这种记录）。
+    pub async fn clear_operation_executor_for_test(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+    ) -> Result<(), UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                let changed = toasty::sql::statement(repo::sql(
+                    backend,
+                    "UPDATE userapp_operations SET executor_id=NULL \
+                     WHERE app_id=$1 AND operation_id=$2 \
+                       AND state='recovery_required' AND executor_id IS NOT NULL",
+                ))
+                .bind(&app_id)
+                .bind(&operation_id)
+                .exec(tx)
+                .await
+                .map_err(storage)?;
+                if changed != 1 {
+                    return Err(UserAppStoreError::VersionConflict);
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+}
+
 impl ToastyUserAppStore {
     pub(crate) fn from_owner(owner: DatabaseOwner, backend: Backend) -> Self {
         Self {
@@ -636,14 +670,16 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         snapshot: &ComputeControlRecord,
         target: &BuilderControlTarget,
     ) -> Result<ComputeControlRecord, UserAppStoreError> {
-        let snapshot = snapshot.clone();
-        let target = target.clone();
-        self.run(false, move |tx, backend| {
-            Box::pin(async move {
-                compute_execution::resume_builder_restart(tx, backend, &snapshot, &target).await
-            })
-        })
-        .await
+        resume_builder_restart_start_with(self, snapshot, target, None).await
+    }
+
+    async fn resume_builder_restart_start_with_volumes(
+        &self,
+        snapshot: &ComputeControlRecord,
+        target: &BuilderControlTarget,
+        volumes: &serde_json::Value,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        resume_builder_restart_start_with(self, snapshot, target, Some(volumes)).await
     }
 
     async fn capture_stopped_builder_restart_template(
@@ -1663,4 +1699,30 @@ pub async fn offline_compute_snapshot(
         .await;
     owner.shutdown().await?;
     result
+}
+
+/// Stopped → Starting 的续做。`volumes` 给出时它成为新的挂载见证；没给出时沿用快照里的
+async fn resume_builder_restart_start_with(
+    store: &ToastyUserAppStore,
+    snapshot: &ComputeControlRecord,
+    target: &BuilderControlTarget,
+    volumes: Option<&serde_json::Value>,
+) -> Result<ComputeControlRecord, UserAppStoreError> {
+    let snapshot = snapshot.clone();
+    let target = target.clone();
+    let volumes = volumes.cloned();
+    store
+        .run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::resume_builder_restart(
+                    tx,
+                    backend,
+                    &snapshot,
+                    &target,
+                    volumes.as_ref(),
+                )
+                .await
+            })
+        })
+        .await
 }

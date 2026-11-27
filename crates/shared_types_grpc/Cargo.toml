@@ -13,7 +13,6 @@ workspace = true
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
-prost-types = { workspace = true }
 
 # Serialization (for MaskedModelConfig)
 serde = { workspace = true }

@@ -109,6 +109,8 @@ pub(crate) fn apply_storage_env_overrides(config: &mut AppConfig) -> anyhow::Res
         info!(" RCODER_PG_STATEMENT_TIMEOUT_SECS: {v}");
     }
     apply_durable_timeout_override(pg, std::env::var("RCODER_PG_DURABLE_COMMIT_TIMEOUT_MS"))?;
+    // 绑定门禁自愈开关（默认 true；false 恢复保守行为：AnomalousAbsent 拒绝、带外替换 409）
+    super::sections::env_override_bool("RCODER_PG_BINDING_AUTOHEAL", &mut pg.binding_autoheal);
     validate_storage_config(&config.storage)
 }
 

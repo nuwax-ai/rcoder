@@ -14,6 +14,12 @@
 //! [`PgStore::reconcile_authoritative_binding`] 同锁失效旧投影并恢复 DB 中
 //! 仍存活的项目、会话和已由 peer 重建的容器，防止旧持久身份或残留游标让
 //! 新源码请求永久 Superseded。退休项目的会话不复制到新项目代次。
+//!
+//! 自愈（`binding_autoheal`，默认开）：读到 `AnomalousAbsent`（行+墓碑俱无）
+//! 且镜像持有完整旧 identity 时，读取入口
+//! [`PgStore::read_authoritative_container_binding`] 以独立写事务补写精确
+//! 三元组墓碑后重读为 `RetiredByUs` 放行——用户下一次重试即恢复，无需
+//! 重启进程。关闭开关恢复原拒绝语义（fail fast）。
 
 use crate::pg::PgStore;
 use shared_types::{ProjectAndContainerInfo, persistence::ContainerPersistenceIdentity};
@@ -72,11 +78,27 @@ impl PgStore {
     /// await）。不做排空屏障：只有 DB 中精确旧代次的 tombstone 才证明退休；
     /// 读取期间本地游标或项目 Arc 变化时不应用旧快照。自己的删除保留的游标
     /// 与 peer 删除留下的投影遵守同一验证规则，PG CAS 继续保护读后竞争。
+    ///
+    /// 自愈（`binding_autoheal` 开启时）：读到 `AnomalousAbsent` 且镜像持有
+    /// 完整旧 identity（generation + physical_uid 非空）→ 补写退休墓碑后
+    /// 重读一次（按 `RetiredByUs` 自我换代放行）。该异常状态曾把用户
+    /// 会话永久 500，唯一出路是重启进程清镜像。
     pub(in crate::pg) async fn read_authoritative_container_binding(
         &self,
         container_name: &str,
         project_id: &str,
         deadline: Instant,
+    ) -> anyhow::Result<AuthoritativeRead> {
+        self.read_authoritative_binding_with_heal(container_name, project_id, deadline, true)
+            .await
+    }
+
+    async fn read_authoritative_binding_with_heal(
+        &self,
+        container_name: &str,
+        project_id: &str,
+        deadline: Instant,
+        allow_heal: bool,
     ) -> anyhow::Result<AuthoritativeRead> {
         let (based_on, project_baselines, retired_generation) = {
             let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
@@ -195,7 +217,7 @@ impl PgStore {
                     "Authoritative container binding read exceeded the durable deadline"
                 )
             })??;
-        Ok(AuthoritativeRead {
+        let read = AuthoritativeRead {
             name,
             binding,
             based_on,
@@ -204,7 +226,131 @@ impl PgStore {
             project_baselines,
             canonical_container,
             previous_retired,
-        })
+        };
+        if allow_heal
+            && matches!(read.binding, AuthoritativeContainerBinding::AnomalousAbsent)
+            && self.postgres_config.binding_autoheal()
+            && let Some(identity) = read.based_on.as_ref()
+            && !identity.generation.is_empty()
+            && let Some(uid) = identity.physical_uid.as_deref()
+            && !uid.is_empty()
+            && self
+                .heal_anomalous_absent_binding(&read.name, &identity.generation, uid, deadline)
+                .await?
+        {
+            // 墓碑补写成功：按"本系统已退役"重读裁决（禁用二次自愈防循环）。
+            return Box::pin(self.read_authoritative_binding_with_heal(
+                container_name,
+                project_id,
+                deadline,
+                false,
+            ))
+            .await;
+        }
+        Ok(read)
+    }
+
+    /// AnomalousAbsent 自愈：以镜像旧 generation 补写退休墓碑（独立写事务；
+    /// 权威读事务是 READ ONLY，不能原地写）。
+    ///
+    /// # 为什么与注册共用锁序
+    /// 补写发生在权威读之后，注册可能已经并发完成。不与注册共用
+    /// `container-name:{name}` advisory lock，就会出现"读时缺席 → 别人注册成功
+    /// → 迟到的墓碑落地"的倒序。这里在同一写事务内先取同一把锁，再复查
+    /// `containers`：已存在绑定说明异常已消失，直接放行重读，不写墓碑。
+    ///
+    /// # 为什么墓碑不带 physical_uid
+    /// 注册的拒绝条件是
+    /// `(name,generation) 匹配 OR physical_uid 匹配`（`repo/containers.rs`）。
+    /// 自愈依据只是镜像里的旧 identity——它**不能证明物理对象已退役**：容器
+    /// 可能仍在运行、甚至已被新代次合法复用。若把 physical_uid 写进墓碑，之后
+    /// 任何使用该 UID 的注册都会被判 `Superseded`，且**无法自愈**（墓碑不会
+    /// 自动消失），属于永久性生产故障。
+    ///
+    /// 只记录 `(name, generation)` 即可达到自愈目的（下一次权威读按
+    /// `RetiredByUs` 放行），同时把"物理退役"的权力保留给运行时确证退役的
+    /// 路径，不由镜像推断授予。
+    ///
+    /// 幂等（`ON CONFLICT DO NOTHING`）；返回 true 表示"可以重读"——包括
+    /// 补写成功与"复查发现绑定已出现"两种情形。
+    async fn heal_anomalous_absent_binding(
+        &self,
+        name: &str,
+        generation: &str,
+        _physical_uid: &str,
+        deadline: Instant,
+    ) -> anyhow::Result<bool> {
+        let insert_name = name.to_owned();
+        let insert_generation = generation.to_owned();
+        let retired_at = chrono::Utc::now().timestamp_micros();
+        let lock_key = format!("container-name:{name}");
+        let heal = super::database::write_with_conflict_retry(&self.database, move |tx| {
+            Box::pin(async move {
+                // 与注册路径同一把锁，串行化"读后补碑"与"并发注册"
+                toasty::sql::query(
+                    "SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($1, 719324))",
+                )
+                .bind(&lock_key)
+                .exec(tx)
+                .await
+                .map_err(anyhow::Error::from)?;
+                // 锁内复查：读后若已有绑定，异常已消失，不必补碑
+                let existing = toasty::sql::query(
+                    "SELECT container_name FROM containers WHERE container_name=$1",
+                )
+                .bind(&insert_name)
+                .exec(tx)
+                .await
+                .map_err(anyhow::Error::from)?;
+                if !existing.is_empty() {
+                    return Ok(1u64);
+                }
+                toasty::sql::statement(
+                    "INSERT INTO container_tombstones(container_name,container_generation,physical_uid,retired_at_us) \
+                     VALUES($1,$2,NULL,$3) ON CONFLICT DO NOTHING",
+                )
+                .bind(&insert_name)
+                .bind(&insert_generation)
+                .bind(retired_at)
+                .exec(tx)
+                .await
+                .map_err(anyhow::Error::from)
+            })
+        });
+        let inserted = match tokio::time::timeout_at(deadline, heal).await {
+            Ok(Ok(rows)) => rows > 0,
+            Ok(Err(error)) => {
+                tracing::warn!(container = name, %error,
+                    "binding autoheal tombstone write failed; keeping the refusal");
+                return Ok(false);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    container = name,
+                    "binding autoheal tombstone write exceeded the durable deadline; keeping the refusal"
+                );
+                return Ok(false);
+            }
+        };
+        if !inserted {
+            // 冲突(no-op)：本代次已有墓碑（可能是自己或 peer 补的）。此时无需
+            // 二次核验——直接放行重读，由权威读按 `RetiredByUs`/精确墓碑裁决。
+            // 原来这里有一次不带 deadline 的 `database::read` 复核，既越过
+            // durable 预算，又在墓碑不带 physical_uid 后失去意义。
+            tracing::debug!(
+                container = name,
+                generation,
+                "binding autoheal: tombstone already present; re-reading for verdict"
+            );
+        }
+        tracing::warn!(
+            container = name,
+            generation,
+            mirrored_physical_uid = _physical_uid,
+            "binding autoheal: container binding vanished without a retirement record; \
+             recorded a generation-only tombstone from the in-memory cursor to unblock re-ensure"
+        );
+        Ok(true)
     }
 
     /// 调用方持有 registration 锁：快照验证、旧镜像失效与新请求准入必须是

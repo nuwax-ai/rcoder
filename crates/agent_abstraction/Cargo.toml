@@ -21,6 +21,7 @@ dial9 = ["rcoder-obs/dial9"]
 workspace = true
 
 [dependencies]
+process_utils = { workspace = true }
 # 依赖其他 crate
 agent_config = { workspace = true }
 shared_types = { workspace = true }
@@ -72,7 +73,6 @@ agent-client-protocol = { workspace = true }
 which = { workspace = true }
 
 # MCP 协议 - rmcp 官方库: https://github.com/modelcontextprotocol/rust-sdk
-rmcp = { workspace = true }
 mcp-proxy-args = { workspace = true }
 
 # 序列化

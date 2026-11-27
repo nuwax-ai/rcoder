@@ -65,6 +65,11 @@ struct Stats {
 async fn run_reconcile(stop: &tokio_util::sync::CancellationToken) -> Result<(), String> {
     let current = file_server::sync_target_version();
     let mut stats = Stats::default();
+    // 范围（复审 P2 分工）：主进程只扫本地可见的普通工作区与共享 computer
+    // 根；RBD 独占卷（Migrated 用户的卷）挂载在 agent 容器内，由
+    // agent_runner::skill_startup_reconcile 在容器侧启动对账——此处对共享
+    // 卷中已迁移用户的旧副本目录做的是无害的本地维护（不再被读，不会
+    // 与 RBD 卷产生双向漂移）。
     for root in [WORKSPACE_ROOT, COMPUTER_WORKSPACE_ROOT] {
         if stop.is_cancelled() {
             break;
@@ -134,10 +139,15 @@ async fn scan_and_reconcile(
 /// - 否则 → `sync_agents_with_wait` (持工作区锁 fan-out, 内部写新 marker);
 ///   锁 busy → skip (另一副本在同步, 不算失败), 真实错误才计 failed
 async fn reconcile_workspace(workspace: &Path, agents: &Path, current: &str, stats: &mut Stats) {
-    if !tokio::fs::try_exists(agents.join("skills"))
+    // 复审第四轮 P2: 同步源含 skills 与 agents 两类(可独立存在)——只查
+    // skills 会跳过仅有 .agents/agents 的工作区。
+    let has_skills = tokio::fs::try_exists(agents.join("skills"))
         .await
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let has_agents = tokio::fs::try_exists(agents.join("agents"))
+        .await
+        .unwrap_or(false);
+    if !has_skills && !has_agents {
         stats.skipped += 1;
         return;
     }
@@ -257,7 +267,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
         // 源与全部实体目标顶层名称集一致 → skip (marker 内容无关, 不做任何写)
-        for dir in [".agents", ".claude", ".opencode", ".codex"] {
+        for dir in [".agents", ".claude", ".opencode", ".nuwax-harness"] {
             tokio::fs::create_dir_all(ws.join(dir).join("skills/sk1"))
                 .await
                 .unwrap();
@@ -296,7 +306,7 @@ mod tests {
         }
         // 实体副本只有 sk1 (生产 15/13 漂移的最小形态), 且 marker 预置为"最新"——
         // 修复前 marker 等值比较会跳过、漂移永不自愈
-        for dir in [".claude", ".opencode", ".codex"] {
+        for dir in [".claude", ".opencode", ".nuwax-harness"] {
             tokio::fs::create_dir_all(ws.join(dir).join("skills/sk1"))
                 .await
                 .unwrap();
@@ -319,7 +329,7 @@ mod tests {
         .await;
 
         assert_eq!(stats.synced, 1, "stale marker must not block self-healing");
-        for dir in [".claude", ".opencode", ".codex"] {
+        for dir in [".claude", ".opencode", ".nuwax-harness"] {
             assert!(
                 ws.join(dir).join("skills/sk2/SKILL.md").exists(),
                 "{dir} healed to source name set"

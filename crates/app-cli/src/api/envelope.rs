@@ -79,14 +79,14 @@ pub(crate) struct ApiJson<T>(pub(crate) T);
 
 impl<T, S> FromRequest<S> for ApiJson<T>
 where
-    axum::Json<T>: FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    Json<T>: FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
     S: Send + Sync,
 {
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match axum::Json::<T>::from_request(req, state).await {
-            Ok(axum::Json(value)) => Ok(Self(value)),
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
             Err(rejection) => Err(error(
                 StatusCode::BAD_REQUEST,
                 "INVALID_BODY",

@@ -8,9 +8,117 @@ use tracing::{info, warn};
 
 use crate::router::AppState;
 use crate::service::{ChatHandlerContext, ChatHandlerInput, handle_chat_core};
+use crate::utils::{PROMPT_LOG_EDGE_CHARS, prompt_preview};
 
 use super::conversion::{convert_agent_config, convert_attachments, convert_model_provider};
 use super::locale::locale_from_grpc_request;
+
+/// 原样打印 ModelProviderConfig（不脱敏）：模型配置的 key 由平台临时分配、
+/// 按用户隔离，排查入参时需要看到完整值。
+struct RawModelConfig<'a>(&'a shared_types::grpc::ModelProviderConfig);
+
+impl std::fmt::Debug for RawModelConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelProviderConfig")
+            .field("id", &self.0.id)
+            .field("provider", &self.0.provider)
+            .field("model", &self.0.model)
+            .field("api_key", &self.0.api_key)
+            .field("api_base", &self.0.api_base)
+            .field("requires_openai_auth", &self.0.requires_openai_auth)
+            .field("api_protocol", &self.0.api_protocol)
+            .field("wire_api", &self.0.wire_api)
+            .finish()
+    }
+}
+
+/// 原样打印 gRPC agent_config（不脱敏）：配置按用户隔离、凭据为临时分配，
+/// 排查入参需要完整值。map 用 BTreeMap 输出，保证日志顺序稳定。
+struct RawAgentConfig<'a>(&'a shared_types::grpc::ChatAgentConfig);
+
+impl std::fmt::Debug for RawAgentConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatAgentConfig")
+            .field(
+                "agent_server",
+                &self.0.agent_server.as_ref().map(RawAgentServer),
+            )
+            .field(
+                "context_servers",
+                &sorted_context_servers(&self.0.context_servers),
+            )
+            .field(
+                "auto_reload",
+                &self.0.auto_reload.map(|config| config.enabled),
+            )
+            .finish()
+    }
+}
+
+fn sorted_context_servers(
+    servers: &std::collections::HashMap<String, shared_types::grpc::ChatContextServerConfig>,
+) -> std::collections::BTreeMap<&str, RawContextServer<'_>> {
+    servers
+        .iter()
+        .map(|(name, config)| (name.as_str(), RawContextServer(config)))
+        .collect()
+}
+
+struct RawAgentServer<'a>(&'a shared_types::grpc::ChatAgentServerConfig);
+
+impl std::fmt::Debug for RawAgentServer<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let model_env_bindings: Vec<(&str, i32)> = self
+            .0
+            .model_env_bindings
+            .iter()
+            .map(|binding| (binding.env_key.as_str(), binding.source))
+            .collect();
+        let tool_approval_rules: Vec<String> = self
+            .0
+            .tool_approval_rules
+            .iter()
+            .map(|rule| {
+                format!(
+                    "patterns={:?}, action={:?}, tool_kind={:?}",
+                    rule.patterns, rule.action, rule.tool_kind
+                )
+            })
+            .collect();
+        let platforms: std::collections::BTreeMap<&str, String> = self
+            .0
+            .platforms
+            .iter()
+            .map(|(key, value)| (key.as_str(), String::from_utf8_lossy(value).into_owned()))
+            .collect();
+        f.debug_struct("ChatAgentServerConfig")
+            .field("agent_id", &self.0.agent_id)
+            .field("command", &self.0.command)
+            .field("args", &self.0.args)
+            .field("env", &self.0.env)
+            .field("metadata", &self.0.metadata)
+            .field("model_env_bindings", &model_env_bindings)
+            .field("agent_mode", &self.0.agent_mode)
+            .field("tool_approval_rules", &tool_approval_rules)
+            .field("version", &self.0.version)
+            .field("platforms", &platforms)
+            .finish()
+    }
+}
+
+struct RawContextServer<'a>(&'a shared_types::grpc::ChatContextServerConfig);
+
+impl std::fmt::Debug for RawContextServer<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatContextServerConfig")
+            .field("source", &self.0.source)
+            .field("enabled", &self.0.enabled)
+            .field("command", &self.0.command)
+            .field("args", &self.0.args)
+            .field("env", &self.0.env)
+            .finish()
+    }
+}
 
 // Hotpath 埋点：gRPC chat 入口（tonic 无 layer，函数级即入口级；feature 关闭时 no-op）
 #[hotpath::measure]
@@ -21,17 +129,15 @@ pub async fn chat(
     let locale = locale_from_grpc_request(&request);
     let req = request.into_inner();
 
-    let model_config_debug = req
-        .model_config
-        .as_ref()
-        .map(shared_types::MaskedModelConfig);
+    let model_config_debug = req.model_config.as_ref().map(RawModelConfig);
 
     info!(
-        "🚀 [gRPC] Chat request: project_id={}, session_id={}, prompt_len={}, has_agent_config={}, model_config={:?}, service_type={:?}, user_id={:?}, has_attachments={}, has_data_source={}",
+        "🚀 [gRPC] Chat request: project_id={}, session_id={}, prompt_len={}, prompt_preview={:?}, agent_config={:?}, model_config={:?}, service_type={:?}, user_id={:?}, has_attachments={}, has_data_source={}",
         req.project_id,
         req.session_id,
         req.prompt.len(),
-        req.agent_config.is_some(),
+        prompt_preview(&req.prompt, PROMPT_LOG_EDGE_CHARS),
+        req.agent_config.as_ref().map(RawAgentConfig),
         model_config_debug,
         req.service_type,
         req.user_id,
@@ -426,5 +532,57 @@ mod tests {
             "/tmp/ws",
         );
         assert_eq!(dir, std::path::PathBuf::from("./project_workspace/p1"));
+    }
+
+    #[test]
+    fn raw_model_config_keeps_api_key_for_diagnostics() {
+        let config = shared_types::grpc::ModelProviderConfig {
+            id: "1".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude".to_string(),
+            api_key: Some("sk-temporary".to_string()),
+            api_base: Some("https://api.example.com".to_string()),
+            requires_openai_auth: Some(true),
+            api_protocol: Some("anthropic".to_string()),
+            wire_api: Some("chat".to_string()),
+        };
+        let rendered = format!("{:?}", RawModelConfig(&config));
+        assert!(rendered.contains("sk-temporary"));
+        assert!(rendered.contains("anthropic"));
+    }
+
+    #[test]
+    fn raw_agent_config_keeps_env_values_for_diagnostics() {
+        let config = shared_types::grpc::ChatAgentConfig {
+            agent_server: Some(shared_types::grpc::ChatAgentServerConfig {
+                agent_id: Some("claude".to_string()),
+                command: Some("run".to_string()),
+                args: vec!["--flag".to_string()],
+                env: std::collections::HashMap::from([(
+                    "API_KEY".to_string(),
+                    "sk-live".to_string(),
+                )]),
+                metadata: std::collections::HashMap::from([("k".to_string(), "v".to_string())]),
+                ..Default::default()
+            }),
+            context_servers: std::collections::HashMap::from([(
+                "dbx".to_string(),
+                shared_types::grpc::ChatContextServerConfig {
+                    source: "local".to_string(),
+                    enabled: true,
+                    command: Some("dbx-mcp".to_string()),
+                    args: vec![],
+                    env: std::collections::HashMap::from([(
+                        "DBX_PASSWORD".to_string(),
+                        "secret".to_string(),
+                    )]),
+                },
+            )]),
+            auto_reload: Some(shared_types::grpc::AutoReloadConfig { enabled: true }),
+        };
+        let rendered = format!("{:?}", RawAgentConfig(&config));
+        assert!(rendered.contains("sk-live"));
+        assert!(rendered.contains("DBX_PASSWORD"));
+        assert!(rendered.contains("dbx"));
     }
 }

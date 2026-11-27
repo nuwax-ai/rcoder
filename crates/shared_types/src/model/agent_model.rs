@@ -150,6 +150,62 @@ pub enum AgentStatus {
     Terminating,
 }
 
+/// Agent 执行态的对外词表（资源面板 `agents[].status` 的单一事实源）。
+///
+/// 与 [`AgentStatus`] 的区别：`Pending`/`Active` 对外同归 `Processing`
+/// （调用方不关心"排队中"还是"执行中"），`Terminating` 单独一类。
+///
+/// **不要**给 [`AgentStatus`] 实现 `Display`：映射有损（四态→三档）且属于
+/// 特定接口契约，应收拢到这里，由调用方显式选择词表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentExecutionStatus {
+    /// 已入队或正在执行
+    Processing,
+    /// 空闲，等待新请求
+    Idle,
+    /// 正在终止
+    Terminating,
+}
+
+impl AgentExecutionStatus {
+    /// 对外字符串（资源面板词表）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Processing => "Processing",
+            Self::Idle => "Idle",
+            Self::Terminating => "Terminating",
+        }
+    }
+}
+
+impl From<AgentStatus> for AgentExecutionStatus {
+    /// 全量匹配，不写 `_ =>`：新增 [`AgentStatus`] 变体时必须在此显式决策，
+    /// 避免新状态被悄悄当成 `Processing`。
+    fn from(status: AgentStatus) -> Self {
+        match status {
+            AgentStatus::Pending | AgentStatus::Active => Self::Processing,
+            AgentStatus::Idle => Self::Idle,
+            AgentStatus::Terminating => Self::Terminating,
+        }
+    }
+}
+
+impl AgentStatus {
+    /// 是否有一个**正在执行**的回合（已入队或处理中；取消判断用）。
+    ///
+    /// 由 [`AgentExecutionStatus::from`] 推导：`Pending`/`Active` 同归
+    /// `Processing` 这个分组只在 `From` 里定义一次，新增变体时那边的穷尽
+    /// match 先编译失败——这里不会静默把新状态当成"没在执行"。
+    ///
+    /// **不是**"是否空闲"：gRPC `GetStatus` 的 "busy" 与活跃任务计数把
+    /// `Terminating` 也算作未空闲（还没 idle），而本函数对 `Terminating`
+    /// 返回 false——取消请求对它幂等成功，无需再发信号。忙等、回收、下发
+    /// 新回合之类的判断不要用本函数。
+    pub fn is_processing(self) -> bool {
+        AgentExecutionStatus::from(self) == AgentExecutionStatus::Processing
+    }
+}
+
 /// Agent 二进制文件快照
 ///
 /// 记录 Agent 可执行文件的路径和修改时间，用于检测文件是否发生变化。

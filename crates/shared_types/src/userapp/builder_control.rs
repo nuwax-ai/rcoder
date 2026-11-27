@@ -36,6 +36,42 @@ pub struct BuilderRestartTemplate {
     pub volumes: Vec<crate::AppResourceIdentity>,
 }
 
+/// A builder mount that holds persistent data: everything under
+/// [`crate::paths::USERAPP_DEV_HOME`] (the workspace, data, logs and agent-store
+/// of the application). A restart never changes the bind source of these mounts.
+pub fn is_builder_persistent_data_mount(target: &str) -> bool {
+    target == crate::paths::USERAPP_DEV_HOME
+        || target.starts_with(&format!("{}/", crate::paths::USERAPP_DEV_HOME))
+}
+
+/// The mounts a builder restart changed, read back from the replacement container
+/// itself. It records what the runtime handed that one container; the engine
+/// accepts only these sources, for exactly that container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuilderRestartMountWitness {
+    /// The replacement container's physical ID
+    pub container_id: String,
+    /// Every mount whose bind source differs from the archived builder
+    pub replaced: Vec<ReplacedBuilderMount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacedBuilderMount {
+    /// Mount target inside the container
+    pub target: String,
+    /// Bind source in the archived builder
+    pub previous_source: String,
+    /// Bind source the replacement was created with
+    pub source: String,
+}
+
+impl BuilderRestartMountWitness {
+    /// The recorded swap for `target`, if any
+    pub fn replaced(&self, target: &str) -> Option<&ReplacedBuilderMount> {
+        self.replaced.iter().find(|mount| mount.target == target)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuilderPodIdentity {
     pub name: String,

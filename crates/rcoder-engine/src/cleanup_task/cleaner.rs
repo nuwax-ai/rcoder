@@ -1,6 +1,6 @@
-//! 主清理器
+//! 主清理器：扫描闲置的 agent 并回收它们的容器。
 //!
-//! 协调各模块完成清理任务
+//! 过期日志目录的清理不在这里，它是独立运行的 [`super::log_cleanup::LogCleanupTask`]。
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -27,7 +27,6 @@ pub struct AgentCleaner {
     // 组件
     container_destroyer: super::container::ContainerDestroyer,
     agent_scanner: super::agent::AgentScanner,
-    log_cleaner: super::logs::LogCleaner,
 
     /// Qualified idle observations from the last completed sweep only.
     /// Shared projects cannot advance a physical workload twice in one sweep.
@@ -50,12 +49,6 @@ impl AgentCleaner {
         // 判断是否是 K8s 运行时（通过 features flag）
         let is_kubernetes = shared_types::is_kubernetes_runtime();
 
-        // 创建日志清理器（使用配置）
-        let log_cleaner = super::logs::LogCleaner::new(
-            config.log_dir.clone(),
-            config.log_retention_duration.as_secs() / 24 / 60 / 60,
-        );
-
         Self {
             config,
             stats: super::config::CleanupStats::default(),
@@ -74,7 +67,6 @@ impl AgentCleaner {
                 use crate::cleanup_task::agent::AgentScanner;
                 AgentScanner::new(state.clone(), config_clone)
             },
-            log_cleaner,
             pending_destroy: std::collections::HashSet::new(),
         }
     }
@@ -89,23 +81,11 @@ impl AgentCleaner {
         // 重置本次清理的统计
         let mut current_stats = super::config::CleanupStats::default();
 
-        // 1. 清理过期日志文件
-        match self.log_cleaner.cleanup_once().await {
-            Ok(log_stats) => {
-                if log_stats.files_deleted > 0 || log_stats.failed_deletions > 0 {
-                    info!("[cleaner] Cleanup completed: {}", log_stats.summary());
-                }
-            }
-            Err(e) => {
-                warn!("[cleaner] Cleanup failed: {}", e);
-            }
-        }
-
-        // 2. 扫描需要清理的 agent
+        // 1. 扫描需要清理的 agent
         let idle_agents = self.agent_scanner.scan_idle_agents().await?;
         info!("[cleaner] Found {} idle agents to clean", idle_agents.len());
 
-        // 3. 清理每个 agent
+        // 2. 清理每个 agent
         for project_id in idle_agents {
             // Retiring a captured workload can remove all its old references.
             // Never erase a surviving/new registration just because a sibling
@@ -138,7 +118,7 @@ impl AgentCleaner {
         }
         self.pending_destroy = idle_sweep.into_pending();
 
-        // 4. 更新累计统计
+        // 3. 更新累计统计
         current_stats.last_cleanup = Some(Utc::now());
         self.stats.total_cleaned += current_stats.total_cleaned;
         self.stats.success_cleaned += current_stats.success_cleaned;

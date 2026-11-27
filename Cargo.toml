@@ -2,7 +2,6 @@
 members = ["crates/*", "tests-e2e"]
 exclude = [
     "tmp/*",
-    "crates/app-cli",
     "vendor/toasty-driver-postgresql",
 ]
 resolver = "2"
@@ -50,12 +49,11 @@ rust.let_underscore_drop = "warn"
 await_holding_lock = "deny"
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 authors = ["soddy <soddygo@qq.com>"]
 license = "Apache-2.0"
 description = "Rust-based AI agent framework"
-homepage = "https://github.com/nuwax-ai/rcoder"
 repository = "https://github.com/nuwax-ai/rcoder"
 publish = false
 
@@ -64,18 +62,18 @@ publish = false
 agent-client-protocol = { version = "3.6" }
 
 # MCP 协议 - rmcp 官方库
-rmcp = { version = "3.8"}
 # mcp-proxy convert fallback 参数解析与文件重写。
 mcp-proxy-args = { version = "0.2.10" }
 
-piper = "0.2"
 
 clap = { version = "4.6", features = ["derive", "env"] }
 
 # Async runtime
-# Pingora 0.9 initializes streams with a zero-capacity reader. Tokio 1.54
-# panics on that constructor; keep the compatible patch until Pingora adapts.
-tokio = { version = "=1.53.3", features = ["full"] }
+# pingora 0.9.0 与 tokio 1.54 曾不兼容（pingora 以 zero-capacity reader 初始化
+# 流，tokio 1.54 对该构造 panic，首个 accept 连接即崩）：pingora 0.9.1 已随
+# 上游 cloudflare/pingora#1059 修复（fix 5b30d71d），tokio 兼容钉就此解除。
+# 后续升级 tokio 前确认 pingora ≥0.9.1 即可。
+tokio = { version = "=1.54", features = ["full"] }
 # CancellationToken lock/wake and stream EOF fixes are required by task drain.
 tokio-util = { version = "0.7.20", features = ["compat", "time"] }
 tokio-stream = "0.1"
@@ -102,7 +100,6 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 tonic = { version = "0.14", features = ["tls-native-roots"] }
 tonic-prost = "0.14"
 prost = "0.14"
-prost-types = "0.14"
 tonic-prost-build = "0.14"
 http = "1.5"
 http-body = "1.1"
@@ -116,8 +113,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml = "=0.9.33"
 serde_urlencoded = "0.7"
-schemars = { version = "1.2", features = ["derive"] }
-config = "0.15"
 
 # Validation
 garde = { version = "0.23.0", features = ["derive", "regex"] }
@@ -139,7 +134,6 @@ opentelemetry-otlp = { version = "0.33", features = [
     "http-proto",
 ] }
 tracing-opentelemetry = "0.34"
-axum-tracing-opentelemetry = "0.42"
 
 # Prometheus Metrics
 metrics = "0.24"
@@ -161,11 +155,8 @@ path-clean = "1.0"
 dashmap = "6.2"
 futures = "0.3"
 futures-util = "0.3"
-itertools = "0.15"
 bytes = "1.12"
-arrayvec = "0.7"
 arc-swap = "1.9"
-md5 = "0.8"
 process-wrap = { version = "10.0.1", features = ["tokio1", "process-group", "job-object"] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
@@ -176,20 +167,15 @@ percent-encoding = "2.3"
 rustls = { version = "0.23", features = ["ring"] }
 
 # Additional utilities
-indoc = "2.0"
 parking_lot = "0.13"
 lockmap = "0.2.3"
-convert_case = "0.12"
 # Persistent data structures for CoW-friendly multi-session tracking (C2/M3 fix)
 # imbl = im 的活跃维护 fork（im 15.1 已 unmaintained，RUSTSEC-2026-0248）
 imbl = { version = "7.0", features = ["serde"] }
-handlebars = { version = "6.4", features = ["rust-embed"] }
-rust-embed = "8.12"
-zstd = "0.14"
 
 # Kubernetes
-kube = { version = "4.2", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
-k8s-openapi = { version = "0.28", features = ["v1_32"] }
+kube = { version = "5.1", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
+k8s-openapi = { version = "0.29", features = ["v1_33"] }
 
 
 # 构建工具
@@ -197,25 +183,20 @@ derive_builder = "0.20"
 
 # Zed 核心功能依赖
 libc = "0.2"
-nix = { version = "0.31.3", features = ["fs", "process", "term", "signal"] }
+nix = { version = "0.32", features = ["fs", "process", "term", "signal"] }
 # Windows 引导会话身份（runtime-supervisor epoch：GetTickCount64/FILETIME FFI）。
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
 # /proc 解析（agent_runner 统计容器内 noVNC 端口 ESTABLISHED 连接，判 VNC 桌面是否在用）。
 # 仅在 Linux target 的 agent_runner 里引入（target-gated），Mac 开发编译不拉它。
 procfs = "0.18"
-unindent = "0.2"                                                   # 使用 crates.io 版本
-open = "5.4"                                                       # 使用 crates.io 版本
-git2 = "0.21"
-tree-sitter-rust = "0.24"                                          # 使用 crates.io 版本
 
 
 # Additional dependencies for nuwax_parser
 sha2 = "0.11"
 hex = "0.4"
-walkdir = "2.5"
 # 并行目录遍历 (work-stealing 线程池), 用于 file-server search-files。
 # 取代手写 BFS: 零 syscall d_type + 多线程并行, dua-cli (gitoxide 作者 Byron 维护) 的核心库。
-dua-core = "5.0"
+dua-core = "6.1"
 # HTTP client。reqwest 0.13 的 default-tls 本就是 rustls(aws-lc-rs + rustls-platform-verifier 读 OS 根证书)，
 # 并无 openssl/native-tls。这里 default-features=false + 显式 rustls 固化“全 workspace 用 rustls”，
 # 防止未来 reqwest 改默认后悄悄回退；charset/http2/system-proxy 补回原默认特性。
@@ -235,39 +216,35 @@ reqwest = { version = "0.13", default-features = false, features = [
 genai = "0.7"
 
 # 项目依赖 - 保留核心功能
-aho-corasick = "1.1"
 base64 = "0.23"
-circular-buffer = "2.0"
-fancy-regex = "0.20"
-fuzzy = "0.0.1"
 globset = "0.4"
-image = "0.25"
-indexmap = "2.14"
 pathdiff = "0.2"
-postage = "0.5"
 regex = "1.13"
 semver = "1.0"
 # npm/node 版本范围语义（与 package.json 依赖版本一致；不同于 Cargo semver）
 node-semver = "2.2"
-shellexpand = "3.1"
-winnow = "1.0.4"
+winnow = "1.0"
 workspace-manifest = { path = "crates/workspace-manifest" }
 userapp-log-reader = { path = "crates/userapp-log-reader" }
+# runtime-state-layout（app-cli/file-server/file-server-userapp 三方共用的状态根
+# 解析契约）：本次收编为 workspace 声明；process_utils/runtime-supervisor 早已
+# 在下方"项目依赖"区声明，勿重复添加。
+runtime-state-layout = { path = "crates/runtime-state-layout" }
 shlex = "2.0"
-smallvec = "1.16"
 
-toml = "1.1.8"
+toml = "1.2"
 which = "8.0"
+
+# app-cli 专用依赖（版本仍集中在此维护，成员以 workspace = true 引用）
+pingap-config = "0.16.1"
+glob = "0.3"
+roxmltree = "0.21"
+infer = { version = "0.22", default-features = false }
 
 
 # Dev dependencies for testing
-ctor = "1.0.13"
-pretty_assertions = "1.4"
 tempfile = "3.27"
-filetime = "0.2"
 rand = "0.10"
-tokio-test = "0.4"
-expect-test = "1.5"
 
 # File system utilities
 dirs = "7.0"
@@ -290,13 +267,12 @@ utoipa-scalar = { version = "0.4", features = ["axum"] }
 ringbuf = "0.6"
 
 
-diffy = { version = "0.5" }
 
-pingora = { version = "0.9", features = ["lb", "rustls"] }
-pingora-core = { version = "0.9", features = ["rustls"] }
-pingora-http = "0.9"
-pingora-proxy = { version = "0.9", features = ["rustls"] }
-pingora-load-balancing = { version = "0.9", features = ["rustls"] }
+pingora = { version = "0.9.1", features = ["lb", "rustls"] }
+pingora-core = { version = "0.9.1", features = ["rustls"] }
+pingora-http = "0.9.1"
+pingora-proxy = { version = "0.9.1", features = ["rustls"] }
+pingora-load-balancing = { version = "0.9.1", features = ["rustls"] }
 matchit = "0.9"
 
 bollard = { version = "0.21" }
@@ -365,7 +341,7 @@ model_probe = { path = "crates/model_probe" }
 # Hotpath 本地性能剖析（hotpath-rs，本地开发观测；见 AGENTS.md「AI 调试路由」）。
 # 非 optional（官方推荐）：不开 feature 时宏全 no-op、内部依赖零编译；
 # 不进 default features → 生产构建（build-agent-docker）完全无感。
-hotpath = { version = "0.30", default-features = false }
+hotpath = { version = "0.32", default-features = false }
 
 # dial9 事件级 Tokio tracing（本地开发观测，取代已移除的 tokio-console）。
 # default=[] 必须显式开 `tokio`（runtime hooks + recorder_from_env）；不开

@@ -16,7 +16,8 @@ use super::container_params::ContainerCreateParams;
 use super::types::{
     AgentPodDiagnostic, AppEventInfo, ContainerLogEntry, ContainerRuntimeError,
     ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus,
-    ExecResult, RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo, StorageResizeOutcome,
+    ExecResult, LogDirectoryMounts, ReclaimPermit, ReclaimRefused, RemovedContainerInfo, ResourceUsage,
+    RuntimeContainerInfo, StorageResizeOutcome,
 };
 
 // mpsc 仍在 lib.rs re-export（`container_runtime_api::mpsc::Receiver` 被 docker_manager /
@@ -114,6 +115,57 @@ pub trait AgentContainerRuntime: Send + Sync {
             "Agent resource events are unsupported".into(),
         ))
     }
+    /// 命名空间级 Pod 概览观测（`/computer/pod/overview` 数据源）。
+    ///
+    /// 采集当前 namespace（k8s）/ 本 daemon（docker）内**全部**容器/Pod 的
+    /// 规格、健康与最近事件。分区失败以 `degraded` 标注（事件/卷），
+    /// 列表本身失败返回 Err——没有列表这个查询没有意义。
+    ///
+    /// 容器已不存在时，探测它**最近一次终止**的证据。
+    ///
+    /// 场景：docker 下**auto_remove 的容器**退出即被删除，`inspect` 无从
+    /// 查询；但 daemon 的**事件历史仍在**，其中 `oom` 事件是 Docker 专为
+    /// cgroup OOM 发出的（比 exitCode 可靠——137 同样来自 SIGKILL）。
+    /// ⚠️ agent 容器已不再 auto_remove（停止后保留 10 分钟，见 B1），
+    /// 对它们 `inspect` 通常还能直接读到；本方法是**容器真被删掉**时的
+    /// 兜底，不再是 agent 的常规路径。k8s 不需要本方法（Pod 保留
+    /// terminated 状态）。
+    ///
+    /// 返回 `None` = 事件窗口内查不到（超出回放条数/时间窗，或从未运行过）。
+    /// 默认实现返回 `None`（老实现/测试替身行为不变）。
+    async fn container_termination_history(
+        &self,
+        _identifier: &str,
+    ) -> ContainerRuntimeResult<Option<crate::LastTermination>> {
+        Ok(None)
+    }
+
+    /// 单容器健康快照（`/computer/pod/health`，供前端轮询）。
+    ///
+    /// 只查**一个**容器：k8s 单 Pod GET、docker inspect(+events)。刻意不复用
+    /// `observe_namespace_pods`（那是 namespace 全量 list，为一个容器付 48 个
+    /// 的成本）。默认 Unsupported——老实现/测试替身行为不变。
+    async fn container_health(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<crate::ContainerHealth>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "container health is unsupported by this runtime".to_string(),
+        ))
+    }
+
+    /// 默认 Unsupported：老实现与测试替身行为不变；调用方（overview
+    /// handler）把它映射为 503 + `error_detail`，不静默返回空。
+    async fn observe_namespace_pods(
+        &self,
+        _events_limit: usize,
+    ) -> ContainerRuntimeResult<crate::pod_overview::PodOverviewSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "pod overview is unsupported by this runtime".into(),
+        ))
+    }
+
     /// Create and start a container
     async fn create_container(
         &self,
@@ -238,17 +290,6 @@ pub trait AgentContainerRuntime: Send + Sync {
             ));
         }
         self.capture_builder_control(context).await
-    }
-
-    /// Read credentials from this captured live builder, never from a later
-    /// platform template. Implementations must not expose the credential in logs.
-    async fn get_bound_builder_file_credentials(
-        &self,
-        _target: &shared_types::BuilderControlTarget,
-    ) -> ContainerRuntimeResult<shared_types::FileServerRequestCredentials> {
-        Err(ContainerRuntimeError::ConfigurationError(
-            "Captured builder file credentials are unsupported".into(),
-        ))
     }
 
     /// Recover an original successful create response from a durable runtime
@@ -474,7 +515,9 @@ pub trait AgentContainerRuntime: Send + Sync {
     }
 
     /// Recreate a lost controller from an operation-bound archive, retaining
-    /// original volumes. Never infer this authority from a resource name.
+    /// original volumes. Never infer this authority from a resource name. The
+    /// only sources a runtime may change are one-time log directories, and it
+    /// reports each change through [`Self::builder_restart_mount_witness`].
     async fn restore_builder_restart(
         &self,
         _template: &shared_types::BuilderRestartTemplate,
@@ -482,6 +525,21 @@ pub trait AgentContainerRuntime: Send + Sync {
         Err(ContainerRuntimeError::ConfigurationError(
             "Builder controller restoration is unsupported".into(),
         ))
+    }
+
+    /// The mounts this restart's replacement actually had changed, read back
+    /// from that container: its physical ID and, for each changed mount, the
+    /// archived and the new bind source. Call it after
+    /// [`Self::restore_builder_restart`]. Recaptured mounts may differ from the
+    /// archived ones only by the sources recorded here, and only when the
+    /// recaptured container is the recorded one; every other mount must come
+    /// back exactly as archived. `Ok(None)`: no replacement of this archive
+    /// exists. The default records no change.
+    async fn builder_restart_mount_witness(
+        &self,
+        _template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartMountWitness>> {
+        Ok(None)
     }
 
     async fn capture_builder_compute_volumes(
@@ -671,6 +729,80 @@ pub trait AgentContainerRuntime: Send + Sync {
         self.find_container(identifier, service_type).await
     }
 
+    /// Host paths currently claimed by some container as a bind mount source,
+    /// including containers that are stopped but not yet removed.
+    ///
+    /// Callers use it to protect host directories a container is still mounting:
+    /// while a path is in this set it must not be deleted. Deciding by mounted
+    /// paths rather than by container name is deliberate — a container that was
+    /// renamed still holds its mounts, so a name lookup would wrongly report it
+    /// as gone and get its log directory deleted.
+    ///
+    /// Implementations must read the real runtime and must not answer from the
+    /// in-process container cache: that cache starts empty after a restart and
+    /// only refills as containers are touched again. The default reports `Err`
+    /// ("unknown"), so a caller can never mistake an unsupported inventory for
+    /// "nothing is mounted".
+    async fn mounted_host_paths(
+        &self,
+    ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "mounted host path inventory is not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// Decide for every candidate log directory whether a container still
+    /// mounts it. Candidates are in the RCoder process's filesystem namespace.
+    ///
+    /// Each candidate ends up mounted, unconfirmed, or in neither set, which
+    /// means no container mounts it. A candidate that cannot be mapped or
+    /// resolved is reported unconfirmed on its own, so one bad directory never
+    /// stops the others from being reclaimed. Like the inventory above, the
+    /// default reports `Err`: an unsupported runtime must never be mistaken for
+    /// "nothing is mounted".
+    async fn mounted_log_directories(
+        &self,
+        _candidates: &[std::path::PathBuf],
+    ) -> ContainerRuntimeResult<LogDirectoryMounts> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "log directory mount inventory is not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// Take permission to delete one candidate log directory. Call it as
+    /// the last step before deleting the directory and hold the permit
+    /// until the deletion has returned. Candidates are in the RCoder
+    /// process's filesystem namespace, as above.
+    ///
+    /// The inventory is one snapshot, and this call closes the gaps it
+    /// leaves. It is one atomic step with the creators' registration:
+    ///
+    /// - A creator has already registered the candidate, or a path below
+    ///   it: [`ReclaimRefused::InUse`]. The caller keeps the directory.
+    /// - The runtime cannot decide: [`ReclaimRefused::Unconfirmed`]. Keep
+    ///   it.
+    /// - Otherwise a permit is returned, and until it is dropped a creator
+    ///   that registers the candidate waits for the deletion to finish
+    ///   instead of binding a directory that is being removed.
+    ///
+    /// A creation that both started and finished after the inventory was
+    /// taken is in neither of its sets. The runtime keeps the inventory it
+    /// handed out together with a generation of the creators' registry;
+    /// when the generation has moved by the time of this call, it re-reads
+    /// the runtime once the candidate is marked and works from the newer
+    /// view for the rest of the sweep.
+    ///
+    /// Like the inventory, the default refuses: an unsupported runtime
+    /// must never delete.
+    async fn begin_log_directory_reclaim(
+        &self,
+        _candidate: &std::path::Path,
+    ) -> Result<ReclaimPermit, ReclaimRefused> {
+        Err(ReclaimRefused::Unconfirmed(
+            "log directory reclaim is not supported by this runtime".to_string(),
+        ))
+    }
+
     /// Stop and remove container
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()>;
 
@@ -834,6 +966,120 @@ pub trait WorkspaceRuntime: Send + Sync {
         _service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Vec<String>> {
         Ok(vec![])
+    }
+
+    /// 该 identifier 的 per-agent workspace PVC 是否存在（**纯存在性, 不创建**）。
+    ///
+    /// per-agent RBD 转发层的混住判据读侧：PVC 存在 = 该用户已切 RBD（请求转发到
+    /// agent 容器）；不存在 = 共享用户（请求走 rcoder 本地共享卷直读）。
+    /// 与 [`Self::ensure_workspace`] 的关键差异：ensure 会创建（把共享用户误变
+    /// RBD 用户），本方法只读。K8s 实现带短 TTL 缓存（30s，对齐 userapp 探活
+    /// 缓存口径——迁移翻转标记后最多一个 TTL 窗口内判据滞后）；Docker 模式
+    /// 恒 false（无 per-agent PVC 概念）。
+    async fn workspace_pvc_exists(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// per-agent workspace 的迁移状态（PVC annotation 投影）。
+    ///
+    /// 判据层三态的真源: PVC 不存在 = NotMigrated; 存在但无/无法识别
+    /// annotation = NotMigrated(fail-safe); `migrated` = Migrated。
+    /// K8s 实现带 30s TTL 缓存（与 workspace_pvc_exists 同口径）;
+    /// Docker 恒 NotMigrated。
+    async fn workspace_migration_state(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceMigrationState> {
+        Ok(shared_types::WorkspaceMigrationState::NotMigrated)
+    }
+
+    /// 翻迁移状态（cutover 落 / 回滚撤）。K8s: patch PVC annotation
+    /// （UID+resourceVersion 条件化, 与 resize 同款 CAS 语义）; PVC 不存在
+    /// 报 NotFound（未 phase-a 不能 cutover）。Docker: 不支持。
+    /// rollback 后把 fresh-init 卷的来源标记改写为 rolled-back（复审第四
+    /// 轮 P1）：ensure 的首建续接分支只认 NotMigrated + fresh-init，改写后
+    /// 显式回滚不会被自动切回 RBD。默认 no-op（无 PVC 概念的形态）。
+    async fn mark_workspace_volume_rolled_back(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(())
+    }
+
+    async fn set_workspace_migration_state(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _state: shared_types::WorkspaceMigrationState,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "workspace migration state is unsupported by this runtime".to_string(),
+        ))
+    }
+
+    /// per-agent workspace 卷当前是否仍被 Pod 挂载（迁移 cutover 防呆）。
+    ///
+    /// K8s: PVC→PV→VolumeAttachment(status.attached) 查询。**fail-closed 语义
+    /// 由调用方保证**：查询出错时调用方必须中止（RWO 同节点双挂 = ext4 损坏）。
+    /// Docker: 恒 false（无 VA 概念, 宿主机 bind 无此风险）。
+    async fn workspace_volume_attached(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// 跑一轮 rclone 同步（Job 载体: src 共享卷 RO + dst per-agent RBD RW）。
+    ///
+    /// `mode` 见 [`shared_types::WorkspaceSyncMode`]。Job 完成判据用
+    /// `.status.succeeded>=1`（**不是** failed!=0——failed 是累计计数器,
+    /// backoffLimit 重试成功后仍为 1）。Job 失败/超时返回 Err（含尾部日志）。
+    /// Docker: 不支持（宿主机无 PVC 双卷形态）。
+    async fn run_workspace_migration_sync(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _mode: shared_types::WorkspaceSyncMode,
+        _src_pvc: &str,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "workspace migration sync is unsupported by this runtime".to_string(),
+        ))
+    }
+
+    /// 补迁：往**已迁移**用户的 per-agent 卷上，从共享卷只补目标上没有的文件
+    /// （Job 载体同同步：src RO + dst RW；`rclone copy --ignore-existing`，不覆盖、不删除）。
+    ///
+    /// 范围与模式见 [`shared_types::WorkspaceBackfill`]（调用方须已校验，这里是纵深防御）。
+    /// Job 补完后对自己拷过的范围做一遍软链完整性校验，仍有"源上能解析、目标上悬空"
+    /// 的软链即 Job 失败。Job 失败/超时返回 Err（带 Job 日志尾部：空间不够、坏软链的
+    /// 清单都只在那里）。Docker: 不支持（宿主机无 PVC 双卷形态）。
+    async fn backfill_workspace(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _backfill: &shared_types::WorkspaceBackfill,
+        _src_pvc: &str,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceBackfillReport> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "workspace backfill is unsupported by this runtime".to_string(),
+        ))
+    }
+
+    /// 迁移 Job 的前置配置校验（镜像等）——**无 I/O、无副作用**。
+    ///
+    /// 编排入口在产生任何副作用（建 PVC、停 agent）之前调用：配置问题若拖到
+    /// `run_workspace_migration_sync` 里才报，留下的是残留 PVC 或停机。
+    /// 默认 `Ok(())`：不支持迁移的后端与测试替身无需实现。
+    async fn check_workspace_migration_config(&self) -> ContainerRuntimeResult<()> {
+        Ok(())
     }
 
     /// 确保 per-agent workspace PVC 存在 (幂等: 已存在则复用, 不存在则创建)。
@@ -1350,6 +1596,26 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         &self,
         _prior: &shared_types::UserAppComputeStartTarget,
     ) -> ContainerRuntimeResult<Option<shared_types::UserAppMutationTarget>> {
+        Ok(None)
+    }
+
+    /// 列出本运行时管理的 UserApp 工作负载及其当前模板镜像（只读）。
+    /// 漂移对账台账（spec sandbox-image-version-drift R3/R5）的数据源；
+    /// 不做任何判定或收敛，分类与记录由引擎侧扫描器完成。
+    async fn list_userapp_workload_images(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<shared_types::UserAppWorkloadImageInfo>> {
+        Ok(Vec::new())
+    }
+
+    /// 启动镜像漂移观察兜底（spec sandbox-image-version-drift R4，K8s 专有；
+    /// Docker 无控制器自愈形态，默认不启动）。返回后台任务句柄；None 表示
+    /// 该运行时不支持。收敛动作复用既有启动/补丁路径，观察只做事件排队。
+    async fn start_userapp_image_drift_watch(
+        &self,
+        _config: shared_types::UserAppImageDriftWatchConfig,
+        _shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> ContainerRuntimeResult<Option<tokio::task::JoinHandle<()>>> {
         Ok(None)
     }
 

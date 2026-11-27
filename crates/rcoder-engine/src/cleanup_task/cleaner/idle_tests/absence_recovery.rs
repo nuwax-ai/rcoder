@@ -122,6 +122,22 @@ async fn missing_compute_registration_retirement_is_durable_and_peer_cannot_rout
         "Strict PG recovery requires an isolated database"
     );
     let Some(dsn) = dsn else { return };
+    // A sweep scans every registration its store can see. Rows left in a shared
+    // test database by other tests are not this fixture's: the real, unfiltered
+    // scan would probe each of them through this runtime and pay a gRPC connect
+    // timeout for every unreachable one. Only a private schema limits the sweep
+    // to what this test registered.
+    let schema = format!("absent_retirement_{}", uuid::Uuid::new_v4().simple());
+    let mut admin = toasty::Db::builder().connect(&dsn).await.unwrap();
+    toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    let config = rcoder_storage::config::PostgresConfig {
+        url: Some(format!("{dsn}{separator}options=-csearch_path%3D{schema}")),
+        ..Default::default()
+    };
     let mut f = Fixture::new(1).await;
     let old = f.cleaner.state.get_project("idle-project-0").unwrap();
     let id = format!("absent-pg-project-{}", uuid::Uuid::new_v4());
@@ -144,10 +160,6 @@ async fn missing_compute_registration_retirement_is_durable_and_peer_cannot_rout
             ..Default::default()
         },
     );
-    let config = rcoder_storage::config::PostgresConfig {
-        url: Some(dsn),
-        ..Default::default()
-    };
     let store = Arc::new(
         rcoder_storage::pg::PgStore::connect(&config, "test-ns".into(), "cluster.local".into())
             .await
@@ -171,6 +183,7 @@ async fn missing_compute_registration_retirement_is_durable_and_peer_cannot_rout
             .unwrap()
             .is_some()
     );
+    drop(before);
     drop(
         tracing_subscriber::fmt()
             .with_env_filter("rcoder_engine=debug,rcoder_storage=debug")
@@ -184,7 +197,14 @@ async fn missing_compute_registration_retirement_is_durable_and_peer_cannot_rout
     f.cleaner.agent_scanner.state = state;
     f.runtime.missing.store(true, Ordering::SeqCst);
     f.activity.unreadable.store(true, Ordering::SeqCst);
-    f.cleaner.cleanup_once().await.unwrap();
+    // Exactly one registration is visible to this sweep, and its own step
+    // budgets (activity probe, admission wait, absence observation) bound
+    // every legitimate step well below this. A sweep still running here is
+    // hung, not slow: fail instead of waiting indefinitely.
+    tokio::time::timeout(Duration::from_secs(60), f.cleaner.cleanup_once())
+        .await
+        .expect("cleanup sweep must finish within its own step budgets")
+        .unwrap();
     let peer =
         rcoder_storage::pg::PgStore::connect(&config, "test-ns".into(), "cluster.local".into())
             .await
@@ -198,6 +218,13 @@ async fn missing_compute_registration_retirement_is_durable_and_peer_cannot_rout
     assert!(f.cleaner.state.get_project(&id).is_none());
     assert_eq!(f.runtime.stops.load(Ordering::SeqCst), 0);
     f.close().await;
+    // A failed assertion keeps the schema for diagnosis; a passed one leaves
+    // nothing behind in the shared database.
+    drop(peer);
+    toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

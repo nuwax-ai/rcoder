@@ -45,8 +45,10 @@ use crate::router::AppState;
 pub async fn computer_db_reset_password(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ResetDbPasswordRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
     if req.password.is_empty() {
         return Err(AppError::validation_error("password must not be empty"));
     }
@@ -81,7 +83,12 @@ pub async fn computer_db_reset_password(
         )));
     }
     info!("[COMPUTER_DB] PG password reset: user_id={}", user_id);
-    Ok(Json(HttpResult::success("密码已重置".to_string())))
+    Ok(Json(HttpResult::success(
+        shared_types::error_codes::get_error_message(
+            shared_types::error_codes::ERR_DB_PASSWORD_RESET,
+            locale,
+        ),
+    )))
 }
 
 /// 新建容器内 PG 数据库
@@ -105,8 +112,10 @@ pub async fn computer_db_reset_password(
 pub async fn computer_db_create_database(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CreateDatabaseRequest>,
 ) -> Result<Json<HttpResult<String>>, AppError> {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
     validate_pg_identifier(&req.database).map_err(|e| AppError::validation_error(&e))?;
     if let Some(owner) = &req.owner {
         validate_pg_identifier(owner).map_err(|e| AppError::validation_error(&e))?;
@@ -162,7 +171,12 @@ pub async fn computer_db_create_database(
         "[COMPUTER_DB] database created: {} (user_id={})",
         req.database, user_id
     );
-    Ok(Json(HttpResult::success("数据库已创建".to_string())))
+    Ok(Json(HttpResult::success(
+        shared_types::error_codes::get_error_message(
+            shared_types::error_codes::ERR_DB_CREATED,
+            locale,
+        ),
+    )))
 }
 
 /// 按 user_id 解析 computer agent-runner 容器名。未找到 → 404。

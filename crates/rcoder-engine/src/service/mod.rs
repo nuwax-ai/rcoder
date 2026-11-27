@@ -22,3 +22,5 @@ pub use computer_container_manager::ComputerContainerManager;
 pub use container_status_checker::{ContainerStatusCheckerConfig, start_container_status_checker};
 #[allow(unused_imports)]
 pub use container_sync::{ContainerSyncConfig, start_container_sync_task};
+#[cfg(feature = "kubernetes")]
+pub mod sandbox_manager;

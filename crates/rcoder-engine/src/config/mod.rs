@@ -106,6 +106,11 @@ pub struct AppConfig {
     /// Userapp 闲置自动回收 + 流量唤醒配置
     #[serde(default)]
     pub userapp_recycle: UserAppRecycleConfig,
+    /// UserApp 镜像漂移治理（R3 只读台账 + R4 观察兜底）
+    #[serde(default)]
+    pub userapp_image_drift: UserAppImageDriftConfig,
+    #[serde(default)]
+    pub e2b_sandbox: E2bSandboxConfig,
     /// 存储后端配置（rcoder-pg：memory=纯内存单节点，postgres=PG 持久化）
     #[serde(default)]
     pub storage: StorageConfig,
@@ -127,6 +132,10 @@ pub struct AppConfig {
     /// 已死（无租约绑定 / 物理租约过期）→ 自动收束 Failed，不再永久占受理 slot。
     #[serde(default)]
     pub fence_settle_grace_secs: Option<u64>,
+    /// 无执行者的历史 Builder 预检拒绝围栏，开始核验前的退避下限（秒），缺省 60s。
+    /// 年龄与缺少 SQL 回执都不能证明运行时写入已经收束。
+    #[serde(default)]
+    pub unclaimed_settle_grace_secs: Option<u64>,
 }
 
 pub(crate) fn default_agent_id() -> String {
@@ -174,6 +183,8 @@ impl Default for AppConfig {
             kubernetes_config: None,
             cleanup_config: CleanupConfigSettings::default(),
             userapp_recycle: UserAppRecycleConfig::default(),
+            userapp_image_drift: UserAppImageDriftConfig::default(),
+            e2b_sandbox: E2bSandboxConfig::default(),
             userapp_error_page: None,
             storage: StorageConfig::default(),
             userapp_storage: UserAppStorageConfig::default(),
@@ -183,6 +194,7 @@ impl Default for AppConfig {
             },
             app_manager: app_manager::AppManagerConfig::default(),
             fence_settle_grace_secs: None,
+            unclaimed_settle_grace_secs: None,
         }
     }
 }
@@ -195,6 +207,6 @@ pub use loader::{
     load_config_with_args, parse_api_key_config,
 };
 pub use sections::{
-    CleanupConfigSettings, DeployHostConfig, DockerConfig, OrphanReconcileMode, ProxyConfig,
-    UserAppRecycleConfig,
+    CleanupConfigSettings, DeployHostConfig, DockerConfig, E2bSandboxConfig, OrphanReconcileMode,
+    ProxyConfig, UserAppImageDriftConfig, UserAppRecycleConfig,
 };

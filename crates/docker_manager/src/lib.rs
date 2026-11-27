@@ -19,6 +19,7 @@ pub mod container_query;
 pub mod deploy_host_ports;
 pub mod health;
 pub mod image_management;
+mod log_directory;
 pub mod manager_cleanup;
 mod native_domain;
 pub mod network;
@@ -36,6 +37,10 @@ pub use utils::*;
 
 // DockerApiCache 从 manager 拆出后单独导出，保持 `docker_manager::DockerApiCache` 路径不变
 pub use api_cache::DockerApiCache;
+pub use log_directory::{DirectoryBeingReclaimed, PendingBinds};
+// 仅供其它 crate 的测试使用：登记一条正在准备挂载的日志目录
+#[cfg(feature = "test-support")]
+pub use log_directory::claim_pending_bind_for_test;
 
 // 公共导出新模块
 pub use container_builder::{ContainerConfigBuilder, MountProcessor};

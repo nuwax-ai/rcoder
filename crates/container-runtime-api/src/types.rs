@@ -3,7 +3,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared_types::ServiceType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use utoipa::ToSchema;
@@ -28,6 +29,100 @@ pub enum AppOperationLeaseObservation {
     /// settled, and never authorizes drain or takeover by itself.
     AbsentOriginalIdentity,
     Unconfirmed,
+}
+
+/// Per-candidate outcome of one mount lookup for log directories.
+///
+/// A candidate that appears in neither field is confirmed to be mounted by no
+/// container. A failure that concerns one candidate is reported in
+/// `unconfirmed` and leaves the other candidates decidable; an `Err` from
+/// [`crate::AgentContainerRuntime::mounted_log_directories`] is reserved for
+/// failures that invalidate the whole inventory.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LogDirectoryMounts {
+    /// Candidates that some container still mounts.
+    pub mounted: HashSet<PathBuf>,
+    /// Candidates whose mount status could not be confirmed, with the reason,
+    /// indexed by path. Callers must keep them: none of them may be treated as
+    /// unmounted.
+    pub unconfirmed: HashMap<PathBuf, String>,
+}
+
+impl LogDirectoryMounts {
+    /// The recorded reason when `candidate` is unconfirmed.
+    #[must_use]
+    pub fn unconfirmed_reason(&self, candidate: &Path) -> Option<&str> {
+        self.unconfirmed.get(candidate).map(String::as_str)
+    }
+}
+
+/// Why the runtime refused permission to delete a candidate log directory.
+/// The directory stays in both cases; the two differ only in whether the
+/// caller should treat it as noteworthy.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ReclaimRefused {
+    /// A container still being created has registered the candidate, or a
+    /// path below it. Normal and transient: the directory is looked at
+    /// again on a later sweep.
+    InUse(String),
+    /// The runtime could not decide. Needs attention.
+    Unconfirmed(String),
+}
+
+impl ReclaimRefused {
+    /// The recorded reason.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::InUse(reason) | Self::Unconfirmed(reason) => reason,
+        }
+    }
+}
+
+impl std::fmt::Display for ReclaimRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InUse(reason) => write!(f, "still in use: {reason}"),
+            Self::Unconfirmed(reason) => write!(f, "unconfirmed: {reason}"),
+        }
+    }
+}
+
+/// Permission to delete one candidate log directory, taken from the runtime
+/// as the last step before deleting it and held until the deletion has
+/// returned. Dropping it is what tells creators they may bind the path
+/// again, so keep it alive for exactly as long as the deletion runs.
+pub struct ReclaimPermit {
+    release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl ReclaimPermit {
+    /// A permit with no runtime state behind it.
+    #[must_use]
+    pub fn noop() -> Self {
+        Self { release: None }
+    }
+
+    /// A permit that runs `release` once, when dropped.
+    pub fn release_on_drop(release: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+}
+
+impl Drop for ReclaimPermit {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for ReclaimPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReclaimPermit")
+    }
 }
 
 /// Pre-fence physical exclusion for an early compute coordinator. This is not

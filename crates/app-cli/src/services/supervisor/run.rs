@@ -19,7 +19,7 @@ pub struct RunProfile {
 #[derive(Clone)]
 pub struct PreparedProxy {
     pub workspace: std::path::PathBuf,
-    pub release: crate::manifest::ReleaseLock,
+    pub release: manifest::ReleaseLock,
     pub dev_profile: bool,
     pub outcome: crate::proxy::compiler::CompileOutcome,
 }
@@ -228,11 +228,9 @@ pub(super) async fn run_inner(
                 );
                 continue;
             }
-            crate::orchestration_events::emit(
-                &crate::orchestration_events::OrchestrationEvent::ServiceStarting {
-                    service: spec.service_id.clone(),
-                },
-            );
+            crate::orchestration_events::emit(&OrchestrationEvent::ServiceStarting {
+                service: spec.service_id.clone(),
+            });
             let launched_at = tokio::time::Instant::now();
             match start_service(
                 spec,
@@ -335,10 +333,10 @@ pub(super) async fn run_inner(
         //（main.rs 的 run 子命令与 run()）恒为 None——即便直跑进程处于原生
         // 监督下，单次编排的进程域仍走会话树（树外进程会在 run 返回后孤儿化）。
         let serve_form = on_running.is_some();
-        if serve_form && super::resident::owner_scope_root()?.is_some() {
-            super::resident::ensure_resident(args, &outcome).await?;
+        if serve_form && resident::owner_scope_root()?.is_some() {
+            resident::ensure_resident(args, &outcome).await?;
         } else {
-            super::pingap::spawn_pingap_into_session_tree(
+            pingap::spawn_pingap_into_session_tree(
                 &outcome,
                 &args.pingap_bin,
                 &crate::proxy::compiler::active_config_path(&runtime_root),
@@ -404,10 +402,10 @@ pub(super) async fn run_inner(
         error!("❌ startup failed, shutting down already-started children: {error:#}");
         // Includes cancellation during proxy confirmation or bridge readiness.
         // A normal route must not outlive the business roots it forwards to.
-        if let Err(entry_error) = super::supervise::drain_or_close_resident_for_startup(
+        if let Err(entry_error) = drain_or_close_resident_for_startup(
             &startup_scope,
             cancel.as_ref(),
-            tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET,
+            tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET,
         )
         .await
         {
@@ -486,10 +484,10 @@ pub(super) async fn run_inner(
         None => match wait_for_bridge(&release, &specs, cancel.as_ref()).await {
             Ok(ready) => ready,
             Err(error) => {
-                let entry = super::supervise::drain_or_close_resident_for_startup(
+                let entry = drain_or_close_resident_for_startup(
                     &startup_scope,
                     cancel.as_ref(),
-                    tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET,
+                    tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET,
                 )
                 .await;
                 let stopped = shutdown_all(std::mem::take(&mut children), 5).await;
@@ -526,7 +524,7 @@ pub(super) async fn run_inner(
 }
 
 fn supervisor_cleanup_unknown(error: anyhow::Error, cleanup: anyhow::Error) -> anyhow::Error {
-    super::supervise::ShutdownUnconfirmed(format!(
+    ShutdownUnconfirmed(format!(
         "startup failed: {error:#}; entry cleanup: {cleanup:#}"
     ))
     .into()

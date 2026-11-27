@@ -60,6 +60,17 @@ impl ApiKeyValidator {
             return true;
         }
 
+        // E2B 兼容沙箱控制面：独立 e2b key 鉴权链（router/sandbox.rs），
+        // 不走 rcoder 服务级 key；数据面由最外层守卫短路，不经此校验。
+        if path.starts_with("/sandboxes")
+            || path.starts_with("/v2/sandboxes")
+            || path.starts_with("/templates")
+            || path.starts_with("/v2/templates")
+            || path.starts_with("/volumes")
+        {
+            return true;
+        }
+
         false
     }
 

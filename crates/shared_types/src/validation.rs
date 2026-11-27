@@ -102,6 +102,117 @@ pub static IDENTIFIER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLoc
     regex::Regex::new(r"\A[a-zA-Z0-9_-]{1,64}\z").expect("identifier whitelist regex")
 });
 
+/// 迁移 Job 名里留给 `user_id` 的长度。Job 名是
+/// `migrate-{user_id 下划线→连字符}-{full|incremental}`，必须是一个 DNS-1123
+/// label（≤63 位）；前后缀最长共占 20 位。
+pub const MIGRATION_USER_ID_MAX_LEN: usize = 43;
+
+/// 迁移编排可接受的 `user_id`：[`validate_identifier`] 之上再加 Kubernetes
+/// 对象名的限制。
+///
+/// user_id（下划线→连字符）同时是迁移 Job 名的中段和 Job 的标签值：对象名只能
+/// 是小写字母、数字、连字符，标签值还得首尾都是字母数字。放不下的 user_id 此前
+/// 要到 cutover **停完 agent** 之后建 Job 才被 apiserver 拒绝，留下停机残留——
+/// 所以在编排入口就拒绝。文案默认英文。
+pub fn validate_migration_user_id(value: &str) -> Result<(), String> {
+    validate_identifier(value, "userId")?;
+    let name_part = value.replace('_', "-");
+    let edge_alphanumeric = name_part.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name_part.ends_with(|c: char| c.is_ascii_alphanumeric());
+    let dns_safe = name_part
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if name_part.len() > MIGRATION_USER_ID_MAX_LEN || !edge_alphanumeric || !dns_safe {
+        return Err(format!(
+            "userId {value:?} cannot name a Kubernetes migration Job: expected at most {} \
+             lowercase letters, digits, '_' or '-', starting and ending with a letter or digit",
+            MIGRATION_USER_ID_MAX_LEN
+        ));
+    }
+    Ok(())
+}
+
+// ── 补迁（backfill）的范围与模式 ──
+//
+// 补迁 Job 的脚本参数逐个来自请求（见 `docker_manager` 的 `BackfillJobPlan`）：
+// 范围作为字面量拼进 rclone 的放行规则，模式本来就是 rclone 通配。形态不对的值不能等到
+// 停完 agent、Job 跑起来才暴露。
+
+/// 一次补迁请求最多给这么多范围 / 模式（Fail Fast）。
+pub const WORKSPACE_BACKFILL_MAX_PATHS: usize = 64;
+pub const WORKSPACE_BACKFILL_MAX_ONLY_PATTERNS: usize = 16;
+const WORKSPACE_BACKFILL_PATH_MAX_LEN: usize = 512;
+const WORKSPACE_BACKFILL_ONLY_MAX_LEN: usize = 256;
+
+const BACKFILL_PATHS: &str = "paths";
+const BACKFILL_ONLY: &str = "only-patterns";
+
+/// 补迁的范围（相对用户目录）。文案默认英文。
+///
+/// 两种通配写法原样放行：`.`（整棵树）、`*`（顶层非点开头的目录里源与目标都有的）。
+/// 其余必须是干净的相对路径——它作为字面量拼进 rclone 的放行规则：以 `/` 开头或带 `..`
+/// 是越出用户目录，空的、`.`、`..` 路径段让规则对不上，`*`、`?`、`[`、反斜杠会被 rclone
+/// 当通配或转义解释。
+pub fn validate_workspace_backfill_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.len() > WORKSPACE_BACKFILL_PATH_MAX_LEN {
+        return Err(format!(
+            "{BACKFILL_PATHS} entries must be 1-{WORKSPACE_BACKFILL_PATH_MAX_LEN} characters long, got {path:?}"
+        ));
+    }
+    if path == "." || path == "*" {
+        return Ok(());
+    }
+    if path.starts_with('/') {
+        return Err(format!(
+            "{BACKFILL_PATHS} entries must be relative to the user's home directory, got {path:?}"
+        ));
+    }
+    if path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(format!(
+            "{BACKFILL_PATHS} entries must not contain empty, \".\" or \"..\" segments, got {path:?}"
+        ));
+    }
+    if let Some(bad) = path
+        .chars()
+        .find(|c| matches!(c, '*' | '?' | '[' | '\\') || c.is_control())
+    {
+        return Err(format!(
+            "{BACKFILL_PATHS} entries must not contain {bad:?} (only \"*\" alone is a wildcard), got {path:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// 补迁的 `--only` 模式：相对范围之下任意层级的 rclone 通配（如 `node_modules/**`）。
+pub fn validate_workspace_backfill_only_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() || pattern.len() > WORKSPACE_BACKFILL_ONLY_MAX_LEN {
+        return Err(format!(
+            "{BACKFILL_ONLY} entries must be 1-{WORKSPACE_BACKFILL_ONLY_MAX_LEN} characters long, got {pattern:?}"
+        ));
+    }
+    if pattern.starts_with('/') {
+        return Err(format!(
+            "{BACKFILL_ONLY} entries are matched at any depth below the scope, so they must not start with '/', got {pattern:?}"
+        ));
+    }
+    if pattern
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(format!(
+            "{BACKFILL_ONLY} entries must not contain empty, \".\" or \"..\" segments, got {pattern:?}"
+        ));
+    }
+    if let Some(bad) = pattern.chars().find(|c| *c == '\\' || c.is_control()) {
+        return Err(format!(
+            "{BACKFILL_ONLY} entries must not contain {bad:?}, got {pattern:?}"
+        ));
+    }
+    Ok(())
+}
 // ── 多平台绝对路径规范化（自 file-server workspace.rs 提取，单一事实源）──────
 //
 // 首个消费方为 file-server 的项目绑定目录 workspaceDir（TS nuwax-file-server
@@ -364,6 +475,40 @@ mod tests {
         assert!(validate_identifier("../etc", "id").is_err());
         assert!(validate_identifier("..\\etc", "id").is_err());
         assert!(validate_identifier("é", "id").is_err());
+    }
+
+    /// 反例（部署评审）：`validate_identifier` 放行大写、首尾连字符/下划线和 64 位
+    /// 的 id，但这样的 id 拼出来的迁移 Job 名或标签值不合法——此前要到 cutover
+    /// 停完 agent、建 Job 时才被 apiserver 拒绝（422）。
+    #[test]
+    fn migration_user_id_must_be_able_to_name_the_kubernetes_job() {
+        for id in ["6", "mig-u1", "user_42", "rbd-v2-u1", &"u".repeat(43)] {
+            assert!(validate_migration_user_id(id).is_ok(), "{id} 应通过");
+        }
+        // 长度上界刚好让最长的 Job 名落在 63 位以内
+        assert_eq!(format!("migrate-{}-incremental", "u".repeat(43)).len(), 63);
+
+        let long = "u".repeat(44);
+        for id in [
+            "",
+            "a/b",
+            "a.b",
+            "用户",
+            "ABC123", // 对象名/标签值只认小写
+            "-mig",   // 标签值首尾必须是字母数字
+            "mig-",
+            "_mig",
+            "mig_",
+            long.as_str(),
+        ] {
+            let error = validate_migration_user_id(id).unwrap_err();
+            if validate_identifier(id, "userId").is_ok() {
+                assert!(
+                    error.contains("cannot name a Kubernetes migration Job"),
+                    "'{id:?}' 应以 Job 命名限制为由拒绝: {error}"
+                );
+            }
+        }
     }
 
     // ── normalize_absolute_dir / is_absolute_path_like（与 file-server 既有
@@ -634,6 +779,108 @@ mod tests {
                 "{st:?}: {err}"
             );
         }
+    }
+    /// 反例：补迁的范围作为字面量拼进 rclone 的放行规则，带 `..` 或以 `/` 开头就是越出用户
+    /// 目录；这些值不能等到停完 agent、Job 跑起来才暴露。
+    #[test]
+    fn backfill_paths_are_clean_relative_paths_or_the_two_wildcards() {
+        for ok in [
+            ".",
+            "*",
+            ".local/share/pnpm",
+            "proj-a",
+            "我的 目录/x",
+            &"a".repeat(WORKSPACE_BACKFILL_PATH_MAX_LEN),
+        ] {
+            assert!(
+                validate_workspace_backfill_path(ok).is_ok(),
+                "{ok:?} 应通过"
+            );
+        }
+        let long = "a".repeat(WORKSPACE_BACKFILL_PATH_MAX_LEN + 1);
+        for bad in [
+            "",
+            "/etc",
+            "../other-user",
+            "a/../../b",
+            "./proj",
+            "proj/",
+            "proj//x",
+            "proj/*/x",
+            "proj?",
+            "proj[1]",
+            "a\\b",
+            "a\nb",
+            long.as_str(),
+        ] {
+            let Err(reason) = validate_workspace_backfill_path(bad) else {
+                panic!("{bad:?} 必须被拒")
+            };
+            assert!(reason.contains("paths"), "{bad:?}: {reason}");
+            assert!(
+                !reason.contains('\n'),
+                "多行输入不能把错误撑成多行: {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_only_patterns_are_relative_rclone_globs() {
+        for ok in ["node_modules/**", "dist/**", "core.[0-9]*", "**/vendor"] {
+            assert!(
+                validate_workspace_backfill_only_pattern(ok).is_ok(),
+                "{ok:?} 应通过"
+            );
+        }
+        for bad in [
+            "",
+            "/node_modules/**",
+            "../x/**",
+            "./x",
+            "x//y",
+            "a\\b",
+            "a\u{0}b",
+        ] {
+            let Err(reason) = validate_workspace_backfill_only_pattern(bad) else {
+                panic!("{bad:?} 必须被拒")
+            };
+            assert!(reason.contains("only-patterns"), "{bad:?}: {reason}");
+        }
+    }
+
+    #[test]
+    fn backfill_request_caps_how_many_paths_and_patterns_it_carries() {
+        let mut request = crate::WorkspaceBackfill::default();
+        assert!(
+            request.validate().is_ok(),
+            "缺省范围（顶层点目录）是合法请求"
+        );
+
+        request.paths = vec!["proj".to_string(); WORKSPACE_BACKFILL_MAX_PATHS];
+        request.only = vec!["node_modules/**".to_string(); WORKSPACE_BACKFILL_MAX_ONLY_PATTERNS];
+        assert!(request.validate().is_ok(), "恰好到上限要通过");
+
+        request.paths.push("proj".to_string());
+        let reason = request.validate().unwrap_err();
+        assert_eq!(
+            reason,
+            format!(
+                "backfill accepts at most {} paths, got {}",
+                WORKSPACE_BACKFILL_MAX_PATHS,
+                WORKSPACE_BACKFILL_MAX_PATHS + 1
+            )
+        );
+        request.paths.pop();
+        request.only.push("dist/**".to_string());
+        let reason = request.validate().unwrap_err();
+        assert_eq!(
+            reason,
+            format!(
+                "backfill accepts at most {} only-patterns, got {}",
+                WORKSPACE_BACKFILL_MAX_ONLY_PATTERNS,
+                WORKSPACE_BACKFILL_MAX_ONLY_PATTERNS + 1
+            )
+        );
     }
 }
 

@@ -351,12 +351,12 @@ async fn find_skills_dir(root: &Path) -> AppResult<Option<PathBuf>> {
 
 /// sync_agents fan-out 目标目录: 权威源 .agents/{skills,agents} → 各家 ACP agent 约定目录。
 /// 加新 agent 在此追加目录名即可 (注意: .agents 是权威源本身, 不在此列)。
-/// 源码实证: claude(.claude) / opencode(.opencode) / codex(.codex) / grok(.grok) / pi(.pi)。
+/// 源码实证: claude(.claude) / opencode(.opencode) / nuwax-harness(.nuwax-harness) / grok(.grok) / pi(.pi)。
 // 临时屏蔽: 暂不接入 grok/pi agent, skills/agents 不再 fan-out 到这两家; 接入时取消注释即恢复。
 pub const SYNC_TARGET_DIRS: &[&str] = &[
     ".claude",
     ".opencode",
-    ".codex",
+    ".nuwax-harness",
     // ".grok",
     // ".pi",
 ];
@@ -368,7 +368,7 @@ pub const ALL_AGENT_DIRS: &[&str] = &[
     ".agents",
     ".claude",
     ".opencode",
-    ".codex",
+    ".nuwax-harness",
     // ".grok",
     // ".pi",
 ];
@@ -442,7 +442,7 @@ pub(crate) async fn sync_agents_locked(project_path: &Path) -> AppResult<()> {
     let has_agents = crate::service::fs_util::path_exists(&primary_agents).await?;
 
     // 构建所有 (src, dst, has) 三元组, 创建目标根目录。
-    // 目标根被普通文件等占用（真实路径冲突，如用户自建 `.codex` 文件）时跳过
+    // 目标根被普通文件等占用（真实路径冲突，如用户自建 `.nuwax-harness` 文件）时跳过
     // 该目标、其余目标继续：不删除用户文件，也不让单个目标永久阻塞整个工作区；
     // 每轮同步重新检查，占用解除后自动恢复。
     let mut copy_targets = Vec::new();
@@ -803,8 +803,10 @@ mod tests {
         fs::create_dir_all(ws.join(".agents").join("agents"))
             .await
             .unwrap();
-        // `.codex` 被用户普通文件占用 (真实路径冲突, 生产 OpenClaw 现场)
-        fs::write(ws.join(".codex"), "user file").await.unwrap();
+        // `.nuwax-harness` 被用户普通文件占用 (真实路径冲突, 生产 OpenClaw 现场)
+        fs::write(ws.join(".nuwax-harness"), "user file")
+            .await
+            .unwrap();
 
         sync_agents(ws).await.unwrap();
 
@@ -822,13 +824,15 @@ mod tests {
             "x"
         );
         // 冲突文件不被删除、不改为目录
-        let codex_meta = fs::symlink_metadata(ws.join(".codex")).await.unwrap();
-        assert!(codex_meta.is_file());
+        let harness_meta = fs::symlink_metadata(ws.join(".nuwax-harness"))
+            .await
+            .unwrap();
+        assert!(harness_meta.is_file());
         assert_eq!(
-            fs::read_to_string(ws.join(".codex")).await.unwrap(),
+            fs::read_to_string(ws.join(".nuwax-harness")).await.unwrap(),
             "user file"
         );
-        // 可同步目标全部完成 → marker 照常写入 (占用解除后下轮自动补齐 .codex)
+        // 可同步目标全部完成 → marker 照常写入 (占用解除后下轮自动补齐 .nuwax-harness)
         assert_eq!(
             fs::read_to_string(ws.join(".agents/.sync_version"))
                 .await
@@ -911,7 +915,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         // 源与全部实体目标名称集一致 → 不漂移
-        for dir in [".agents", ".claude", ".opencode", ".codex"] {
+        for dir in [".agents", ".claude", ".opencode", ".nuwax-harness"] {
             fs::create_dir_all(ws.join(dir).join("skills/sk1"))
                 .await
                 .unwrap();
@@ -928,7 +932,7 @@ mod tests {
         assert!(fanout_names_drifted(ws).await.unwrap());
 
         // 对齐后恢复不漂移
-        for dir in [".claude", ".opencode", ".codex"] {
+        for dir in [".claude", ".opencode", ".nuwax-harness"] {
             fs::create_dir_all(ws.join(dir).join("skills/sk2"))
                 .await
                 .unwrap();
@@ -936,8 +940,10 @@ mod tests {
         assert!(!fanout_names_drifted(ws).await.unwrap());
 
         // 目标根被普通文件占用 → 该目标不参与比较 (其余一致即不漂移)
-        fs::remove_dir_all(ws.join(".codex")).await.unwrap();
-        fs::write(ws.join(".codex"), "occupied").await.unwrap();
+        fs::remove_dir_all(ws.join(".nuwax-harness")).await.unwrap();
+        fs::write(ws.join(".nuwax-harness"), "occupied")
+            .await
+            .unwrap();
         assert!(!fanout_names_drifted(ws).await.unwrap());
 
         // 目标整体缺失 → 漂移 (补一次 fan-out 后自稳)
@@ -966,7 +972,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn fanout_names_drifted_excludes_symlinked_target_root() {
-        // `.codex` 整个被用户链走: sync_agents 对该目标根整体跳过, drift 判据
+        // `.nuwax-harness` 整个被用户链走: sync_agents 对该目标根整体跳过, drift 判据
         // 必须同样排除——否则判定与同步行为不一致, 每次重启都空转一次 sync
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
@@ -980,7 +986,7 @@ mod tests {
         }
         let foreign = tmp.path().join("foreign");
         fs::create_dir_all(&foreign).await.unwrap();
-        std::os::unix::fs::symlink("../foreign", ws.join(".codex")).unwrap();
+        std::os::unix::fs::symlink("../foreign", ws.join(".nuwax-harness")).unwrap();
 
         assert!(!fanout_names_drifted(ws).await.unwrap());
 
@@ -990,7 +996,7 @@ mod tests {
             .unwrap();
         assert!(fanout_names_drifted(ws).await.unwrap());
 
-        // 实体目标对齐后即不漂移 (被链走的 .codex 永远不参与比较)
+        // 实体目标对齐后即不漂移 (被链走的 .nuwax-harness 永远不参与比较)
         for dir in [".claude", ".opencode"] {
             fs::create_dir_all(ws.join(dir).join("skills/sk2"))
                 .await

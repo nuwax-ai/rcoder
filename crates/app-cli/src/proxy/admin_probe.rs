@@ -615,10 +615,18 @@ mod tests {
         assert!(proxy_spec_relative_config_legacy(&legacy));
         assert!(!proxy_spec_contract_ok(&legacy));
 
+        // 绝对路径要按平台构造：`/home/user/…` 在 Windows 上没有盘符前缀，不算绝对路径。
+        let temporary = tempfile::tempdir().unwrap();
         let absolute = spec_file(vec![
             "/usr/local/bin/pingap".into(),
             "-c".into(),
-            "/home/user/2/.local-logs/pingap/active/pingap.toml".into(),
+            temporary
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join(".local-logs/pingap/active/pingap.toml")
+                .to_string_lossy()
+                .into_owned(),
         ]);
         assert!(!proxy_spec_relative_config_legacy(&absolute));
         assert!(proxy_spec_contract_ok(&absolute));
@@ -740,7 +748,7 @@ mod tests {
                 "backend":{"healthy":0,"total":1,"unhealthy_backends":["127.0.0.1:4101"]}
             }
         }"#;
-        let snapshot = super::parse_admin_basic(body).expect("valid body");
+        let snapshot = parse_admin_basic(body).expect("valid body");
         assert_eq!(snapshot.config_hash.as_deref(), Some("AB12CD34"));
         assert_eq!(
             snapshot
@@ -760,10 +768,10 @@ mod tests {
 
     #[test]
     fn parse_admin_basic_tolerates_missing_sections() {
-        let snapshot = super::parse_admin_basic(r#"{"version":"0.14.3"}"#).expect("valid body");
+        let snapshot = parse_admin_basic(r#"{"version":"0.14.3"}"#).expect("valid body");
         assert_eq!(snapshot.config_hash, None);
         assert!(snapshot.upstreams.is_empty());
         // 非法 JSON 仍是错误（协议错误不能当观察成功）
-        assert!(super::parse_admin_basic("not json").is_err());
+        assert!(parse_admin_basic("not json").is_err());
     }
 }

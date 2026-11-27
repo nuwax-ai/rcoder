@@ -41,7 +41,7 @@ impl LivenessHold {
                 )
                 .fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE });
             // 无限等待：task 被 abort（deploy 结束时）即整体退出
-            let _ = axum::serve(listener, app).await;
+            let _unused = axum::serve(listener, app).await;
         });
         Ok(Self { task })
     }

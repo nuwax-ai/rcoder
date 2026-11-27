@@ -72,12 +72,8 @@ pub(crate) async fn observe_fence_evidence(
             // Historical versions fenced a definite read-side PVC identity
             // rejection. Only that acknowledged result, absent compute, and a
             // dead/absent native holder permit closing it as Failed.
-            let legacy_preflight = record.kind == UserAppOperationKind::EnsureBuilder
-                && record.step == "creation_result" && record.checkpoint.is_null()
-                && record.error_message.as_deref().is_some_and(|message| message.starts_with(
-                    "ensure UserappBuilder failed: Concurrent resource update: Application resource identity mismatch:"));
             if state.config.userapp_storage.default_recovery_enabled
-                && legacy_preflight
+                && record.is_legacy_builder_preflight_rejection()
                 && matches!(
                     state
                         .userapp_store
@@ -94,7 +90,7 @@ pub(crate) async fn observe_fence_evidence(
                 )
             {
                 return FenceEvidence::Observed(
-                    serde_json::json!({"kind":"legacy_creation_preflight_rejected_compute_absent", "observed_at_us":chrono::Utc::now().timestamp_micros()}),
+                    serde_json::json!({"kind":shared_types::LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE, "observed_at_us":chrono::Utc::now().timestamp_micros()}),
                 );
             }
             if state.config.userapp_storage.default_recovery_enabled
@@ -274,10 +270,27 @@ pub(crate) async fn observe_fence_evidence(
 /// holder 死亡兜底的收束留痕说明。
 const HOLDER_EXPIRED_RELEASE_NOTE: &str =
     "holder expired, outcome unverifiable; retry the operation";
+/// 无执行者声明的围栏收束留痕说明。
+const UNCLAIMED_RELEASE_NOTE: &str =
+    "unclaimed beyond settle grace; historical preflight rejection verified; retry the operation";
 /// 物理状态确定性观察收束的留痕说明。
 const DEFINITE_RELEASE_NOTE: &str = "physical state verified definite by recovery scanner";
 /// 围栏 holder 死亡兜底的默认超龄门槛（秒）：≫ 操作 deadline + 租约 TTL 60s。
 const DEFAULT_FENCE_SETTLE_GRACE_SECS: u64 = 900;
+/// Minimum age before inspecting an unclaimed historical preflight rejection.
+const DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS: u64 = 60;
+
+/// 时间点是否已早于"当前 − 宽限期"。
+///
+/// 两条收束路径的计龄基准不同：
+/// - holder 死亡兜底用 `created_at`（记录仅暴露该时间；它早于最近状态变更，
+///   门槛因此更容易满足——该路径的安全依赖死亡探针，年龄只是下限）；
+/// - 无执行者路径按 `updated_at` 退避，是否能收束由已核验的证据决定。
+fn aged_beyond(timestamp: chrono::DateTime<chrono::Utc>, grace_secs: u64) -> bool {
+    let grace_us = i64::try_from(grace_secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+    let now_us = chrono::Utc::now().timestamp_micros();
+    now_us.saturating_sub(timestamp.timestamp_micros()) >= grace_us
+}
 
 /// holder 死亡兜底判定（围栏有界保证）：**围栏超龄 ∧ 持有者已死**。
 ///
@@ -299,15 +312,12 @@ pub(crate) async fn holder_expired(state: &AppState, record: &UserAppOperationRe
         // Losing lease authority does not retract an already-issued DELETE.
         return false;
     }
-    let grace_secs = state
+    // Age from admission is an observation threshold, not proof of holder death.
+    let grace = state
         .config
         .fence_settle_grace_secs
         .unwrap_or(DEFAULT_FENCE_SETTLE_GRACE_SECS);
-    let grace_us = i64::try_from(grace_secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
-    let now_us = chrono::Utc::now().timestamp_micros();
-    // 计龄从 created_at 起算（记录仅暴露 created_at；created ≤ updated，
-    // 保守取更长的等待）。
-    if now_us.saturating_sub(record.created_at.timestamp_micros()) < grace_us {
+    if !aged_beyond(record.created_at, grace) {
         return false;
     }
     match state
@@ -399,12 +409,94 @@ pub(crate) async fn reconcile_fenced_ensure(
         );
         return Ok(());
     };
-    // 无执行者声明的记录不可被扫描器收束（store 侧同样拒绝）。
+    // Claimed records can already have a native holder or a dispatched write.
+    // Only the known historical read-side rejection has affirmative evidence
+    // that it was rejected before the write. Also verify physical absence.
     if record.executor_id.is_none() {
+        if !state.config.userapp_storage.default_recovery_enabled
+            || !record.is_legacy_builder_preflight_rejection()
+        {
+            tracing::warn!(
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                kind = ?record.kind,
+                step = %record.step,
+                "Fence kept: unclaimed record has no proof of pre-dispatch state"
+            );
+            return Ok(());
+        }
+        let binding = state
+            .userapp_store
+            .get_operation_lease(&record.app_id, &record.operation_id)
+            .await?;
+        if binding.is_some() {
+            tracing::warn!(
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                "Fence kept: unclaimed record still has an original lease receipt"
+            );
+            return Ok(());
+        }
+        // 无任何租约行：计龄取 updated_at（最近一次状态变更 ≈ 落围栏时刻），
+        // 读不到就保守保持围栏等下一轮。
+        let updated_at = match state
+            .userapp_store
+            .get_operation_updated_at(&record.app_id, &record.operation_id, record.revision)
+            .await
+        {
+            Ok(Some(updated_at)) => updated_at,
+            Ok(None) => {
+                tracing::warn!(
+                    operation_id = %record.operation_id,
+                    app_id = %record.app_id,
+                    "Fence kept: unclaimed record has no readable updated_at"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    operation_id = %record.operation_id,
+                    app_id = %record.app_id,
+                    %error,
+                    "Fence kept: unclaimed record updated_at read failed"
+                );
+                return Ok(());
+            }
+        };
+        let grace = state
+            .config
+            .unclaimed_settle_grace_secs
+            .unwrap_or(DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS);
+        if !aged_beyond(updated_at, grace) {
+            tracing::warn!(
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                "Fence kept: unclaimed record within settle grace"
+            );
+            return Ok(());
+        }
+        let observation = tokio::time::timeout(
+            Duration::from_secs(10),
+            observe_fence_evidence(state, &record),
+        )
+        .await;
+        let Ok(FenceEvidence::Observed(evidence)) = observation else {
+            return Ok(());
+        };
+        if evidence.get("kind").and_then(serde_json::Value::as_str)
+            != Some(shared_types::LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE)
+        {
+            return Ok(());
+        }
+        state
+            .userapp_store
+            .settle_fenced_operation(&record, &evidence, UNCLAIMED_RELEASE_NOTE)
+            .await?;
         tracing::warn!(
             operation_id = %record.operation_id,
             app_id = %record.app_id,
-            "Fence kept: record has no executor claim"
+            kind = ?record.kind,
+            "Fenced operation settled as Failed: unclaimed beyond settle grace"
         );
         return Ok(());
     }
@@ -492,4 +584,64 @@ pub(crate) async fn reconcile_default_recovery_before_ensure(
         reconcile_fenced_ensure(state, &operation).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod settle_grace_tests {
+    use super::*;
+    use shared_types::{
+        UserAppOperationKind, UserAppOperationRecord, UserAppOperationScope, UserAppOperationState,
+    };
+
+    fn record_aged_secs(age_secs: i64) -> UserAppOperationRecord {
+        UserAppOperationRecord {
+            runtime_policy_on_success: None,
+            command: None,
+            admitted_metadata: None,
+            operation_id: "op-grace".into(),
+            app_id: "app-grace".into(),
+            lifecycle_id: "life".into(),
+            request_id: None,
+            request_fingerprint: "a".repeat(64),
+            kind: UserAppOperationKind::EnsureBuilder,
+            scope: UserAppOperationScope::Dev,
+            state: UserAppOperationState::RecoveryRequired,
+            revision: 3,
+            executor_id: None,
+            step: "runtime_updated".into(),
+            checkpoint: serde_json::Value::Null,
+            error_code: None,
+            error_message: None,
+            created_at: chrono::Utc::now() - chrono::Duration::seconds(age_secs),
+        }
+    }
+
+    #[test]
+    fn holder_grace_defaults_to_900s() {
+        assert!(!aged_beyond(
+            record_aged_secs(899).created_at,
+            DEFAULT_FENCE_SETTLE_GRACE_SECS
+        ));
+        assert!(aged_beyond(
+            record_aged_secs(901).created_at,
+            DEFAULT_FENCE_SETTLE_GRACE_SECS
+        ));
+    }
+
+    #[test]
+    fn unclaimed_grace_defaults_to_60s() {
+        assert!(!aged_beyond(
+            record_aged_secs(59).created_at,
+            DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS
+        ));
+        assert!(aged_beyond(
+            record_aged_secs(61).created_at,
+            DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS
+        ));
+    }
+
+    #[test]
+    fn zero_grace_settles_any_aged_record() {
+        assert!(aged_beyond(record_aged_secs(1).created_at, 0));
+    }
 }

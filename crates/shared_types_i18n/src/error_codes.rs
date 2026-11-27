@@ -48,6 +48,60 @@ pub const ERR_USERAPP_WAKE_FAILED: &str = "ERR_USERAPP_WAKE_FAILED";
 /// Dispatched mutation completion was not proven; never blindly retry.
 pub const ERR_OPERATION_OUTCOME_UNKNOWN: &str = "ERR_OPERATION_OUTCOME_UNKNOWN";
 
+// ========== E2B 沙箱数据面错误码（默认英文，三语系；2026-11-20 i18n 整改）===========
+/// e2b sandbox 能力未启用（SandboxManager 缺失）
+pub const ERR_E2B_NOT_ENABLED: &str = "ERR_E2B_NOT_ENABLED";
+/// 请求端口不在白名单
+pub const ERR_E2B_PORT_NOT_ALLOWED: &str = "ERR_E2B_PORT_NOT_ALLOWED";
+/// 沙箱不存在、已到期或 token 无效
+pub const ERR_E2B_SANDBOX_UNAVAILABLE: &str = "ERR_E2B_SANDBOX_UNAVAILABLE";
+/// 沙箱 Pod 不可达
+pub const ERR_E2B_POD_UNREACHABLE: &str = "ERR_E2B_POD_UNREACHABLE";
+/// 沙箱数据面不可达
+pub const ERR_E2B_DATA_PLANE_UNREACHABLE: &str = "ERR_E2B_DATA_PLANE_UNREACHABLE";
+/// 沙箱 WS 上游不可达/超时/握手异常/响应畸形
+pub const ERR_E2B_WS_UPSTREAM_UNREACHABLE: &str = "ERR_E2B_WS_UPSTREAM_UNREACHABLE";
+pub const ERR_E2B_WS_UPSTREAM_TIMEOUT: &str = "ERR_E2B_WS_UPSTREAM_TIMEOUT";
+pub const ERR_E2B_WS_UPSTREAM_HANDSHAKE: &str = "ERR_E2B_WS_UPSTREAM_HANDSHAKE";
+/// 代理响应构造/读取失败
+pub const ERR_PROXY_RESPONSE_FAILED: &str = "ERR_PROXY_RESPONSE_FAILED";
+/// sandbox 参数类错误（template 必填/非 Ready/续期状态/volume/mountPath/timeout）
+pub const ERR_E2B_TEMPLATE_REQUIRED: &str = "ERR_E2B_TEMPLATE_REQUIRED";
+pub const ERR_E2B_NOT_READY: &str = "ERR_E2B_NOT_READY";
+pub const ERR_E2B_RENEW_REQUIRES_READY: &str = "ERR_E2B_RENEW_REQUIRES_READY";
+pub const ERR_E2B_VOLUME_NAME_INVALID: &str = "ERR_E2B_VOLUME_NAME_INVALID";
+pub const ERR_E2B_MOUNT_PATH_INVALID: &str = "ERR_E2B_MOUNT_PATH_INVALID";
+/// volumeMounts 整体形态不对（非数组/对象、条目缺字段、字段类型错）
+pub const ERR_E2B_VOLUME_MOUNTS_INVALID: &str = "ERR_E2B_VOLUME_MOUNTS_INVALID";
+/// Idempotency-Key 请求头存在但不合规（空，或超过 255 个字符）
+pub const ERR_E2B_IDEMPOTENCY_KEY_INVALID: &str = "ERR_E2B_IDEMPOTENCY_KEY_INVALID";
+/// 续期后的到期时间越过了沙箱创建时定下的硬性截止时间
+pub const ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE: &str = "ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE";
+/// 续期与并发的回收/终止操作反复冲突（CAS 重试耗尽）
+pub const ERR_E2B_RENEW_CONFLICT: &str = "ERR_E2B_RENEW_CONFLICT";
+pub const ERR_E2B_TIMEOUT_INVALID: &str = "ERR_E2B_TIMEOUT_INVALID";
+pub const ERR_E2B_TIMEOUT_EXCEEDS_CAP: &str = "ERR_E2B_TIMEOUT_EXCEEDS_CAP";
+pub const ERR_E2B_TEMPLATE_UNAVAILABLE: &str = "ERR_E2B_TEMPLATE_UNAVAILABLE";
+pub const ERR_E2B_IDEMPOTENCY_IN_PROGRESS: &str = "ERR_E2B_IDEMPOTENCY_IN_PROGRESS";
+pub const ERR_E2B_CAPABILITY_NOT_SUPPORTED: &str = "ERR_E2B_CAPABILITY_NOT_SUPPORTED";
+/// E2B 控制面鉴权
+pub const ERR_E2B_API_KEY_MISSING: &str = "ERR_E2B_API_KEY_MISSING";
+pub const ERR_E2B_API_KEY_INVALID: &str = "ERR_E2B_API_KEY_INVALID";
+/// mountPath / volume 附加参数码（codex follow-up：SandboxApiError 带码化）
+pub const ERR_E2B_MOUNT_PATH_ABSOLUTE: &str = "ERR_E2B_MOUNT_PATH_ABSOLUTE";
+pub const ERR_E2B_MOUNT_PATH_SYSTEM: &str = "ERR_E2B_MOUNT_PATH_SYSTEM";
+pub const ERR_E2B_VOLUME_NOT_FOUND: &str = "ERR_E2B_VOLUME_NOT_FOUND";
+pub const ERR_E2B_VOLUME_SIZE_INVALID: &str = "ERR_E2B_VOLUME_SIZE_INVALID";
+/// UserApp ensure 成功态消息（计算容器状态说明）
+pub const ERR_USERAPP_BUILDER_RUNNING: &str = "ERR_USERAPP_BUILDER_RUNNING";
+pub const ERR_USERAPP_BUILDER_REBUILT: &str = "ERR_USERAPP_BUILDER_REBUILT";
+pub const ERR_USERAPP_BUILDER_READY: &str = "ERR_USERAPP_BUILDER_READY";
+pub const ERR_USERAPP_PROD_REQUESTED: &str = "ERR_USERAPP_PROD_REQUESTED";
+pub const ERR_USERAPP_PROD_PRECREATED: &str = "ERR_USERAPP_PROD_PRECREATED";
+/// Computer DB 成功态消息
+pub const ERR_DB_PASSWORD_RESET: &str = "ERR_DB_PASSWORD_RESET";
+pub const ERR_DB_CREATED: &str = "ERR_DB_CREATED";
+
 /// 工作目录错误
 pub const ERR_WORKSPACE_ERROR: &str = "WORKSPACE_ERROR";
 
@@ -198,6 +252,11 @@ pub const ERR_NOT_FOUND: &str = "ERR_NOT_FOUND";
 pub const ERR_CONFLICT: &str = "ERR_CONFLICT";
 /// Ordinary Computer ownership conflict, rejected before task dispatch.
 pub const ERR_COMPUTER_OWNER_CONFLICT: &str = "ERR_COMPUTER_OWNER_CONFLICT";
+/// 重启 agent 时的归属冲突文案。与聊天接口共用 [`ERR_COMPUTER_OWNER_CONFLICT`]
+/// 这个码（调用方按码分支），但码表里那条文案说的是"消息未发送"——重启场景
+/// 没有消息，另取这条。
+pub const COMPUTER_RESTART_OWNER_CONFLICT_MESSAGE_KEY: &str =
+    "error.computer_restart_owner_conflict";
 /// Diagnostic reasons; these do not expose the registered or requested values.
 pub const COMPUTER_OWNER_USER_MISMATCH: &str = "COMPUTER_OWNER_USER_MISMATCH";
 pub const COMPUTER_OWNER_POD_MISMATCH: &str = "COMPUTER_OWNER_POD_MISMATCH";
@@ -308,6 +367,42 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_AGENT_ERROR => "error.agent_error",
         ERR_PROXY_DISABLED => "error.proxy_disabled",
         ERR_PROXY_SERVICE_UNAVAILABLE => "error.proxy_service_unavailable",
+        ERR_E2B_NOT_ENABLED => "error.e2b_not_enabled",
+        ERR_E2B_PORT_NOT_ALLOWED => "error.e2b_port_not_allowed",
+        ERR_E2B_SANDBOX_UNAVAILABLE => "error.e2b_sandbox_unavailable",
+        ERR_E2B_POD_UNREACHABLE => "error.e2b_pod_unreachable",
+        ERR_E2B_DATA_PLANE_UNREACHABLE => "error.e2b_data_plane_unreachable",
+        ERR_E2B_WS_UPSTREAM_UNREACHABLE => "error.e2b_ws_upstream_unreachable",
+        ERR_E2B_WS_UPSTREAM_TIMEOUT => "error.e2b_ws_upstream_timeout",
+        ERR_E2B_WS_UPSTREAM_HANDSHAKE => "error.e2b_ws_upstream_handshake",
+        ERR_PROXY_RESPONSE_FAILED => "error.proxy_response_failed",
+        ERR_E2B_TEMPLATE_REQUIRED => "error.e2b_template_required",
+        ERR_E2B_NOT_READY => "error.e2b_not_ready",
+        ERR_E2B_RENEW_REQUIRES_READY => "error.e2b_renew_requires_ready",
+        ERR_E2B_VOLUME_NAME_INVALID => "error.e2b_volume_name_invalid",
+        ERR_E2B_MOUNT_PATH_INVALID => "error.e2b_mount_path_invalid",
+        ERR_E2B_VOLUME_MOUNTS_INVALID => "error.e2b_volume_mounts_invalid",
+        ERR_E2B_IDEMPOTENCY_KEY_INVALID => "error.e2b_idempotency_key_invalid",
+        ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE => "error.e2b_renew_exceeds_hard_deadline",
+        ERR_E2B_RENEW_CONFLICT => "error.e2b_renew_conflict",
+        ERR_E2B_TIMEOUT_INVALID => "error.e2b_timeout_invalid",
+        ERR_E2B_TIMEOUT_EXCEEDS_CAP => "error.e2b_timeout_exceeds_cap",
+        ERR_E2B_TEMPLATE_UNAVAILABLE => "error.e2b_template_unavailable",
+        ERR_E2B_IDEMPOTENCY_IN_PROGRESS => "error.e2b_idempotency_in_progress",
+        ERR_E2B_CAPABILITY_NOT_SUPPORTED => "error.e2b_capability_not_supported",
+        ERR_E2B_API_KEY_MISSING => "error.e2b_api_key_missing",
+        ERR_E2B_API_KEY_INVALID => "error.e2b_api_key_invalid",
+        ERR_E2B_MOUNT_PATH_ABSOLUTE => "error.e2b_mount_path_absolute",
+        ERR_E2B_MOUNT_PATH_SYSTEM => "error.e2b_mount_path_system",
+        ERR_E2B_VOLUME_NOT_FOUND => "error.e2b_volume_not_found",
+        ERR_E2B_VOLUME_SIZE_INVALID => "error.e2b_volume_size_invalid",
+        ERR_USERAPP_BUILDER_RUNNING => "error.userapp_builder_running",
+        ERR_USERAPP_BUILDER_REBUILT => "error.userapp_builder_rebuilt",
+        ERR_USERAPP_BUILDER_READY => "error.userapp_builder_ready",
+        ERR_USERAPP_PROD_REQUESTED => "error.userapp_prod_requested",
+        ERR_USERAPP_PROD_PRECREATED => "error.userapp_prod_precreated",
+        ERR_DB_PASSWORD_RESET => "error.db_password_reset",
+        ERR_DB_CREATED => "error.db_created",
         ERR_SESSION_NOT_FOUND => "error.session_not_found",
         ERR_AGENT_NOT_FOUND => "error.agent_not_found",
         ERR_CONTAINER_NOT_FOUND => "error.container_not_found",
@@ -562,6 +657,59 @@ mod tests {
         assert!(get_error_message(ERR_COMPUTER_OWNER_CONFLICT, "zh-CN").contains("消息未发送"));
     }
 
+    /// 2026-11-20 i18n 整改新增码：三语系目录必须齐全（缺条目 = 前端看到裸 key）。
+    #[test]
+    fn e2b_and_userapp_message_codes_have_all_supported_catalogs() {
+        for code in [
+            ERR_E2B_NOT_ENABLED,
+            ERR_E2B_PORT_NOT_ALLOWED,
+            ERR_E2B_SANDBOX_UNAVAILABLE,
+            ERR_E2B_POD_UNREACHABLE,
+            ERR_E2B_DATA_PLANE_UNREACHABLE,
+            ERR_E2B_WS_UPSTREAM_UNREACHABLE,
+            ERR_E2B_WS_UPSTREAM_TIMEOUT,
+            ERR_E2B_WS_UPSTREAM_HANDSHAKE,
+            ERR_PROXY_RESPONSE_FAILED,
+            ERR_E2B_TEMPLATE_REQUIRED,
+            ERR_E2B_NOT_READY,
+            ERR_E2B_RENEW_REQUIRES_READY,
+            ERR_E2B_VOLUME_NAME_INVALID,
+            ERR_E2B_MOUNT_PATH_INVALID,
+            ERR_E2B_VOLUME_MOUNTS_INVALID,
+            ERR_E2B_IDEMPOTENCY_KEY_INVALID,
+            ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE,
+            ERR_E2B_RENEW_CONFLICT,
+            ERR_E2B_TIMEOUT_INVALID,
+            ERR_E2B_TIMEOUT_EXCEEDS_CAP,
+            ERR_E2B_TEMPLATE_UNAVAILABLE,
+            ERR_E2B_IDEMPOTENCY_IN_PROGRESS,
+            ERR_E2B_CAPABILITY_NOT_SUPPORTED,
+            ERR_E2B_API_KEY_MISSING,
+            ERR_E2B_API_KEY_INVALID,
+            ERR_E2B_MOUNT_PATH_ABSOLUTE,
+            ERR_E2B_MOUNT_PATH_SYSTEM,
+            ERR_E2B_VOLUME_NOT_FOUND,
+            ERR_E2B_VOLUME_SIZE_INVALID,
+            ERR_USERAPP_BUILDER_RUNNING,
+            ERR_USERAPP_BUILDER_REBUILT,
+            ERR_USERAPP_BUILDER_READY,
+            ERR_USERAPP_PROD_REQUESTED,
+            ERR_USERAPP_PROD_PRECREATED,
+            ERR_DB_PASSWORD_RESET,
+            ERR_DB_CREATED,
+        ] {
+            for locale in crate::SUPPORTED_LOCALES {
+                let message = get_error_message(code, locale);
+                assert!(
+                    !message.is_empty() && !message.starts_with("error."),
+                    "{code}: {locale}"
+                );
+            }
+        }
+        // 默认 locale 必须是英文（用户要求默认英文）
+        assert!(get_error_message(ERR_E2B_SANDBOX_UNAVAILABLE, "en-US").contains("Sandbox"));
+    }
+
     #[test]
     fn runtime_error_codes_and_guidance_have_all_supported_catalogs() {
         for code in [
@@ -597,6 +745,42 @@ mod tests {
             );
         }
         assert_eq!(ERR_APP_NOT_FOUND, "ERR_APP_NOT_FOUND");
+    }
+
+    /// 反例：重启接口的归属冲突曾直接取码表里聊天场景的文案（"消息未发送"），
+    /// 对重启请求是错的。重启场景的那条必须在每种语言里都有，且不提消息。
+    #[test]
+    fn computer_restart_owner_conflict_has_its_own_message_in_every_catalog() {
+        for locale in crate::SUPPORTED_LOCALES {
+            let message = get_i18n_message(COMPUTER_RESTART_OWNER_CONFLICT_MESSAGE_KEY, locale);
+            assert!(
+                !message.is_empty() && !message.starts_with("error."),
+                "{locale}: {message}"
+            );
+            let chat = get_error_message(ERR_COMPUTER_OWNER_CONFLICT, locale);
+            assert_ne!(message, chat, "{locale}: 不能与聊天场景共用文案");
+        }
+        assert!(
+            get_i18n_message(COMPUTER_RESTART_OWNER_CONFLICT_MESSAGE_KEY, "zh-CN")
+                .contains("未重启 agent")
+        );
+        assert!(
+            !get_i18n_message(COMPUTER_RESTART_OWNER_CONFLICT_MESSAGE_KEY, "zh-CN")
+                .contains("消息未发送")
+        );
+    }
+
+    /// `ERR_CONFLICT` 在映射表里一直有，语言文件里却没有条目——走
+    /// `get_error_message` 会把裸键名 `error.conflict` 漏给客户端。
+    #[test]
+    fn generic_conflict_message_exists_in_every_catalog() {
+        for locale in crate::SUPPORTED_LOCALES {
+            let message = get_error_message(ERR_CONFLICT, locale);
+            assert!(
+                !message.is_empty() && !message.starts_with("error."),
+                "{ERR_CONFLICT}: {locale} -> {message}"
+            );
+        }
     }
 
     #[test]

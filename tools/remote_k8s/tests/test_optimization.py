@@ -160,15 +160,37 @@ class TestBuildCache(unittest.TestCase):
                     raise RuntimeError(self.error)
                 return self.output
         ref = 'reg/rcoder@sha256:' + 'a' * 64
-        cfg = type('C', (), {'ssh': Ssh(output='Digest: sha256:' + 'a' * 64)})()
+        no_http_get = staticmethod(lambda n, d='': d)
+        cfg = type('C', (), {'ssh': Ssh(output='Digest: sha256:' + 'a' * 64), 'get': no_http_get})()
         self.assertEqual(build_cache.artifact_matches(cfg, ref), (True, 'digest-mismatch'))
-        cfg = type('C', (), {'ssh': Ssh(output='Digest: sha256:' + 'b' * 64)})()
+        cfg = type('C', (), {'ssh': Ssh(output='Digest: sha256:' + 'b' * 64), 'get': no_http_get})()
         ok, error = build_cache.artifact_matches(cfg, ref)
         self.assertFalse(ok)
         self.assertEqual(error, 'digest-mismatch')
-        cfg = type('C', (), {'ssh': Ssh(error='ssh exited 1: ... manifest unknown ...')})()
+        cfg = type('C', (), {'ssh': Ssh(error='ssh exited 1: ... manifest unknown ...'), 'get': no_http_get})()
         self.assertEqual(build_cache.artifact_matches(cfg, ref), (False, 'artifact-missing'))
-        cfg = type('C', (), {'ssh': Ssh(error='ssh exited 255: connection refused')})()
+        cfg = type('C', (), {'ssh': Ssh(error='ssh exited 255: connection refused'), 'get': no_http_get})()
+        self.assertEqual(build_cache.artifact_matches(cfg, ref), (False, 'registry-error'))
+
+    def test_http_registry_artifact_check_uses_curl_not_buildx(self):
+        # HTTP 私有 registry:curl 直查 manifest 端点——buildx 对裸 IP 仓库
+        # 坚持 HTTPS,连接层失败会被误归 registry-error(缓存命中路径唯一
+        # 调用点,HTTP registry 首次缓存命中必然误报硬失败)。
+        class Ssh:
+            def __init__(self, output):
+                self.output = output
+            def __call__(self, args, timeout=None):
+                assert args[0] == 'curl', 'HTTP registry must not go through buildx: ' + repr(args[:2])
+                return self.output
+        ref = 'reg.example:5000/ns/rcoder@sha256:' + 'a' * 64
+        cfg = type('C', (), {'ssh': Ssh('200\n'), 'get': staticmethod(
+            lambda n, d='': {'REGISTRY': 'reg.example:5000/ns', 'REGISTRY_HTTP': 'true'}.get(n, d))})()
+        self.assertEqual(build_cache.artifact_matches(cfg, ref), (True, None))
+        cfg = type('C', (), {'ssh': Ssh('404\n'), 'get': staticmethod(
+            lambda n, d='': {'REGISTRY': 'reg.example:5000/ns', 'REGISTRY_HTTP': 'true'}.get(n, d))})()
+        self.assertEqual(build_cache.artifact_matches(cfg, ref), (False, 'artifact-missing'))
+        cfg = type('C', (), {'ssh': Ssh('500\n'), 'get': staticmethod(
+            lambda n, d='': {'REGISTRY': 'reg.example:5000/ns', 'REGISTRY_HTTP': 'true'}.get(n, d))})()
         self.assertEqual(build_cache.artifact_matches(cfg, ref), (False, 'registry-error'))
 
 

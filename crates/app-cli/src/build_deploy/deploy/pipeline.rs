@@ -142,7 +142,7 @@ pub(crate) async fn prepare_with_local(
             tokio::fs::write(part.path(), &bytes)
                 .await
                 .context("stage local artifact into incoming")?;
-            to_hex(&sha2::Sha256::digest(&bytes))
+            to_hex(&Sha256::digest(&bytes))
         }
         None => to_hex(&download_to_file(url, part.path()).await?),
     };

@@ -486,7 +486,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _unused = axum::serve(listener, app).await;
         });
         for method in ["GET", "HEAD"] {
             let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
@@ -534,10 +534,10 @@ mod tests {
                 let response = app
                     .clone()
                     .oneshot(
-                        axum::http::Request::builder()
+                        Request::builder()
                             .method(method)
                             .uri(path)
-                            .body(axum::body::Body::empty())
+                            .body(Body::empty())
                             .expect("request"),
                     )
                     .await
@@ -644,7 +644,7 @@ mod tests {
         let probe = bind_listener(0).expect("port");
         let port = probe.local_addr().expect("address").port();
         let mut probe = Some(probe);
-        let mut spec = crate::manifest::ServiceSpec {
+        let mut spec = ServiceSpec {
             service_id: uuid::Uuid::new_v4().to_string(),
             name: "Web".into(),
             dir: "web".into(),
@@ -778,7 +778,7 @@ mod tests {
             let mut hosts = manager.hosts.lock().await;
             let host = hosts.get_mut(&port).unwrap();
             host.task.abort();
-            let _ = (&mut host.task).await;
+            let _unused = (&mut host.task).await;
         }
         manager
             .reconcile(std::slice::from_ref(&accepted), root.path(), false)
@@ -819,7 +819,7 @@ mod tests {
     /// dev 源码态 + devrun → 让位 dev server；非 static 恒 false。
     #[test]
     fn hosts_statically_dispatch() {
-        let mut spec = crate::manifest::ServiceSpec {
+        let mut spec = ServiceSpec {
             service_id: "web".into(),
             name: "Web".into(),
             dir: "web".into(),

@@ -767,12 +767,7 @@ mod tests {
         }
     }
 
-    async fn call(
-        state: &AppState,
-        method: &str,
-        uri: &str,
-        body: &str,
-    ) -> (StatusCode, serde_json::Value) {
+    async fn call(state: &AppState, method: &str, uri: &str, body: &str) -> (StatusCode, Value) {
         let response = api_router(state.clone())
             .oneshot(
                 axum::http::Request::builder()
@@ -824,7 +819,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["code"], "0000");
         assert_eq!(body["success"], true);
-        assert_eq!(body["tid"], serde_json::Value::Null);
+        assert_eq!(body["tid"], Value::Null);
         assert!(body["data"]["logs"].as_array().unwrap().is_empty());
         assert_eq!(body["data"].as_object().unwrap().len(), 4);
     }
@@ -841,7 +836,7 @@ mod tests {
         assert_eq!(body["code"], "0000");
         assert_eq!(body["data"]["ready"], false);
         assert_eq!(body["data"]["status"], "not_deployed");
-        assert_eq!(body["data"]["runtime_instance_id"], serde_json::Value::Null);
+        assert_eq!(body["data"]["runtime_instance_id"], Value::Null);
         // OpenAPI 文档同步注册
         let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
         assert!(document["paths"].get("/v1/app/readiness").is_some());
@@ -907,7 +902,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "INVALID_LOG_QUERY");
         assert_eq!(body["success"], false);
-        assert_eq!(body["data"], serde_json::Value::Null);
+        assert_eq!(body["data"], Value::Null);
         assert!(body["message"].as_str().unwrap().contains("nope"));
     }
 
@@ -935,7 +930,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], "DEPLOY_FORBIDDEN");
-        assert_eq!(body["data"], serde_json::Value::Null);
+        assert_eq!(body["data"], Value::Null);
     }
 
     /// P1-01 初始化门：恢复期 /ready 以 initializing 摘流（不以 Idle 基础
@@ -1053,7 +1048,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["code"], "0000");
         assert_eq!(body["data"]["mode"], "idle");
-        assert_eq!(body["data"]["release_id"], serde_json::Value::Null);
+        assert_eq!(body["data"]["release_id"], Value::Null);
     }
 
     /// proxy/validate idle 错误信封：PINGAP_CONFIG_INVALID + data=null。
@@ -1063,7 +1058,7 @@ mod tests {
         let (status, body) = call(&state, "POST", "/v1/proxy/validate", "").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "PINGAP_CONFIG_INVALID");
-        assert_eq!(body["data"], serde_json::Value::Null);
+        assert_eq!(body["data"], Value::Null);
     }
 
     /// 启动窗口内 recovery 端点返回 ERR_INITIALIZING（不是 ERR_INVALID_STATE）
@@ -1086,7 +1081,7 @@ mod tests {
         let response = api_router(state.clone()).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON envelope");
+        let body: Value = serde_json::from_slice(&bytes).expect("JSON envelope");
         assert_eq!(body["code"], "ERR_INITIALIZING");
     }
 }

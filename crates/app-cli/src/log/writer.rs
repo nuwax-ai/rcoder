@@ -111,17 +111,17 @@ impl RotatingWriter {
     async fn rotate(&mut self) {
         // 关闭当前文件
         if let Some(mut f) = self.file.take() {
-            let _ = f.flush().await;
+            let _unused = f.flush().await;
         }
 
         // rename .log → .1.log → .2.log → ...（删超过 max_backups 的）
         for i in (1..self.max_backups).rev() {
             let from = rotate_path(&self.path, i);
             let to = rotate_path(&self.path, i + 1);
-            let _ = tokio::fs::rename(&from, &to).await;
+            let _unused = tokio::fs::rename(&from, &to).await;
         }
         let backup1 = rotate_path(&self.path, 1);
-        let _ = tokio::fs::rename(&self.path, &backup1).await;
+        let _unused = tokio::fs::rename(&self.path, &backup1).await;
 
         // 新建空 .log
         match OpenOptions::new()

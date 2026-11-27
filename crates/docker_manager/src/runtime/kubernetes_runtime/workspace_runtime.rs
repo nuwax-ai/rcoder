@@ -43,6 +43,259 @@ impl WorkspaceRuntime for KubernetesRuntime {
         Ok(Some(format!("{cephfs_root}/{sub}")))
     }
 
+    /// per-agent workspace PVC 存在性（混住判据读侧, 30s TTL 缓存）。
+    ///
+    /// PVC 存在 = 该用户已切 RBD（转发层路由依据）；不存在 = 共享用户。
+    /// 只读不创建（ensure 会把共享用户误变 RBD 用户——判据必须走本方法）。
+    /// TTL 取 30s：迁移 cutover 翻转后最多一个窗口内判据滞后（此时容器已
+    /// 按 RBD 起，转发路径不受影响；共享残留窗口只影响"转发 vs 本地"选择）。
+    async fn workspace_pvc_exists(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        let cache_key = self.migration_cache_key(identifier, service_type);
+        if let Some((exists, _, at)) = self.workspace_exists_cache.read().await.get(&cache_key)
+            && at.elapsed() < TTL
+        {
+            return Ok(*exists);
+        }
+        // sampled_at 语义同 migration_state(防旧值覆盖 set_state 的即时写)。
+        let sampled_at = std::time::Instant::now();
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        // 单次 GET 同时取 exists + annotation(read_migration_annotation 会对
+        // 同一 PVC 再发一次全量 GET——合并掉)。
+        let (exists, state) = match self.pvcs().get_opt(&pvc_name).await {
+            Ok(pvc) => {
+                let value = pvc
+                    .as_ref()
+                    .and_then(|p| p.metadata.annotations.as_ref())
+                    .and_then(|a| a.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION))
+                    .map(String::as_str);
+                (
+                    pvc.is_some(),
+                    shared_types::WorkspaceMigrationState::from_annotation(value),
+                )
+            }
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "workspace_pvc_exists: get PVC '{pvc_name}' failed: {e}"
+                )));
+            }
+        };
+        self.upsert_cache_if_not_stale(&cache_key, (exists, state), sampled_at)
+            .await;
+        Ok(exists)
+    }
+
+    /// 迁移状态（PVC annotation, 30s TTL 缓存——与 exists 同 cache 同口径,
+    /// 一次 GET 同时得两个判据; annotation 缺失/无法识别 → NotMigrated）。
+    async fn workspace_migration_state(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceMigrationState> {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        let cache_key = self.migration_cache_key(identifier, service_type);
+        if let Some((_, state, at)) = self.workspace_exists_cache.read().await.get(&cache_key)
+            && at.elapsed() < TTL
+        {
+            return Ok(*state);
+        }
+        // 单次 GET 同时取 exists + annotation(此前 get_opt 后又全量 GET 同一
+        // PVC, 每请求两次 API); miss 后**回写缓存**——此前只读不写导致
+        // intercept 每请求都打 API, 快路径名不副实, 且 replacement 冷缓存
+        // 对 RBD 用户永远 Conflict 也同根于此。
+        // sampled_at 记 GET 发起时刻: 若期间 set_state 已写入更新值(如
+        // cutover 翻 Migrated), 本回写不得用旧查询结果覆盖(写时间单调)。
+        let sampled_at = std::time::Instant::now();
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        let (exists, state) = match self.pvcs().get_opt(&pvc_name).await {
+            Ok(Some(pvc)) => {
+                let value = pvc
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION))
+                    .map(String::as_str);
+                (
+                    true,
+                    shared_types::WorkspaceMigrationState::from_annotation(value),
+                )
+            }
+            Ok(None) => (false, shared_types::WorkspaceMigrationState::NotMigrated),
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "get PVC '{pvc_name}': {e}"
+                )));
+            }
+        };
+        self.upsert_cache_if_not_stale(&cache_key, (exists, state), sampled_at)
+            .await;
+        Ok(state)
+    }
+
+    /// 翻迁移状态（patch PVC annotation; NotMigrated = 移除 annotation）。
+    /// 成功后即时写缓存（否则 30s TTL 窗口内判据滞后——cutover 后首个
+    /// 请求可能仍走共享卷）。PVC 不存在 → NotFound。
+    async fn mark_workspace_volume_rolled_back(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        // 卷不存在（rollback 前卷已被清理等）→ no-op：标记的对象都缺了，
+        // 续接分支自然不成立。
+        let Some(existing) =
+            self.pvcs().get_opt(&pvc_name).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}"))
+            })?
+        else {
+            return Ok(());
+        };
+        let origin = existing
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(crate::runtime::k8s_pvc::VOLUME_ORIGIN_LABEL))
+            .cloned()
+            .unwrap_or_default();
+        if origin != crate::runtime::k8s_pvc::VOLUME_ORIGIN_FRESH_INIT {
+            // 非 fresh-init 卷（phase-a/存量）本就不会被续接分支认领。
+            return Ok(());
+        }
+        let uid = existing.metadata.uid.clone().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no UID"))
+        })?;
+        let rv = existing.metadata.resource_version.clone().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no resourceVersion"))
+        })?;
+        let patch = serde_json::json!({
+            "metadata": {
+                "uid": uid,
+                "resourceVersion": rv,
+                "labels": {crate::runtime::k8s_pvc::VOLUME_ORIGIN_LABEL: crate::runtime::k8s_pvc::VOLUME_ORIGIN_ROLLED_BACK}
+            }
+        });
+        self.pvcs()
+            .patch(
+                &pvc_name,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(&patch),
+            )
+            .await
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("patch PVC '{pvc_name}' origin label: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn set_workspace_migration_state(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        state: shared_types::WorkspaceMigrationState,
+    ) -> ContainerRuntimeResult<()> {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        let existing = self
+            .pvcs()
+            .get_opt(&pvc_name)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}")))?
+            .ok_or_else(|| {
+                ContainerRuntimeError::ContainerNotFound(format!(
+                    "PVC '{pvc_name}' not found; run phase-a before flipping migration state"
+                ))
+            })?;
+        let uid = existing.metadata.uid.clone().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no UID"))
+        })?;
+        let rv = existing.metadata.resource_version.clone().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no resourceVersion"))
+        })?;
+        // NotMigrated 必须用显式 null 删除 key——RFC 7386 下空对象 {} 是
+        // **无操作**(不删任何 key), 之前的 annotations:{} 导致 rollback 只
+        // 改缓存、PVC 上 annotation 保留, 30s TTL 过后判据回弹 migrated
+        // (静默假回滚, 比不提供 rollback 更危险)。
+        let annotations = match state.as_annotation() {
+            Some(value) => serde_json::json!({
+                shared_types::WORKSPACE_MIGRATION_ANNOTATION: value
+            }),
+            None => serde_json::json!({
+                shared_types::WORKSPACE_MIGRATION_ANNOTATION: serde_json::Value::Null
+            }),
+        };
+        let patch = serde_json::json!({
+            "metadata": {"uid": uid, "resourceVersion": rv, "annotations": annotations}
+        });
+        self.pvcs()
+            .patch(
+                &pvc_name,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(&patch),
+            )
+            .await
+            .map_err(|e| match &e {
+                kube::Error::Api(response) if response.code == 404 => {
+                    ContainerRuntimeError::ContainerNotFound(format!("PVC '{pvc_name}' vanished"))
+                }
+                kube::Error::Api(response) if response.code == 409 => {
+                    ContainerRuntimeError::Conflict(format!(
+                        "PVC '{pvc_name}' changed concurrently; retry"
+                    ))
+                }
+                other => ContainerRuntimeError::K8sError(format!(
+                    "patch PVC '{pvc_name}' migration state: {other}"
+                )),
+            })?;
+        // 即时写缓存: cutover 后首个请求就要按新判据路由
+        self.workspace_exists_cache.write().await.insert(
+            self.migration_cache_key(identifier, service_type),
+            (true, state, std::time::Instant::now()),
+        );
+        Ok(())
+    }
+
+    async fn workspace_volume_attached(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        self.workspace_volume_attached_inner(identifier, service_type)
+            .await
+    }
+
+    async fn run_workspace_migration_sync(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        mode: shared_types::WorkspaceSyncMode,
+        src_pvc: &str,
+    ) -> ContainerRuntimeResult<()> {
+        self.run_workspace_migration_sync_inner(identifier, service_type, mode, src_pvc)
+            .await
+    }
+
+    async fn backfill_workspace(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        backfill: &shared_types::WorkspaceBackfill,
+        src_pvc: &str,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceBackfillReport> {
+        self.run_workspace_backfill_inner(identifier, service_type, backfill, src_pvc)
+            .await
+    }
+
+    async fn check_workspace_migration_config(&self) -> ContainerRuntimeResult<()> {
+        self.workspace_migration_config_check()
+    }
+
     /// 枚举某 service_type 的所有 per-app PVC，从 PVC 名反解 identifier（app_id）。
     ///
     /// 用于 storage/query 发现"有持久数据"的 app（含已 delete 但 PVC 保留的孤儿）——
@@ -91,7 +344,21 @@ impl WorkspaceRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         // 复用 K8sPvcOps::ensure_workspace_pvc (幂等: active→复用 / not_found→创建)
         self.ensure_workspace_pvc(identifier, service_type, storage_size)
+            .await?;
+        // 缓存即时失效: PVC 此刻必存在, 写 true——否则刚创建的 volume 在
+        // workspace_pvc_exists 的 30s TTL 窗口内仍可能读到 false（新用户
+        // 首个文件请求会落本地共享卷读到空数据）。
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        let state = self
+            .read_migration_annotation(&pvc_name)
             .await
+            .unwrap_or(shared_types::WorkspaceMigrationState::NotMigrated);
+        self.workspace_exists_cache.write().await.insert(
+            self.migration_cache_key(identifier, service_type),
+            (true, state, std::time::Instant::now()),
+        );
+        Ok(())
     }
 
     async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {
@@ -152,5 +419,219 @@ impl WorkspaceRuntime for KubernetesRuntime {
         // 委派 K8sPvcOps::resize_app_pvc（读当前值→比较→patch/事实拒绝）。
         // trait 方法默认 no-op, Docker 不覆盖（bind 目录无容量语义）。
         K8sPvcOps::resize_app_pvc(self, app_id, new_size).await
+    }
+}
+
+impl KubernetesRuntime {
+    /// 判据缓存键 = 物理 PVC 名（终审 F5）：ComputerAgentRunner 与
+    /// ComputerNormalProject 同 PVC 但不同 service_type——此前
+    /// `{service_type}/{identifier}` 双键会同一 PVC 返回 Migrated 与
+    /// NotMigrated 并存（cutover 只 warm 一个键）。PVC 名是物理唯一键。
+    fn migration_cache_key(&self, identifier: &str, service_type: &ServiceType) -> String {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        self.workspace_pvc_name(identifier, service_type)
+            .unwrap_or_else(|_| format!("{service_type}/{identifier}"))
+    }
+    /// 缓存回写防旧值覆盖（并发终审 A）: 若现有条目的写入时刻晚于本次查询
+    /// 的发起时刻（如 cutover 的 set_state 即时写入），本次结果作废不回写。
+    /// set_state/ensure_workspace 的权威写入不经此守卫（无条件写）。
+    async fn upsert_cache_if_not_stale(
+        &self,
+        cache_key: &str,
+        value: (bool, shared_types::WorkspaceMigrationState),
+        sampled_at: std::time::Instant,
+    ) {
+        let mut cache = self.workspace_exists_cache.write().await;
+        if let Some((_, _, existing_at)) = cache.get(cache_key)
+            && *existing_at > sampled_at
+        {
+            return; // 期间已有更新写入, 旧查询结果作废
+        }
+        cache.insert(
+            cache_key.to_string(),
+            (value.0, value.1, std::time::Instant::now()),
+        );
+    }
+
+    /// 读 PVC 的迁移 annotation（无法识别的值 → NotMigrated）。私有 helper
+    /// （非 WorkspaceRuntime 接口——内部实现细节）。
+    async fn read_migration_annotation(
+        &self,
+        pvc_name: &str,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceMigrationState> {
+        let pvc =
+            self.pvcs().get(pvc_name).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}"))
+            })?;
+        let value = pvc
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION))
+            .map(String::as_str);
+        Ok(shared_types::WorkspaceMigrationState::from_annotation(
+            value,
+        ))
+    }
+}
+
+/// [`WorkspaceRuntime::set_workspace_migration_state`] 的 `'static` 版本
+/// （第八轮复审 P1）：首建的完成者任务在编排 future 取消后仍要完成
+/// marker PATCH + 判据缓存写，门禁（migration_guard）随任务持有至此——
+/// 提前放行会让路由缓存（仍 NotMigrated）与 PVC（已 Migrated）分裂，
+/// 并发写落旧共享卷。
+/// 成功时返回**本次实际读取并 PATCH 的 PVC UID**——对账必须以此身份核对
+///（第十二轮 P1：外部再 GET 是另一次采样，同名换代时会认错对象）。
+/// marker 写入三态（codex 复审 2026-11-20）：完成者的门禁处置必须区分
+/// "从未发出写"与"写已发出结果未知"——前者可直接收束，后者需 RV 栅栏
+/// 淘汰在途写后才可放行。
+pub(crate) enum MarkerSetOutcome {
+    /// PATCH 已确认应用（缓存已写）。携带 setter 自身读到的 PVC UID。
+    Applied(String),
+    /// 确定没有任何写落地：GET 阶段失败（未发出），或 PATCH 被服务端
+    /// 明确拒绝（404 目标消失 / 409 RV 冲突 / 其他 4xx 拒绝）。
+    NothingApplied,
+    /// PATCH 已发出但结果未知（传输失败/超时/5xx——可能已到达服务端）。
+    /// 携带目标对象 UID 与写入前提 RV：完成者据此做 RV 条件的状态推进
+    /// 栅栏——对象 RV 越过该值后，此在途写永远 409，不可能再落地。
+    Unknown {
+        pvc_uid: String,
+        resource_version: String,
+    },
+}
+
+pub(crate) async fn set_migration_state_detached(
+    client: Client,
+    namespace: String,
+    cache: Arc<RwLock<std::collections::HashMap<String, WorkspaceMigrationCacheValue>>>,
+    pvc_name: String,
+    cache_key: String,
+    state: shared_types::WorkspaceMigrationState,
+) -> ContainerRuntimeResult<MarkerSetOutcome> {
+    let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+        kube::Api::namespaced(client, &namespace);
+    // codex 复审（2026-11-23）P1：RV 竞争重试必须**内聚锚定**——绑定首次
+    // GET 读到的（UID + volume-origin），重试只刷新 RV。否则外层重试的
+    // 新一轮 GET 会重新认领同名对象（phase-a 换代卷/被标 rolled-back 的
+    // 卷都能被重写成 migrated，撤销并发决策）。
+    const RV_RACE_ATTEMPTS: u8 = 3;
+    let mut attempt: u8 = 0;
+    let mut anchor: Option<(String, Option<String>)> = None;
+    loop {
+        // GET 阶段的任何失败 = 从未发出写（NotSent）：终态返回，不重试
+        // （404 = 卷不在，交上层重新判定；不得把后续同名对象的标记当作
+        // 本操作证据——codex 反例：GET 失败后同名替换 PVC 自带 migrated
+        // 被误认成功）。
+        let existing = match pvcs.get_opt(&pvc_name).await {
+            Ok(Some(existing)) => existing,
+            Ok(None) => return Ok(MarkerSetOutcome::NothingApplied),
+            Err(error) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "get PVC '{pvc_name}': {error}"
+                )));
+            }
+        };
+        let (Some(uid), Some(rv)) = (
+            existing.metadata.uid.clone(),
+            existing.metadata.resource_version.clone(),
+        ) else {
+            return Err(ContainerRuntimeError::Conflict(format!(
+                "PVC '{pvc_name}' has no uid/resourceVersion"
+            )));
+        };
+        let origin = existing
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(crate::runtime::k8s_pvc::VOLUME_ORIGIN_LABEL))
+            .cloned();
+        match &anchor {
+            None => anchor = Some((uid.clone(), origin)),
+            Some((anchored_uid, anchored_origin)) => {
+                if anchored_uid != &uid {
+                    tracing::warn!(
+                        pvc = %pvc_name,
+                        anchored_uid = %anchored_uid,
+                        current_uid = %uid,
+                        "marker write retry saw a replaced same-name PVC; refusing to reclaim"
+                    );
+                    return Ok(MarkerSetOutcome::NothingApplied);
+                }
+                if anchored_origin != &origin {
+                    tracing::warn!(
+                        pvc = %pvc_name,
+                        anchored_origin = ?anchored_origin,
+                        current_origin = ?origin,
+                        "marker write retry saw volume-origin change; refusing to overwrite"
+                    );
+                    return Ok(MarkerSetOutcome::NothingApplied);
+                }
+            }
+        }
+        let annotations = match state.as_annotation() {
+            Some(value) => serde_json::json!({
+                shared_types::WORKSPACE_MIGRATION_ANNOTATION: value
+            }),
+            None => serde_json::json!({
+                shared_types::WORKSPACE_MIGRATION_ANNOTATION: serde_json::Value::Null
+            }),
+        };
+        let patch = serde_json::json!({
+            "metadata": {"uid": uid, "resourceVersion": rv, "annotations": annotations}
+        });
+        match pvcs
+            .patch(
+                &pvc_name,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(&patch),
+            )
+            .await
+        {
+            Ok(_) => {
+                // 即时写缓存：完成者场景下这是"取消后路由与 PVC 收敛"的关键一步。
+                cache
+                    .write()
+                    .await
+                    .insert(cache_key, (true, state, std::time::Instant::now()));
+                return Ok(MarkerSetOutcome::Applied(uid));
+            }
+            Err(kube::Error::Api(response)) if response.code == 409 => {
+                // RV 冲突被拒（刚建 PVC 的 CSI binder 注解写入是典型来源）：
+                // 服务端证明本次写未落地。锚定身份不变时重 GET 拿新 RV 重试；
+                // 预算耗尽按确定未落地终态返回。
+                if attempt < RV_RACE_ATTEMPTS {
+                    attempt += 1;
+                    tracing::warn!(
+                        pvc = %pvc_name,
+                        attempt,
+                        "migration marker PATCH rejected by RV race; retrying with fresh RV"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    continue;
+                }
+                return Ok(MarkerSetOutcome::NothingApplied);
+            }
+            Err(kube::Error::Api(response)) if response.code == 404 => {
+                // 目标在应用时已消失：本次写确定未落地（终态，不重试）。
+                return Ok(MarkerSetOutcome::NothingApplied);
+            }
+            Err(kube::Error::Api(response)) if (400..500).contains(&response.code) => {
+                // 其他 4xx 明确拒绝：未落地（终态）。
+                return Ok(MarkerSetOutcome::NothingApplied);
+            }
+            Err(other) => {
+                // 传输失败/超时/5xx：写可能已到达服务端——结果未知。交出写入
+                // 前提（UID+RV）供完成者做 RV 栅栏淘汰；原始错误仅记日志。
+                tracing::warn!(
+                    pvc = %pvc_name,
+                    error = %other,
+                    "migration marker PATCH outcome unknown; handing UID/RV precondition to completer fence"
+                );
+                return Ok(MarkerSetOutcome::Unknown {
+                    pvc_uid: uid,
+                    resource_version: rv,
+                });
+            }
+        }
     }
 }

@@ -121,7 +121,7 @@ pub async fn download_all_files_impl(
         path_prefix: Some(prefix),
         ..Default::default()
     };
-    // 大小上限 (对齐 nuwax DOWNLOAD_MAX_FILE_SIZE_BYTES, 默认 100MB)
+    // 压缩前文件总大小上限 (DOWNLOAD_MAX_FILE_SIZE_BYTES，默认 5 GiB)
     let max = state.config.download_max_file_size_bytes;
     let src_for_size = src.clone();
     let opts_for_size = opts.clone();

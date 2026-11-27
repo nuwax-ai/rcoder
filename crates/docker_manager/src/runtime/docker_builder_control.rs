@@ -134,58 +134,6 @@ impl DockerRuntime {
         }))
     }
 
-    pub(super) async fn read_builder_file_credentials(
-        &self,
-        target: &BuilderControlTarget,
-    ) -> Result<shared_types::FileServerRequestCredentials> {
-        target.validate().map_err(Error::ConfigurationError)?;
-        let resource = target
-            .workload
-            .as_ref()
-            .ok_or(Error::ManagementNotRunning)?;
-        let before = self
-            .capture_builder_compute_with_binding(
-                &target.context,
-                target.resource_binding.as_ref(),
-                false,
-            )
-            .await?;
-        if before.workload.as_ref().map(|value| &value.uid) != Some(&resource.uid) {
-            return Err(Error::Conflict(
-                "Builder physical identity changed before credential read".into(),
-            ));
-        }
-        let client = self.inner.get_docker_client();
-        let info = client
-            .inspect_container(&resource.uid, None)
-            .await
-            .map_err(|error| {
-                Error::DockerError(format!("Inspect builder credential target: {error}"))
-            })?;
-        if info.state.as_ref().and_then(|state| state.running) != Some(true) {
-            return Err(Error::ManagementNotRunning);
-        }
-        let result = super::docker_app_runtime::execute_container_command(
-            client,
-            &resource.uid,
-            super::builder_file_credentials::read_command(),
-        )
-        .await?;
-        let after = self
-            .capture_builder_compute_with_binding(
-                &target.context,
-                target.resource_binding.as_ref(),
-                false,
-            )
-            .await?;
-        if after.workload.as_ref().map(|value| &value.uid) != Some(&resource.uid) {
-            return Err(Error::Conflict(
-                "Builder physical identity changed during credential read".into(),
-            ));
-        }
-        super::builder_file_credentials::credentials(result)
-    }
-
     pub(super) async fn reconcile_builder_start(
         &self,
         target: &BuilderControlTarget,

@@ -429,25 +429,40 @@ fn pod_diagnostic(pod: &Pod) -> AgentPodDiagnostic {
             ..Default::default()
         };
     };
+    let mut diagnostic = pod_container_diagnostic(cs);
+    // evidence（Pod UID + 终止时间戳）属于 Pod 级信息，在这里补上
+    let current = cs.state.as_ref().and_then(|s| s.terminated.as_ref());
+    let terminated = current.or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()));
+    diagnostic.evidence = pod
+        .metadata
+        .uid
+        .clone()
+        .filter(|id| !id.is_empty())
+        .map(
+            |physical_id| container_runtime_api::AgentPodDiagnosticEvidence {
+                physical_id,
+                termination_finished_at: terminated
+                    .and_then(|t| t.finished_at.as_ref())
+                    .and_then(|t| chrono::DateTime::from_timestamp_millis(t.0.as_millisecond())),
+                current_termination: current.is_some(),
+            },
+        );
+    diagnostic
+}
+
+/// 纯函数：单个 ContainerStatus → AgentPodDiagnostic（不含 Pod 级 evidence）。
+///
+/// 从 `pod_diagnostic` 抽出：`/computer/pod/overview` 要对**任意主容器**
+/// （agent/app/rcoder/第一个）做同样的健康提取，写死 "agent" 会漏掉
+/// mysql/redis 等非 agent Pod。原 `pod_diagnostic` 改为委托本函数 +
+/// 补 evidence，行为零变化（现有 diagnostic_tests 即回归网）。
+pub(crate) fn pod_container_diagnostic(
+    cs: &k8s_openapi::api::core::v1::ContainerStatus,
+) -> AgentPodDiagnostic {
     let current = cs.state.as_ref().and_then(|s| s.terminated.as_ref());
     let terminated = current.or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()));
     AgentPodDiagnostic {
-        evidence: pod
-            .metadata
-            .uid
-            .clone()
-            .filter(|id| !id.is_empty())
-            .map(
-                |physical_id| container_runtime_api::AgentPodDiagnosticEvidence {
-                    physical_id,
-                    termination_finished_at: terminated
-                        .and_then(|t| t.finished_at.as_ref())
-                        .and_then(|t| {
-                            chrono::DateTime::from_timestamp_millis(t.0.as_millisecond())
-                        }),
-                    current_termination: current.is_some(),
-                },
-            ),
+        evidence: None,
         exists: true,
         ready: cs.ready,
         restart_count: u32::try_from(cs.restart_count).unwrap_or(0),

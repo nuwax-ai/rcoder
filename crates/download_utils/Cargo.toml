@@ -5,7 +5,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "HTTP download utilities with retry, resume, and SHA-256 verification"
-homepage.workspace = true
 repository.workspace = true
 publish.workspace = true
 

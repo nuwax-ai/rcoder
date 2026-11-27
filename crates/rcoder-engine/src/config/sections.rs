@@ -106,14 +106,22 @@ pub struct LogCleanupConfig {
     /// 日志保留天数，默认10天
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: u64,
+    /// 日志清理的周期（秒），默认 86400 秒（1 天）。日志清理任务每隔一个清扫间隔检查一次是否
+    /// 到期；设为 0 表示每次检查都运行。
+    #[serde(default = "default_log_cleanup_interval_seconds")]
+    pub cleanup_interval_seconds: u64,
 }
 
 fn default_log_dir() -> String {
-    "/app/logs/container".to_string()
+    shared_types::paths::CONTAINER_LOG_ROOT.to_string()
 }
 
 fn default_log_retention_days() -> u64 {
     10
+}
+
+fn default_log_cleanup_interval_seconds() -> u64 {
+    24 * 60 * 60
 }
 
 impl Default for LogCleanupConfig {
@@ -121,6 +129,7 @@ impl Default for LogCleanupConfig {
         Self {
             log_dir: default_log_dir(),
             log_retention_days: default_log_retention_days(),
+            cleanup_interval_seconds: default_log_cleanup_interval_seconds(),
         }
     }
 }
@@ -217,6 +226,54 @@ impl Default for CleanupConfigSettings {
 ///
 /// 默认 `enabled=true`：免费用户 app 闲置超阈值自动 scale0 回收；付费 app 经
 /// `CreateAppRequest.recycle_enabled=false`（注解 `rcoder.io/recycle-enabled=false`）opt-out 永不回收。
+/// UserApp 镜像漂移治理（spec sandbox-image-version-drift）：R3 只读对账
+/// 台账与 R4 观察兜底（K8s 专有；Docker 豁免 watch，仅台账）。全部只读或
+/// 有界收敛，不影响运行中工作负载。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserAppImageDriftConfig {
+    /// 只读漂移台账扫描（默认 true；纯日志，无副作用）
+    #[serde(default = "default_true")]
+    pub inventory_enabled: bool,
+    /// 台账扫描间隔（秒），默认 3600
+    #[serde(default = "default_drift_inventory_interval_seconds")]
+    pub inventory_interval_seconds: u64,
+    /// 拉取失败观察兜底（默认 true；仅平台仓库内旧模板 + 持续拉取失败才
+    /// 有界对齐一次）
+    #[serde(default = "default_true")]
+    pub watch_enabled: bool,
+    /// 拉取失败持续判定窗口（秒），默认 120
+    #[serde(default = "default_drift_pull_failure_window_seconds")]
+    pub pull_failure_window_seconds: u64,
+    /// 同一 app 收敛尝试冷却（秒），默认 3600
+    #[serde(default = "default_drift_recovery_cooldown_seconds")]
+    pub recovery_cooldown_seconds: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_drift_inventory_interval_seconds() -> u64 {
+    3600
+}
+fn default_drift_pull_failure_window_seconds() -> u64 {
+    120
+}
+fn default_drift_recovery_cooldown_seconds() -> u64 {
+    3600
+}
+
+impl Default for UserAppImageDriftConfig {
+    fn default() -> Self {
+        Self {
+            inventory_enabled: true,
+            inventory_interval_seconds: default_drift_inventory_interval_seconds(),
+            watch_enabled: true,
+            pull_failure_window_seconds: default_drift_pull_failure_window_seconds(),
+            recovery_cooldown_seconds: default_drift_recovery_cooldown_seconds(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserAppRecycleConfig {
     /// 是否启用定时闲置回收（默认 true；不关闭显式启动或流量唤醒）
@@ -238,6 +295,15 @@ pub struct UserAppRecycleConfig {
     /// 新建 app 最小保护期（秒），默认 300；龄期小于此值不回收
     #[serde(default = "default_userapp_protection_seconds")]
     pub protection_seconds: u64,
+    /// 从未访问工作负载的弃置龄期（秒），默认 86400（24h）：健康运行但
+    /// 无任何访问记录超过该龄期即回收（app-184 反例；龄期不替代近期闲置
+    /// 证据，仅闭合从未访问的永久 grace）
+    #[serde(default = "default_userapp_never_accessed_timeout_seconds")]
+    pub never_accessed_timeout_seconds: u64,
+}
+
+fn default_userapp_never_accessed_timeout_seconds() -> u64 {
+    86400
 }
 
 fn default_userapp_recycle_enabled() -> bool {
@@ -299,6 +365,7 @@ impl Default for UserAppRecycleConfig {
             wake_timeout_seconds: default_userapp_wake_timeout_seconds(),
             dev_entry_wait_timeout_seconds: default_userapp_dev_entry_wait_timeout_seconds(),
             protection_seconds: default_userapp_protection_seconds(),
+            never_accessed_timeout_seconds: default_userapp_never_accessed_timeout_seconds(),
         }
     }
 }
@@ -594,5 +661,126 @@ impl DockerConfig {
             self.cache_network_ttl_seconds.unwrap_or(15),
             self.cache_max_capacity.unwrap_or(10000)
         )
+    }
+}
+
+// ============================================================
+// E2B 兼容沙箱（M1：单副本；启用需 kubernetes + pg）
+// ============================================================
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct E2bSandboxConfig {
+    /// 总开关：false 时完全不装配（无路由、无任务、无存储连接）。
+    pub enabled: bool,
+    /// 沙箱 Pod 所在 namespace（独立于业务 runner）。
+    pub namespace: String,
+    /// token 加密密钥（64 位 hex = 32 字节 AES-256-GCM key）。
+    /// 生产经环境注入；缺失且 enabled=true 时启动 fail-fast。
+    pub token_key_hex: String,
+    pub default_ttl_seconds: i64,
+    pub max_ttl_seconds: i64,
+    pub reaper_interval_seconds: u64,
+    /// create 等待 Pod Ready 的上限（秒）。
+    pub create_ready_timeout_seconds: u64,
+    /// envd /init 重试次数（同 token + 新 timestamp，源码实证幂等）。
+    pub envd_init_retries: u32,
+    /// create 响应里的 domain 字段（SDK 侧主要用 E2B_DOMAIN，此值用于展示）。
+    pub public_domain: String,
+    /// 温池总开关（M4）：false 时不启动补池器，create 走冷启动。
+    pub warm_pool_enabled: bool,
+    /// 补池器巡检周期（秒）。
+    pub warm_pool_interval_seconds: u64,
+    /// 温池实例未被认领的最长闲置秒数（Pod activeDeadline 与 expires 同源）。
+    pub warm_idle_ttl_seconds: i64,
+    /// Volume 使用的 StorageClass（默认 cephfs，RWX 多沙箱并发挂载）。
+    pub volume_storage_class: String,
+    /// Volume 最大容量（GiB）。
+    pub volume_max_size_gib: i32,
+    /// 数据面端口白名单：路径/头路由只代理这些沙箱内端口
+    /// （49983 envd / 8787 CDP / 8788 MCP）。任意端口默认 403，防 SSRF 与
+    /// 任意端口转发；模板需要新端口须显式加白。
+    pub allowed_ports: Vec<i32>,
+    pub api_keys: Vec<E2bSandboxApiKeySeed>,
+    pub templates: Vec<E2bSandboxTemplateSeed>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct E2bSandboxApiKeySeed {
+    pub key_id: String,
+    pub tenant_id: String,
+    /// 明文 key（仅用于计算哈希入库与运维对照；库中只存 sha256）。
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct E2bSandboxTemplateSeed {
+    pub template_id: String,
+    /// 修订号：镜像/envd/规格变更必须 +1（修订行不可变，同号冲突被忽略）。
+    #[serde(default = "default_template_revision")]
+    pub revision: i64,
+    pub display_name: Option<String>,
+    pub enabled: bool,
+    pub image: String,
+    pub image_digest: Option<String>,
+    pub envd_version: String,
+    /// None/空 = runc；如 kata-clh-runtime-rs。
+    pub runtime_class: Option<String>,
+    pub cpu_millicores: i64,
+    pub memory_mib: i64,
+    pub default_user: String,
+    pub default_workdir: String,
+    #[serde(default)]
+    pub default_env: std::collections::BTreeMap<String, String>,
+    pub ttl_max_seconds: i64,
+    #[serde(default)]
+    pub warm_target: i64,
+}
+
+fn default_template_revision() -> i64 {
+    1
+}
+
+impl Default for E2bSandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            namespace: "nuwax-e2b".to_string(),
+            token_key_hex: String::new(),
+            default_ttl_seconds: 300,
+            max_ttl_seconds: 3600,
+            reaper_interval_seconds: 10,
+            create_ready_timeout_seconds: 90,
+            envd_init_retries: 5,
+            public_domain: String::new(),
+            warm_pool_enabled: false,
+            warm_pool_interval_seconds: 30,
+            warm_idle_ttl_seconds: 3600,
+            volume_storage_class: "cephfs".to_string(),
+            volume_max_size_gib: 10,
+            allowed_ports: vec![49983, 8787, 8788, 49999],
+            api_keys: Vec::new(),
+            templates: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod log_cleanup_tests {
+    use super::LogCleanupConfig;
+
+    /// 旧配置里没有这一项：按默认 1 天
+    #[test]
+    fn the_log_cleanup_interval_defaults_to_one_day() {
+        let config: LogCleanupConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config.cleanup_interval_seconds, 24 * 60 * 60);
+        assert_eq!(config.log_retention_days, 10);
+    }
+
+    #[test]
+    fn an_explicit_log_cleanup_interval_is_honoured() {
+        let config: LogCleanupConfig =
+            serde_yaml::from_str("cleanup_interval_seconds: 3600").unwrap();
+        assert_eq!(config.cleanup_interval_seconds, 3600);
     }
 }

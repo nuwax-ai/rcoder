@@ -27,9 +27,11 @@ pub(super) async fn ensure_project_workspace_exists(
 ) -> Result<(), AppError> {
     // 解析主容器侧应创建的路径（None = 跳过预创建）
     let project_workspace_path = if shared_types::is_absolute_path_like(work_dir_id) {
-        // per-agent PVC 模式：主容器不挂 per-agent PVC，预创建只会产生主视角
+        // per-agent PVC 模式（subvolume/RBD 同）：主容器不挂 per-agent PVC，预创建只会产生主视角
         // 孤儿目录；容器内 agent_runner dispatch 有 create_dir_all 兜底
-        if shared_types::per_agent_pvc_enabled() {
+        if shared_types::is_kubernetes_runtime()
+            && (shared_types::per_agent_pvc_enabled() || shared_types::per_agent_rbd_enabled())
+        {
             debug!(
                 "📁 [COMPUTER_CHAT] per-agent PVC mode, skip host-side pre-create (agent_runner will create): work_dir_id={work_dir_id}"
             );

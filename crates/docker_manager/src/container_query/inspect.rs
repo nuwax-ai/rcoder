@@ -2,6 +2,8 @@
 //!
 //! 从 container_query.rs 目录化拆出（extension-impl，方法体原样搬迁）。
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,6 +91,27 @@ impl DockerManager {
         identifier: &str,
     ) -> DockerResult<Option<ContainerQueryResult>> {
         self.find_container_status(identifier, false).await
+    }
+
+    /// 当前被某个容器当作挂载源的宿主机路径，含已停止但尚未删除的容器。
+    ///
+    /// 一次列表调用覆盖全部容器，周期调用方只需一次请求。路径按与挂载创建侧相同的
+    /// 方式归一化，调用方可以直接拿自己推导出的路径来比对。响应里任何让"挂载源是否
+    /// 完整"存疑的地方都报错，不会被当成"没有挂载"，见
+    /// [`crate::runtime::docker_runtime::log_dir_mounts::mount_sources`]。
+    pub(crate) async fn mounted_host_paths(&self) -> DockerResult<HashSet<PathBuf>> {
+        let options = Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            ..Default::default()
+        });
+        let timeout = Duration::from_secs(self.config.api_timeout_quick_seconds);
+        let containers = tokio::time::timeout(timeout, self.docker.list_containers(options))
+            .await
+            .map_err(|_| DockerError::Timeout("List container mount sources timed out".to_owned()))?
+            .map_err(|error| {
+                DockerError::ConnectionError(format!("List container mounts: {error}"))
+            })?;
+        crate::runtime::docker_runtime::log_dir_mounts::mount_sources(&containers)
     }
 
     async fn find_container_status(

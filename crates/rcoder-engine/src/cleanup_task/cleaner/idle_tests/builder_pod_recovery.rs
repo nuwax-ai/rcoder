@@ -235,9 +235,21 @@ async fn builder_same_controller_pod_repair_is_durable_in_real_pg_and_preserves_
         "Strict PG recovery requires an isolated database"
     );
     let Some(dsn) = dsn else { return };
+    // See absence_recovery: a sweep scans every registration its store can see,
+    // so rows other tests left in a shared database would each pay a gRPC
+    // connect timeout here. Only a private schema limits the sweep to this
+    // fixture's own registration.
+    let schema = format!("builder_pod_retirement_{}", uuid::Uuid::new_v4().simple());
+    let mut admin = toasty::Db::builder().connect(&dsn).await.unwrap();
+    toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    let scoped = format!("{dsn}{separator}options=-csearch_path%3D{schema}");
     let (mut f, app_id) = builder_fixture().await;
     let config = rcoder_storage::config::PostgresConfig {
-        url: Some(dsn),
+        url: Some(scoped),
         ..Default::default()
     };
     let store = Arc::new(
@@ -322,6 +334,13 @@ async fn builder_same_controller_pod_repair_is_durable_in_real_pg_and_preserves_
     );
     assert_eq!(f.runtime.stops.load(Ordering::SeqCst), 0);
     f.close().await;
+    // A failed assertion keeps the schema for diagnosis; a passed one leaves
+    // nothing behind in the shared database.
+    drop(peer);
+    toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

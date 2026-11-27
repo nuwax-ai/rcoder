@@ -38,7 +38,7 @@ dial9 = ["rcoder-engine/dial9", "http-server/dial9"]
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
 userapp-turso = ["rcoder-engine/userapp-turso"]
 
-kubernetes = ["rcoder-engine/kubernetes"]
+kubernetes = ["rcoder-engine/kubernetes", "http-server/kubernetes"]
 
 # Agent 项目/会话 PostgreSQL 后端；运行期由 [storage].backend 选择。
 # userApp 后端独立配置，不因 Agent 仍使用 memory 而回退到内存。
@@ -49,7 +49,6 @@ deploy-host = ["rcoder-engine/deploy-host", "http-server/deploy-host"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-filetime = { workspace = true }
 http-body-util = { workspace = true }
 
 [lints]
@@ -132,7 +131,6 @@ dashmap = { workspace = true }
 notify = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
-piper = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
@@ -143,7 +141,6 @@ rustls = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-axum-tracing-opentelemetry = { workspace = true }
 
 # File system
 path-clean = { workspace = true }
@@ -153,11 +150,9 @@ utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 utoipa-scalar = { workspace = true }
 
-ringbuf = { workspace = true }
 
 # Random and hashing
 rand = { workspace = true }
-md5 = { workspace = true }
 
 # Cache
 moka = { workspace = true }

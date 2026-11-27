@@ -467,6 +467,18 @@ impl AgentContainerRuntime for Runtime {
             .expect("Docker archive fixture");
         mode.restore(template).await
     }
+    async fn builder_restart_mount_witness(
+        &self,
+        _template: &BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Option<BuilderRestartMountWitness>> {
+        let witness = self
+            .docker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|mode| mode.mount_witness());
+        Ok(witness)
+    }
     async fn ensure_absent_builder_control(
         &self,
         _: &BuilderControlTarget,

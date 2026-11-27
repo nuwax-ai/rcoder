@@ -288,11 +288,7 @@ mod tests {
         let ws = temp_ws_with_index();
         let router = router(ws);
         let response = router
-            .oneshot(
-                axum::http::Request::head("/")
-                    .body(axum::body::Body::empty())
-                    .expect("request"),
-            )
+            .oneshot(Request::head("/").body(Body::empty()).expect("request"))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -361,7 +357,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _unused = axum::serve(listener, app).await;
         });
         for method in ["GET", "HEAD"] {
             let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
@@ -406,10 +402,10 @@ mod tests {
                 let response = app
                     .clone()
                     .oneshot(
-                        axum::http::Request::builder()
+                        Request::builder()
                             .method(method)
                             .uri(path)
-                            .body(axum::body::Body::empty())
+                            .body(Body::empty())
                             .expect("request"),
                     )
                     .await

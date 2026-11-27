@@ -253,8 +253,18 @@ impl AppService {
             let target = self
                 .capture_bound_app_target(&context, previous.resource_version.as_deref())
                 .await?;
+            // 冷唤醒镜像对齐（spec sandbox-image-version-drift R1）：受理时解析
+            // 平台当前镜像并随 checkpoint 持久化，重试/接管按同一目标收敛；
+            // 归属守卫在 k8s 写边界（非平台镜像保留模板）。env 缺失时退化为
+            // 保留模板镜像（可用性优先，同 platform_restart_image 契约）。
+            let wake_image = crate::runtime::params::platform_restart_image(
+                &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
+            );
             operation
-                .checkpoint("traffic_wake_target", serde_json::json!({"target":target}))
+                .checkpoint(
+                    "traffic_wake_target",
+                    serde_json::json!({"target":target, "image": wake_image.clone()}),
+                )
                 .await?;
             // Admission and captured identity are authoritative. A stale local
             // deletion/manual-stop flag cannot override another replica's committed
@@ -266,7 +276,7 @@ impl AppService {
             } else {
                 guard.mark_mutating()?;
                 self.runtime
-                    .start_app_target(&target)
+                    .start_app_target_with_image(&target, wake_image.as_deref())
                     .await
                     .map_err(|error| {
                         map_runtime_mutation_error(

@@ -29,7 +29,7 @@ mod cleanup;
 mod cleanup_empty_tests;
 #[cfg(all(test, unix))]
 mod current_domain_recovery_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod deadline_tests;
 mod legacy;
 mod official_host;
@@ -107,7 +107,7 @@ impl SupervisordHost {
     pub(crate) fn mutations_pending() -> Result<bool> {
         SupervisorClient::mutations_pending()
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn protocol_fixture(socket: PathBuf, conf_path: PathBuf) -> Self {
         Self {
             client: SupervisorClient::new(socket),
@@ -331,7 +331,7 @@ impl SupervisordHost {
                 // run 兜底），不再恒用 run.command。
                 // R08：profile 来自**本次操作**（请求 Source 形态）显式传递，
                 // env 仅作操作未指定时的兜底
-                argv: crate::supervisor::effective_run_argv(spec, dev_profile).to_vec(),
+                argv: supervisor::effective_run_argv(spec, dev_profile).to_vec(),
                 env: supervisor::service_environment(spec, pg.as_ref())?,
                 port: Some(spec.port),
             };
@@ -514,7 +514,7 @@ impl SupervisordHost {
         }
         runtime_status.set_ready(ready);
         ServiceSpecFile::prune_other_generations(&release.release_id);
-        let _ = started; // 全部成功；失败路径由外层 stop_all 清理
+        let _unused = started; // 全部成功；失败路径由外层 stop_all 清理
         Ok(())
     }
 
@@ -581,7 +581,7 @@ impl SupervisordHost {
 async fn settle_start_mutation<T>(
     deadline: tokio::time::Instant,
     cancel: &tokio_util::sync::CancellationToken,
-    future: impl std::future::Future<Output = Result<T>>,
+    future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     anyhow::ensure!(!cancel.is_cancelled(), "Startup check cancelled");
     tokio::pin!(future);

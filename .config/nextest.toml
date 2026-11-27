@@ -27,3 +27,13 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = '(package(file-server) & test(owner_probe_branches)) | (package(app_manager) & test(lifecycle::recovery::identity_tests::purged_witness::))'
 test-group = 'app-cli-admin-3010'
+
+# app-cli 的生产代理监听契约含真实 0.0.0.0:9080；协议生命周期 fixture 与就绪
+# 组合共享该 socket，仅组内串行。原 crates/app-cli/.config/nextest.toml（独立
+# workspace 时代）随 2026-11-18 并入迁移至此。
+[test-groups.app-cli-public-proxy]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = '(package(app-cli) & (binary(run_source_owner) | binary(retry_after_failure) | binary(tree_lifecycle) | test(business_readiness) | test(publication_receipt_tests) | test(pingap_failure_emits_single_done_and_exits_non_zero)))'
+test-group = 'app-cli-public-proxy'

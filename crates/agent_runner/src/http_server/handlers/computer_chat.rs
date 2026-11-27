@@ -10,6 +10,7 @@ use crate::http_server::router::AppState;
 use crate::service::AGENT_REGISTRY;
 use crate::service::chat_handler::{ChatHandlerContext, ChatHandlerInput, handle_chat_core};
 use crate::service::get_or_create_session_data;
+use crate::utils::{PROMPT_LOG_EDGE_CHARS, prompt_preview};
 use shared_types::{
     ChatResponse, ComputerChatRequest, HttpResult, I18nJsonOrQuery, ServiceType,
     error_codes::ERR_INTERNAL_SERVER_ERROR, error_codes::ERR_VALIDATION, get_i18n_message,
@@ -49,8 +50,26 @@ pub(crate) async fn handle_computer_chat_internal(
     is_devcomputer: bool,
 ) -> Result<Json<HttpResult<ChatResponse>>, shared_types::AppError> {
     let locale = locale_from_headers(&headers);
+    // 原样打印 model_provider / agent_config（不脱敏）：配置按用户隔离、
+    // 凭据为临时分配，排查入参需要完整值。
+    let model_provider_json = request
+        .model_provider
+        .as_ref()
+        .map(|config| {
+            serde_json::to_string(config)
+                .unwrap_or_else(|error| format!("<serialize failed: {error}>"))
+        })
+        .unwrap_or_else(|| "None".to_string());
+    let agent_config_json = request
+        .agent_config
+        .as_ref()
+        .map(|config| {
+            serde_json::to_string(config)
+                .unwrap_or_else(|error| format!("<serialize failed: {error}>"))
+        })
+        .unwrap_or_else(|| "None".to_string());
     info!(
-        "[HTTP] Received {} Chat request: user_id={}, project_id={:?}, session_id={:?}, request_id={:?}, prompt_len={}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}, attachments={:?}, data_source_attachments={:?}, model_provider={:#?}, agent_config={:#?}, system_prompt_len={}, user_prompt_len={}",
+        "[HTTP] Received {} Chat request: user_id={}, project_id={:?}, session_id={:?}, request_id={:?}, prompt_len={}, prompt_preview={:?}, pod_id={:?}, tenant_id={:?}, space_id={:?}, isolation_type={:?}, attachments={:?}, data_source_attachments={:?}, model_provider={}, agent_config={}, system_prompt_len={}, user_prompt_len={}",
         if is_devcomputer {
             "DevComputer"
         } else {
@@ -61,14 +80,15 @@ pub(crate) async fn handle_computer_chat_internal(
         request.session_id,
         request.request_id,
         request.prompt.len(),
+        prompt_preview(&request.prompt, PROMPT_LOG_EDGE_CHARS),
         request.pod_id,
         request.tenant_id,
         request.space_id,
         request.isolation_type,
         request.attachments,
         request.data_source_attachments,
-        request.model_provider,
-        request.agent_config,
+        model_provider_json,
+        agent_config_json,
         request.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0),
         request.user_prompt.as_ref().map(|s| s.len()).unwrap_or(0)
     );

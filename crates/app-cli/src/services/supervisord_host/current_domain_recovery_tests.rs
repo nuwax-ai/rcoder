@@ -272,7 +272,7 @@ pub(super) fn recovery_case_with_context(
         assert_eq!(std::fs::read(&foreign_config).unwrap(), b"foreign resource must stay intact");
         assert_eq!(std::fs::read(&config).unwrap(), b"fresh original source candidate");
         if !configured || !succeeds { assert_eq!(std::fs::read(&conf).unwrap(), original_conf); }
-        rpc.abort(); let _ = rpc.await;
+        rpc.abort(); let _unused = rpc.await;
         supervisor::resident::shutdown().await.unwrap(); drop(lease); drop(env);
     });
     if let Some(child) = foreign.as_mut() {

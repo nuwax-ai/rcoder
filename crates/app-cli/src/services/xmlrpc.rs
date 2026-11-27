@@ -222,18 +222,18 @@ fn decode_reload_changes(value: serde_json::Value) -> Result<ReloadChanges> {
 #[derive(Clone)]
 pub(crate) struct SupervisorClient {
     socket: std::path::PathBuf,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     dispatch_hook: Option<std::sync::Arc<TestDispatchHook>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DispatchHookPhase {
     BeforeAttempt,
     AfterAttempt,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 struct TestDispatchHook {
     phase: DispatchHookPhase,
     reached: tokio::sync::Barrier,
@@ -258,7 +258,7 @@ impl SupervisorClient {
     pub(crate) fn new(socket: impl Into<std::path::PathBuf>) -> Self {
         Self {
             socket: socket.into(),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             dispatch_hook: None,
         }
     }
@@ -666,7 +666,7 @@ impl SupervisorClient {
         self.transport("").await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn dispatch_stage(&self, phase: DispatchHookPhase) {
         if let Some(hook) = &self.dispatch_hook
             && hook.phase == phase

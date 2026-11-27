@@ -1,13 +1,13 @@
 //! Agent hook 配置写入 (对齐 nuwax `utils/computer/hookConfigUtils.js`)。
 //!
-//! 写入 Claude Code / Codex / OpenCode 三套 Hook 相关配置:
+//! 写入 Claude Code / nuwax-harness / OpenCode 三套 Hook 相关配置:
 //! - Claude Code: `.claude/settings.json` (hooks + permissions) + `.mcp.json` + `.claude/hooks/` 脚本
-//! - Codex: `.codex/hooks.json` (http hook 转 command wrapper 脚本) + `.codex/hooks/*.sh`
+//! - nuwax-harness: `.nuwax-harness/hooks.json` (http hook 转 command wrapper 脚本) + `.nuwax-harness/hooks/*.sh`
 //! - OpenCode: `.opencode/plugins/opencode-hooks-plugin` + 可选 platform-env 插件
 //!
 //! 设计要点 (与 nuwax 一致):
 //! - 仅在对应配置解析成功时才清除并重写, 避免无效 payload 误删旧配置
-//! - Codex/OpenCode 运行时产物先在 `.tmp/hook-staging-*` staging 目录预生成, 成功后再替换工作区,
+//! - nuwax-harness/OpenCode 运行时产物先在 `.tmp/hook-staging-*` staging 目录预生成, 成功后再替换工作区,
 //!   缩小半更新窗口
 //! - 原子写 (staging tmp + rename) + 损坏 JSON 保护 (解析失败保留旧文件)
 //! - hook 脚本路径校验防穿越与配置覆盖 (限定在 `.claude/hooks/` 下)
@@ -15,7 +15,7 @@
 //! hook 配置是 schemaless 的嵌套 JSON, 用 `serde_json::Value` 透传处理。
 //!
 //! 子模块: `claude` (Claude Code settings/scripts) / `parse` (hooks 解析) /
-//! `codex` (Codex 转换 + shell 辅助) /
+//! `harness` (nuwax-harness 转换 + shell 辅助) /
 //! `opencode` (vendored 插件) / `scripts` (外挂脚本) / `staging` (staging 预生成) /
 //! `io_util` (原子写) / `types` (输入类型)。
 
@@ -27,7 +27,7 @@ use tokio::fs;
 use crate::error::AppResult;
 
 mod claude;
-mod codex;
+mod harness;
 mod io_util;
 mod opencode;
 mod parse;
@@ -48,7 +48,7 @@ use staging::{
 
 // ── 主入口 (writeAgentHookConfigs) ───────────────────────────────────────────────
 
-/// 写入 Claude Code / Codex / OpenCode 三套 Hook 相关配置 (对齐 nuwax writeAgentHookConfigs)。
+/// 写入 Claude Code / nuwax-harness / OpenCode 三套 Hook 相关配置 (对齐 nuwax writeAgentHookConfigs)。
 ///
 /// 仅在对应配置解析成功时才清除并重写。文件系统错误立即返回；workspace 创建调用方
 /// 可以显式选择 best-effort。staging 目录由 `TempDir` 在所有退出路径自动清理。
@@ -187,7 +187,7 @@ async fn apply_hook_configs(workspace: &Path, update: PreparedHookUpdate<'_>) ->
         tracing::info!("Written .mcp.json to workspace root");
     }
 
-    // 3. 应用 / 清理 Codex+OpenCode 运行时产物
+    // 3. 应用 / 清理 nuwax-harness+OpenCode 运行时产物
     if flags.should_update_hooks && hooks_map.is_some() {
         if let Some(staged) = staged_runtime.as_ref() {
             apply_staged_runtime_hook_artifacts(workspace, staged).await?;
@@ -284,14 +284,16 @@ mod tests {
         assert!(settings.get("hooks").unwrap().get("PreToolUse").is_some());
         assert!(settings.get("permissions").unwrap().get("allow").is_some());
 
-        // .codex/hooks.json: http 转 command wrapper
-        let codex: Value = serde_json::from_str(
-            &fs::read_to_string(tmp.join(".codex").join("hooks.json"))
+        // .nuwax-harness/hooks.json: http 转 command wrapper
+        let harness: Value = serde_json::from_str(
+            &fs::read_to_string(tmp.join(".nuwax-harness").join("hooks.json"))
                 .await
                 .unwrap(),
         )
         .unwrap();
-        let handlers = codex["hooks"]["PreToolUse"][1]["hooks"].as_array().unwrap();
+        let handlers = harness["hooks"]["PreToolUse"][1]["hooks"]
+            .as_array()
+            .unwrap();
         assert_eq!(handlers[0]["type"], "command");
         assert!(
             handlers[0]["command"]
@@ -299,9 +301,9 @@ mod tests {
                 .unwrap()
                 .contains("http-hook-0.sh")
         );
-        // wrapper 脚本写入 .codex/hooks/
+        // wrapper 脚本写入 .nuwax-harness/hooks/
         assert!(
-            tmp.join(".codex")
+            tmp.join(".nuwax-harness")
                 .join("hooks")
                 .join("http-hook-0.sh")
                 .is_file()
@@ -378,8 +380,8 @@ mod tests {
         assert!(mcp["mcpServers"]["new"].is_object());
         // 旧 entry 被覆盖 (mcp 是整文件重写, 对齐 nuwax)
         assert!(mcp["mcpServers"]["old"].is_null());
-        // 无 .codex/hooks.json (hooks 无效未触发)
-        assert!(!tmp.join(".codex").join("hooks.json").exists());
+        // 无 .nuwax-harness/hooks.json (hooks 无效未触发)
+        assert!(!tmp.join(".nuwax-harness").join("hooks.json").exists());
     }
 
     #[tokio::test]
@@ -416,7 +418,7 @@ mod tests {
         .expect("parse settings");
         assert!(settings["hooks"]["Stop"].is_array());
         assert_eq!(settings["permissions"]["allow"][0], "Bash");
-        assert!(tmp.join(".codex/hooks.json").is_file());
+        assert!(tmp.join(".nuwax-harness/hooks.json").is_file());
     }
 
     #[tokio::test]
@@ -454,7 +456,7 @@ mod tests {
         .expect("parse settings");
         assert!(settings.get("hooks").is_none());
         assert_eq!(settings["permissions"]["allow"][0], "Bash");
-        assert!(!tmp.join(".codex/hooks.json").exists());
+        assert!(!tmp.join(".nuwax-harness/hooks.json").exists());
         assert!(
             !tmp.join(".opencode/plugins/opencode-hooks-plugin.js")
                 .exists()

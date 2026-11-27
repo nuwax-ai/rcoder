@@ -33,4 +33,8 @@ mod captured;
 mod mutation_identity_tests;
 mod patches;
 
+#[cfg(test)]
+#[path = "../k8s_start_alignment_tests.rs"]
+mod start_alignment_tests;
+
 use patches::*;

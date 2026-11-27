@@ -1046,8 +1046,12 @@ async fn initializing_wait_keeps_original_budget_and_later_unknown_resume_readon
         )
         .await;
     assert!(result.is_err());
+    // 判别对象是「700ms 原期限」与「90s 新预算」这两个数量级不同的行为，不是
+    // 调度延迟：余量要远大于 700ms（套件并行时调度被压住是常态），又远小于
+    // 90s（回归一出现仍然失败）。此前的 1400ms 上界在并行负载下偶发误报
+    // （本机整包并行 20 轮复现 1 次）。
     assert!(
-        started.elapsed() < Duration::from_millis(1400),
+        started.elapsed() < Duration::from_secs(30),
         "initialization cannot replace the original deadline with a new 90s budget"
     );
     assert!(

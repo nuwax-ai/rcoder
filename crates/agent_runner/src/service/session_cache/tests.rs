@@ -2,6 +2,16 @@ use super::*;
 use crate::model::SessionMessageType;
 use chrono::Utc;
 
+/// 保留字（`""` / `"pending"`，preparation 状态的 sentinel）是下面两个用例的
+/// 测试意图——换成随机 id 就再也走不到"身份未建立"那条路。但它们是进程级全局
+/// `SESSION_CACHE` 上**同一个键**，并行执行会互相看见对方插入的条目，让开头
+/// 那句"缓存里不该有条目"误判。因此这两个用例互斥执行。
+static SENTINEL_CACHE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn sentinel_cache_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    SENTINEL_CACHE_LOCK.lock().await
+}
+
 fn make_msg(sub_type: &str) -> UnifiedSessionMessage {
     UnifiedSessionMessage {
         session_id: "test-session".to_string(),
@@ -473,6 +483,7 @@ async fn historical_owner_indexes_and_closed_entries_do_not_block_notification_b
 
 #[tokio::test]
 async fn no_session_identity_cannot_create_a_notification_cache() {
+    let _sentinel = sentinel_cache_guard().await;
     for sid in ["", "pending"] {
         assert!(!SESSION_CACHE.contains_key(sid));
         let direct = push_session_update(sid, identity_boundary_notify(sid)).await;
@@ -525,6 +536,7 @@ async fn no_session_identity_cannot_create_a_notification_cache() {
 
 #[tokio::test]
 async fn invalid_new_notification_preserves_legacy_cache_without_writing_or_deleting_it() {
+    let _sentinel = sentinel_cache_guard().await;
     for sid in ["", "pending"] {
         assert!(!SESSION_CACHE.contains_key(sid));
         let historical = SessionData::new(8).await;

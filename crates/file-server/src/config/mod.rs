@@ -19,6 +19,9 @@ use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, USERAPP_WORKSPACE_ROOT, WORKS
 pub use self::env::MAX_UPLOAD_FILE_SIZE_BYTES;
 use self::env::{default_attachment_extensions, split_default};
 
+/// 全部文件打包下载的默认上限，按压缩前的文件总大小计量。
+const DEFAULT_DOWNLOAD_MAX_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
 /// 部署模式 (区分 K8s 容器部署 vs 宿主机/Electron 部署)。
 ///
 /// file-server 自身保持 kube-free：K8s 重逻辑 (per-agent PVC / CephFS subvolume 解析) 全经
@@ -82,7 +85,7 @@ impl std::str::FromStr for DeploymentMode {
 // ── 默认值常量 (Default impl 与 load.rs env 回退共享, 单一事实源) ────────────────
 
 /// 遍历时排除的目录 (对齐 TS env.development TRAVERSE_EXCLUDE_DIRS)。
-pub(crate) const DEFAULT_TRAVERSE_EXCLUDE_DIRS: &str = "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.grok,.pi,.logs";
+pub(crate) const DEFAULT_TRAVERSE_EXCLUDE_DIRS: &str = "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.nuwax-harness,.opencode,.grok,.pi,.logs";
 /// 备份时排除的文件。
 pub(crate) const DEFAULT_BACKUP_TRAVERSE_EXCLUDE_FILES: &str =
     "pnpm-lock.yaml,yarn.lock,package-lock.json";
@@ -94,7 +97,7 @@ pub(crate) const DEFAULT_INLINE_IMAGE_EXTENSIONS: &str =
     ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif";
 /// zip-workspace 排除列表（含 dev 部署运行目录 .run/.previous/.staging——平台
 /// 生成的解压产物与轮换现场，不进下载包；.agent-store 技能实体库对齐 TS 6ab47b7）。
-pub(crate) const DEFAULT_ZIP_WORKSPACE_EXCLUDE: &str = ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.agent-store,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json,.run,.previous,.staging";
+pub(crate) const DEFAULT_ZIP_WORKSPACE_EXCLUDE: &str = ".git,.tmp,.claude,.agents,.nuwax-harness,.opencode,.grok,.pi,.agent-store,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json,.run,.previous,.staging";
 
 /// 全局配置 (启动时构造一次, 经 AppState 共享)。
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -148,6 +151,7 @@ pub struct Config {
     pub skill_url_allow_http: bool,
     pub skill_url_allow_private_networks: bool,
     pub skill_url_allowed_hosts: Vec<String>,
+    /// 全部文件打包下载的压缩前总大小上限，默认 5 GiB。
     pub download_max_file_size_bytes: u64,
     /// Axum 全局请求体上限；默认且硬上限为 1 GiB。
     pub request_body_max_bytes: u64,
@@ -255,7 +259,7 @@ impl Default for Config {
             // 公网/SaaS 部署可用 SKILL_URL_ALLOW_PRIVATE_NETWORKS=false 重新锁紧。
             skill_url_allow_private_networks: true,
             skill_url_allowed_hosts: Vec::new(),
-            download_max_file_size_bytes: 104_857_600,
+            download_max_file_size_bytes: DEFAULT_DOWNLOAD_MAX_FILE_SIZE_BYTES,
             request_body_max_bytes: MAX_UPLOAD_FILE_SIZE_BYTES,
             log_cache_enabled: true,
             log_cache_duration_ms: 180_000,

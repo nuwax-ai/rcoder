@@ -1,4 +1,5 @@
 use super::*;
+use tracing::warn;
 
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
@@ -111,13 +112,6 @@ impl AgentContainerRuntime for DockerRuntime {
     ) -> ContainerRuntimeResult<()> {
         self.retire_captured_idle_builder(identifier, captured)
             .await
-    }
-
-    async fn get_bound_builder_file_credentials(
-        &self,
-        target: &shared_types::BuilderControlTarget,
-    ) -> ContainerRuntimeResult<shared_types::FileServerRequestCredentials> {
-        self.read_builder_file_credentials(target).await
     }
 
     async fn start_builder_control_with_options(
@@ -467,6 +461,48 @@ impl AgentContainerRuntime for DockerRuntime {
         }
     }
 
+    async fn verify_absent_builder_recovery(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        #[cfg(unix)]
+        {
+            use container_runtime_api::UnboundBuilderCreationAuthority;
+            // 仅用于"已核验的历史预检拒绝"围栏收束：要求计算缺席，且没有
+            // 任何原生创建授权（.app-operation-locks 的 flock 标记）。
+            // 活持有者 / 过期但未清理的原持有者 / 他人持有 / 查询失败
+            // 一律保持围栏——它们证明不了"没有写入被派发过"。
+            //
+            // 只读探针只能缩小窗口，无法把物理缺席保护到 SQL 清槽：探针之后
+            // 仍可能有新身份拿到同一 flock。本条路径的放行前提是"旧 dev 槽
+            // 仍被这条围栏占着"——正常 Ensure 走耐久受理边界、计算控制先排干
+            // 旧操作，所以窗口内没有合法写入方。若将来把本探针复用到更宽的
+            // kind/step，应改用 docker_builder_deletion 的 handoff guard：
+            // 持有 flock、复验计算缺席，并保持到 SQL CAS 完成。
+            if !matches!(
+                self.observe_unbound_builder_creation_authority(context)
+                    .await?,
+                UnboundBuilderCreationAuthority::Absent
+            ) {
+                return Ok(false);
+            }
+            if !self.builder_compute_absent(context).await? {
+                return Ok(false);
+            }
+            // 探针期间可能有新创建拿到标记：发布缺席前再核一次授权面。
+            Ok(matches!(
+                self.observe_unbound_builder_creation_authority(context)
+                    .await?,
+                UnboundBuilderCreationAuthority::Absent
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = context;
+            Ok(false)
+        }
+    }
+
     async fn exec_builder_control_target(
         &self,
         target: &shared_types::BuilderControlTarget,
@@ -574,6 +610,13 @@ impl AgentContainerRuntime for DockerRuntime {
         template: &shared_types::BuilderRestartTemplate,
     ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
         self.restore_builder_template(template).await
+    }
+
+    async fn builder_restart_mount_witness(
+        &self,
+        template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartMountWitness>> {
+        self.restart_mount_witness(template).await
     }
 
     async fn capture_builder_compute_volumes(
@@ -934,6 +977,34 @@ impl AgentContainerRuntime for DockerRuntime {
         }))
     }
 
+    /// 一次列表调用拿到全部容器的挂载源，因此周期调用方只需一次请求。
+    /// 改名后的容器依然持有原挂载，按名字判断会把它误判成已消失。
+    async fn mounted_host_paths(
+        &self,
+    ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
+        self.inner
+            .mounted_host_paths()
+            .await
+            .map_err(log_dir_mounts::list_error)
+    }
+
+    async fn mounted_log_directories(
+        &self,
+        candidates: &[std::path::PathBuf],
+    ) -> ContainerRuntimeResult<container_runtime_api::LogDirectoryMounts> {
+        log_dir_mounts::mounted_log_directories(self, candidates).await
+    }
+
+    async fn begin_log_directory_reclaim(
+        &self,
+        candidate: &std::path::Path,
+    ) -> Result<
+        container_runtime_api::ReclaimPermit,
+        container_runtime_api::ReclaimRefused,
+    > {
+        log_dir_mounts::begin_reclaim(self, candidate).await
+    }
+
     /// Docker 基础诊断：find_container → docker inspect → 读 State(OOMKilled/exit_code/running)。
     /// 用于 gRPC 连接失败时的根因识别（OOM / 容器不在），生成精准友好错误，而非裸 transport error。
     /// inspect 失败(容器重建中等)→ 返回默认诊断(无根因)，调用方按"保留原文"处理，不误判。
@@ -1074,6 +1145,13 @@ impl AgentContainerRuntime for DockerRuntime {
             .unwrap_or(false))
     }
 
+    async fn observe_namespace_pods(
+        &self,
+        events_limit: usize,
+    ) -> ContainerRuntimeResult<container_runtime_api::pod_overview::PodOverviewSnapshot> {
+        self.pod_overview_inner(events_limit).await
+    }
+
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
         let epoch = self.inner.containers.list_epoch();
         // 命中且代次一致才可用；状态已变更（创建/删除/更新）则强制刷新
@@ -1090,7 +1168,28 @@ impl AgentContainerRuntime for DockerRuntime {
         Ok(result)
     }
 
+    async fn container_health(
+        &self,
+        identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::ContainerHealth>> {
+        self.container_health_inner(identifier).await
+    }
+
+    async fn container_termination_history(
+        &self,
+        identifier: &str,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::LastTermination>> {
+        self.termination_history_inner(identifier).await
+    }
+
     async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
+        // 先按 Docker 真实列表回收超期的 stopped agent 容器（不依赖任何
+        // 注册表——agent 容器在 rcoder-engine 的 projects 表里，
+        // DockerManager.containers 是另一套缓存，挂那里永远不会触发）。
+        if let Err(e) = self.inner.reap_stopped_agents().await {
+            warn!("[SYNC] reclaim stopped agent containers failed: {e}");
+        }
         self.inner
             .sync_all_container_states()
             .await

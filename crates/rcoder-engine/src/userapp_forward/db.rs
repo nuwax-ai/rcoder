@@ -461,7 +461,7 @@ pub(crate) async fn create_database(
         body.database,
         body.owner
     );
-    Ok(HttpResult::success("数据库已创建".to_string()))
+    Ok(HttpResult::success("Database created".to_string()))
 }
 
 #[cfg(test)]

@@ -59,12 +59,12 @@ fn main() {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
+                let _unused = stream.read(&mut buf);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{marker}",
                     marker.len()
                 );
-                let _ = stream.write_all(response.as_bytes());
+                let _unused = stream.write_all(response.as_bytes());
             }
         }
         _ => {
@@ -125,8 +125,8 @@ fn serve_with_grandchild(svc_port: u16, gc_port: u16) {
         Ok(listener) => listener,
         Err(error) => {
             eprintln!("tree-fixture serve: bind {svc_port} failed: {error}");
-            let _ = grandchild.kill();
-            let _ = grandchild.wait();
+            let _unused = grandchild.kill();
+            let _unused = grandchild.wait();
             std::process::exit(3);
         }
     };
@@ -134,8 +134,8 @@ fn serve_with_grandchild(svc_port: u16, gc_port: u16) {
         let Ok(mut stream) = stream else { continue };
         // 最小 HTTP 应答（readiness 探测 200）
         let mut buf = [0u8; 1024];
-        let _ = stream.read(&mut buf);
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let _unused = stream.read(&mut buf);
+        let _unused = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     }
 }
 

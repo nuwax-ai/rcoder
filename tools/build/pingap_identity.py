@@ -23,18 +23,22 @@ def source_identity(root=None):
     root = Path(root) if root is not None else Path(__file__).resolve().parents[2]
     # 仓库源码含非 ASCII 注释；Windows runner 的默认文本编码是 cp1252，
     # 必须显式 UTF-8（否则 UnicodeDecodeError 让发布在解析阶段即失败）。
-    cargo = (root / 'crates/app-cli/Cargo.toml').read_text(encoding='utf-8')
-    declarations = re.findall(r'^\s*pingap-config\s*=\s*\{([^\n]*)\}\s*(?:#.*)?$', cargo, re.M)
+    # 版本事实源：根 [workspace.dependencies] 的 crates.io 字符串声明（0.13.x 时代的发布 bug 已修复，不再 git rev pin）。
+    cargo = (root / 'Cargo.toml').read_text(encoding='utf-8')
+    declarations = re.findall(r'^\s*pingap-config\s*=\s*"([^"]+)"\s*(?:#.*)?$', cargo, re.M)
     if len(declarations) != 1:
-        raise ValueError('expected exactly one supported inline pingap-config dependency')
-    def dependency_field(name):
-        values = re.findall(r'(?:^|,)\s*' + name + r'\s*=\s*"([^"]+)"\s*(?=,|$)', declarations[0])
-        if len(values) != 1:
-            raise ValueError('expected exactly one pingap-config ' + name + ' field')
-        return values[0]
-    commit = dependency_field('rev')
-    if dependency_field('git') != 'https://github.com/vicanso/pingap' or not re.fullmatch(r'[0-9a-f]{40}', commit):
-        raise ValueError('app-cli pingap-config must pin the official repository and exact commit')
+        raise ValueError('expected exactly one pingap-config version requirement')
+    version = declarations[0]
+    if not re.fullmatch(_SEMVER, version):
+        raise ValueError('app-cli pingap-config must pin an exact semver version: ' + repr(version))
+    # commit 事实源：官方资产目录（下载校验同源）。三方一致性：
+    # Cargo.toml 版本 ↔ devtool 回退常量 ↔ 目录条目（tag/commit）。
+    catalog_path = root / 'tools/build/pingap-assets.json'
+    catalog = json.loads(catalog_path.read_text(encoding='utf-8'))
+    release = catalog.get('releases', {}).get(version, {})
+    commit = release.get('commit', '')
+    if catalog.get('repository') != 'vicanso/pingap' or release.get('tag') != 'v' + version or not re.fullmatch(r'[0-9a-f]{40}', commit):
+        raise ValueError('app-cli Pingap version ' + version + ' has no trusted official asset catalog entry')
     path = root / 'crates/app-cli/src/build_deploy/devtool.rs'
     content = path.read_text(encoding='utf-8')
     def constant(name):
@@ -42,15 +46,8 @@ def source_identity(root=None):
         if len(matches) != 1:
             raise ValueError('expected exactly one ' + name + ' source constant')
         return matches[0]
-    version = constant('DEFAULT_PINGAP_VERSION')
-    if not re.fullmatch(_SEMVER, version) or constant('DEFAULT_PINGAP_COMMIT') != commit:
+    if constant('DEFAULT_PINGAP_VERSION') != version or constant('DEFAULT_PINGAP_COMMIT') != commit:
         raise ValueError('app-cli Pingap constants disagree with its dependency pin')
-    catalog_path = root / 'tools/build/pingap-assets.json'
-    if catalog_path.exists():
-        catalog = json.loads(catalog_path.read_text(encoding='utf-8'))
-        release = catalog.get('releases', {}).get(version, {})
-        if catalog.get('repository') != 'vicanso/pingap' or release.get('tag') != 'v' + version or release.get('commit') != commit:
-            raise ValueError('app-cli Pingap identity disagrees with trusted official asset catalog')
     return {'version': version, 'commit': commit}
 
 

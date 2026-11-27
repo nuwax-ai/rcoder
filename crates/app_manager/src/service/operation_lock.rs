@@ -552,8 +552,36 @@ impl AppService {
                     }
                 }
             }
-            shared_types::AppFileMutationMarker::check_clean(&file)
-                .map_err(|error| AppOperationError::Conflict(error.to_string()))?;
+            // The exclusive flock is held here: a nonempty marker can only be
+            // a former holder's remnant (kernel-released flock proves the
+            // holder stopped), so reclaim it and let this operation converge
+            // through the original entry instead of fencing forever.
+            let lock_path = if builder_family {
+                directory.join(format!("builder-{app_id}.lock"))
+            } else {
+                directory.join(format!("prod-{app_id}.lock"))
+            };
+            match shared_types::AppFileMutationMarker::reclaim_orphaned(
+                &file,
+                Some(&lock_path.with_extension("lock.orphaned")),
+            ) {
+                Ok(None) => {}
+                Ok(Some(orphan_operation_id)) => {
+                    tracing::warn!(
+                        app_id,
+                        orphan_operation_id,
+                        lock_path = %lock_path.display(),
+                        archive = %lock_path.with_extension("lock.orphaned").display(),
+                        "Reclaimed orphaned application mutation marker under held flock; previous holder is proven stopped; operation id archived for reconciliation"
+                    );
+                }
+                Err(error) => {
+                    return Err(AppOperationError::Conflict(format!(
+                        "inspect application mutation marker at {}: {error}",
+                        lock_path.display()
+                    )));
+                }
+            }
             Some(file)
         } else {
             None

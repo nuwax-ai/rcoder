@@ -452,6 +452,16 @@ pub struct ComputerPodResourcesResponse {
     #[schema(example = "pod_abc123")]
     pub pod_id: Option<String>,
 
+    /// 实际解析到的业务场景(回显)。可选值：`WebAgentRunner` /
+    /// `ComputerAgentRunner` / `ComputerNormalProject` / `Userapp` /
+    /// `UserappBuilder`。
+    ///
+    /// 同一个标识符在不同容器族下指向不同容器，调用方应以此字段确认自己看的
+    /// 是哪一个族，不要按 `container_name` 前缀猜。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "computer-agent-runner")]
+    pub service_type: Option<ServiceType>,
+
     /// 容器是否存活(true=存在且运行中)
     #[schema(example = true)]
     pub alive: bool,
@@ -487,10 +497,56 @@ pub struct ComputerPodResourcesResponse {
     #[schema(example = "abc123def456")]
     pub container_id: Option<String>,
 
+    /// 容器内进程明细(按 RSS 降序;include_processes=false 或采集降级时缺省)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processes: Option<Vec<ComputerProcessEntry>>,
+
+    /// 进程总数(容器内全部进程)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_count: Option<u32>,
+
+    /// 角色分组聚合(与内存看门狗淘汰语义对齐)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_groups: Option<ComputerProcessGroups>,
+
+    /// 容器内**所有** agent 执行的进程组聚合(仅 include_processes 时填充)。
+    /// 一个 user 容器可并存多个 project，每个一条；无注册执行时为空。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<ComputerAgentExecution>,
+
     /// 容器名称(定位成功时)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner-user_123")]
     pub container_name: Option<String>,
+}
+
+/// 容器内单进程明细(资源观测)
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ComputerProcessEntry {
+    /// 进程 ID(容器 pid namespace)
+    pub pid: u32,
+    /// 进程名(内核 comm,≤15 字符)
+    pub comm: String,
+    /// RSS(MB)
+    pub rss_mb: f64,
+    /// 累计 CPU 时间(秒,utime+stime;前端按采样差分得 CPU%)
+    pub cpu_seconds: f64,
+    /// 角色分组: infra | platform | workload
+    pub group: String,
+    /// 命令行前缀(≤120 字符)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args_head: Option<String>,
+}
+
+/// 进程角色分组聚合(字节口径,前端按需换算 MB)
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ComputerProcessGroups {
+    /// 桌面/系统(永不淘汰)
+    pub infra_rss_bytes: u64,
+    /// 平台服务(claude/MCP/file-server,永不淘汰)
+    pub platform_rss_bytes: u64,
+    /// 会话工作负载(看门狗可淘汰范围)
+    pub workload_rss_bytes: u64,
 }
 
 /// Computer 容器资源查询参数(GET query)
@@ -507,6 +563,129 @@ pub struct ComputerPodResourcesQuery {
     #[param(example = "pod_abc123")]
     #[schema(example = "pod_abc123")]
     pub pod_id: Option<String>,
+
+    /// 业务场景(容器族)。缺省 `computer-agent-runner`。可选值：
+    /// `WebAgentRunner` / `ComputerAgentRunner` / `ComputerNormalProject` /
+    /// `Userapp` / `UserappBuilder`。
+    ///
+    /// **与 `/computer/pod/ensure` 同一套三字段分派**（`service_type` +
+    /// `app_id` + `app_stage`，共用 `parse_app_target`，不另立规则）：
+    ///
+    /// - `computer-agent-runner` / `computer-normal-project`：同一容器族
+    ///   （共容器、共镜像、共 PVC），标识符是 `user_id`；
+    /// - `userapp`（或省略 service_type）+ `app_id`：按 `app_stage` 分派，
+    ///   `dev`（缺省）→ UserappBuilder 开发容器（有 agent_runner，可返回明细），
+    ///   `prod` → 业务运行 Deployment（无 agent_runner，返回
+    ///   `ERR_OPERATION_NOT_SUPPORTED`）；
+    /// - `web-agent-runner`：标识符是 `project_id`。
+    #[serde(default)]
+    #[param(example = "userapp")]
+    #[schema(example = "userapp")]
+    pub service_type: Option<ServiceType>,
+
+    /// userApp 应用 ID（与 `service_type=userapp` 搭配；存在即走 userApp 分派）。
+    /// 语义与 `/computer/pod/ensure` 完全一致。
+    #[serde(default)]
+    #[param(example = "app_789")]
+    #[schema(example = "app_789")]
+    pub app_id: Option<String>,
+
+    /// userApp 容器阶段（缺省 `dev`）：`dev` = UserappBuilder 开发容器；
+    /// `prod` = 业务运行 Deployment（本接口不支持，无 agent_runner）。
+    #[serde(default)]
+    #[param(example = "dev")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
+
+    /// 项目 ID：`web-agent-runner` 族的容器标识符（其余族不使用）。
+    #[serde(default)]
+    #[param(example = "proj_456")]
+    #[schema(example = "proj_456")]
+    pub project_id: Option<String>,
+
+    /// 租户 ID（可选，仅创建期隔离元数据）。
+    ///
+    /// **不参与容器定位**：容器标识只由 `user_id` / `project_id` / `app_id`
+    /// 决定，而一租户下的同一 user 在 computer 族里只有一台容器（名字由
+    /// identifier 拼），所以传入它找到的是同一台容器。
+    ///
+    /// 之所以仍然接受，是为了和 `/computer/pod/ensure` 的入参面对齐——调用方
+    /// 可以把创建时的请求参数原样带过来，不必删字段。传入值只用于日志留痕。
+    /// 若将来需要"按租户过滤/隔离查询"，那是查找层要支持的新能力，不是加个
+    /// 参数就能生效的。
+    #[serde(default)]
+    #[param(example = "tenant_abc")]
+    #[schema(example = "tenant_abc")]
+    pub tenant_id: Option<String>,
+
+    /// 空间 ID（可选，仅创建期隔离元数据；语义同 `tenant_id`，不参与定位）。
+    #[serde(default)]
+    #[param(example = "space_xyz")]
+    #[schema(example = "space_xyz")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型（可选，仅创建期隔离元数据；语义同 `tenant_id`，不参与定位）。
+    #[serde(default)]
+    #[param(example = "tenant")]
+    #[schema(example = "tenant")]
+    pub isolation_type: Option<String>,
+
+    /// 是否返回容器内进程明细(默认 true;响应 processes 字段)
+    #[serde(default = "computer_pod_resources_default_include_processes")]
+    #[param(example = true)]
+    #[schema(example = true)]
+    pub include_processes: Option<bool>,
+
+    /// SSE 采样周期(秒,默认 2,clamp 1-30)。仅 `/stream` 端点使用。
+    #[serde(default)]
+    #[param(example = 2, minimum = 1, maximum = 30)]
+    #[schema(example = 2)]
+    pub interval_secs: Option<u64>,
+}
+
+fn computer_pod_resources_default_include_processes() -> Option<bool> {
+    Some(true)
+}
+
+/// SSE 采样周期的默认值(秒)。
+pub const COMPUTER_POD_RESOURCES_DEFAULT_INTERVAL_SECS: u64 = 2;
+
+/// SSE 采样周期的合法区间(秒):下限防止把 agent_runner 打成 DoS,
+/// 上限防止连接挂着却几乎不采样。
+pub const COMPUTER_POD_RESOURCES_MIN_INTERVAL_SECS: u64 = 1;
+pub const COMPUTER_POD_RESOURCES_MAX_INTERVAL_SECS: u64 = 30;
+
+/// 归一化 SSE 采样周期:非法值回落到默认,越界夹到区间内。
+pub fn computer_pod_resources_clamp_interval(raw: Option<u64>) -> u64 {
+    raw.filter(|v| *v > 0)
+        .unwrap_or(COMPUTER_POD_RESOURCES_DEFAULT_INTERVAL_SECS)
+        .clamp(
+            COMPUTER_POD_RESOURCES_MIN_INTERVAL_SECS,
+            COMPUTER_POD_RESOURCES_MAX_INTERVAL_SECS,
+        )
+}
+
+/// 容器内 agent 执行的进程组聚合（`/computer/pod/resources` 提供）。
+///
+/// 观测端只用新接口就能拿到 agent 维度数据，不必再调
+/// `/computer/agent/status`——那个接口的 `cpu_percent` 是**服务端差分**，
+/// 外部 2s 轮询会改写它的基线，让平台自身查询拿到 None 或失真值。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ComputerAgentExecution {
+    /// 该执行所属 project（同一 user 容器可并存多个 project）
+    pub project_id: String,
+    /// 当前执行的会话 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// 执行状态：Processing / Idle / Terminating
+    pub status: String,
+    /// agent 进程组 RSS 合计（MB，含其 MCP 子进程）
+    pub rss_mb: f64,
+    /// agent 进程组**累计** CPU 秒（utime+stime）。
+    /// 消费方自行差分算百分比：累计值无状态，任意多个消费者互不影响。
+    pub cpu_seconds: f64,
+    /// agent 进程组内进程数
+    pub process_count: u32,
 }
 
 /// Computer Agent 取消任务的请求参数

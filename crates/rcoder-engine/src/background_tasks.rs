@@ -125,6 +125,9 @@ async fn spawn_single_instance_tasks(
     let userapp_recycle_handle = if config.userapp_recycle.enabled {
         let recycle_cfg = userapp_recycle::UserAppRecycleRuntimeConfig {
             idle_timeout: Duration::from_secs(config.userapp_recycle.idle_timeout_seconds),
+            never_accessed_timeout: Duration::from_secs(
+                config.userapp_recycle.never_accessed_timeout_seconds,
+            ),
             scan_interval: Duration::from_secs(config.userapp_recycle.scan_interval_seconds),
             protection: Duration::from_secs(config.userapp_recycle.protection_seconds),
         };
@@ -162,6 +165,47 @@ async fn spawn_single_instance_tasks(
         info!("[USERAPP_RECYCLE] disabled (userapp_recycle.enabled=false)");
         None
     };
+
+    // 镜像漂移治理（spec sandbox-image-version-drift 第二批）：R3 只读台账
+    // （多副本只重复日志，无害）+ R4 观察兜底（动作有界：仓库守卫 + 已对齐
+    // 检查 + 每进程冷却；多副本最坏同窗各一次幂等尝试，严格单实例挂 leader
+    // 代际留作后续）。两任务均以 shutdown 广播终止，句柄 detach。
+    let drift_config = config.userapp_image_drift.clone();
+    if drift_config.inventory_enabled {
+        crate::userapp_drift_inventory::start_drift_inventory_task(
+            crate::userapp_drift_inventory::DriftInventoryRuntimeConfig {
+                scan_interval: Duration::from_secs(drift_config.inventory_interval_seconds),
+            },
+            state.clone(),
+            shutdown_tx.clone(),
+        );
+        info!(
+            "[IMAGE_DRIFT_INVENTORY] enabled (interval: {}s)",
+            drift_config.inventory_interval_seconds
+        );
+    }
+    if drift_config.watch_enabled {
+        let watch_config = shared_types::UserAppImageDriftWatchConfig {
+            namespace: String::new(),
+            platform_image: std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").unwrap_or_default(),
+            pull_failure_window_seconds: drift_config.pull_failure_window_seconds,
+            recovery_cooldown_seconds: drift_config.recovery_cooldown_seconds,
+        };
+        match state
+            .runtime()
+            .start_userapp_image_drift_watch(watch_config, shutdown_tx.subscribe())
+            .await
+        {
+            Ok(Some(_)) => info!(
+                "[IMAGE_DRIFT_WATCH] enabled (window: {}s, cooldown: {}s)",
+                drift_config.pull_failure_window_seconds, drift_config.recovery_cooldown_seconds
+            ),
+            Ok(None) => {
+                info!("[IMAGE_DRIFT_WATCH] not started (runtime unsupported or config missing)")
+            }
+            Err(error) => tracing::warn!("[IMAGE_DRIFT_WATCH] start failed: {error}"),
+        }
+    }
     let orphan_reconciliation_handle = config.cleanup_config.enabled.then(|| {
         crate::orphan_reconciliation::start(
             state.clone(),
@@ -324,8 +368,17 @@ fn cleanup_runtime_config(config: &AppConfig) -> cleanup_task::CleanupConfig {
         long_idle_timeout: Duration::from_secs(config.cleanup_config.long_idle_timeout_seconds),
         active_window: Duration::from_secs(5 * 60),
         log_dir: config.cleanup_config.log_cleanup.log_dir.clone(),
+        // saturating_mul：保留天数来自配置，直接相乘在 release 下会静默回绕
+        // （例如 144115188075855872 天回绕成 0 秒 = 保留期 0 天），debug 下则 panic
         log_retention_duration: Duration::from_secs(
-            config.cleanup_config.log_cleanup.log_retention_days * 24 * 60 * 60,
+            config
+                .cleanup_config
+                .log_cleanup
+                .log_retention_days
+                .saturating_mul(24 * 60 * 60),
+        ),
+        log_cleanup_interval: Duration::from_secs(
+            config.cleanup_config.log_cleanup.cleanup_interval_seconds,
         ),
     }
 }

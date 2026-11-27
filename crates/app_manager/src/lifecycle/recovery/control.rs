@@ -882,13 +882,12 @@ impl AppService {
                 Command::Start { traffic } => {
                     if !*traffic || previous.phase != "Running" {
                         guard.mark_mutating()?;
-                        let image = if *traffic {
-                            None
-                        } else {
-                            crate::runtime::params::platform_restart_image(
-                                &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
-                            )
-                        };
+                        // 流量冷唤醒与显式启动统一对齐平台当前镜像（spec
+                        // sandbox-image-version-drift R1）；非平台镜像由 k8s
+                        // 写边界归属守卫保留模板。env 缺失时保留模板镜像。
+                        let image = crate::runtime::params::platform_restart_image(
+                            &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
+                        );
                         self.runtime
                             .start_app_target_with_image(&target, image.as_deref())
                             .await

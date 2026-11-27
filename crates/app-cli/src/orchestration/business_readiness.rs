@@ -1750,10 +1750,7 @@ mod tests {
     // runtime 的调度就能备好应答；断言语义不变，只消除夹具自饥饿。
 
     /// 极简 HTTP/1.1 服务：`mode` 决定每次响应（200 健康契约 / 503 退化）。
-    fn spawn_tiny_http(
-        listener: std::net::TcpListener,
-        mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    ) {
+    fn spawn_tiny_http(listener: std::net::TcpListener, mode: Arc<std::sync::atomic::AtomicU8>) {
         std::thread::spawn(move || {
             for socket in listener.incoming() {
                 let Ok(mut socket) = socket else { continue };
@@ -1775,7 +1772,7 @@ mod tests {
                         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    let _ = socket.write_all(response.as_bytes());
+                    let _unused = socket.write_all(response.as_bytes());
                 });
             }
         });
@@ -1820,7 +1817,7 @@ mod tests {
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    let _ = socket.write_all(response.as_bytes());
+                    let _unused = socket.write_all(response.as_bytes());
                 });
             }
         });
@@ -1868,10 +1865,10 @@ path = "/"
     /// 有界等待观察到达期望状态（每轮跨过 1s 观察缓存 TTL；全量并发下的
     /// 调度噪声不再把合法时序误判为失败——断言语义不变，仍要求最终到达）。
     async fn await_status(
-        observer: &super::BusinessReadinessObserver,
-        expect: shared_types::UserAppReadinessStatus,
-    ) -> super::UserAppBusinessReadiness {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        observer: &BusinessReadinessObserver,
+        expect: UserAppReadinessStatus,
+    ) -> UserAppBusinessReadiness {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let observed = observer.observe().await;
             if observed.status == expect {
@@ -1880,7 +1877,7 @@ path = "/"
             if tokio::time::Instant::now() >= deadline {
                 panic!("observer did not reach {expect:?} in time; last: {observed:?}");
             }
-            tokio::time::sleep(CACHE_TTL + std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(CACHE_TTL + Duration::from_millis(200)).await;
         }
     }
 
@@ -1908,7 +1905,7 @@ path = "/"
                     "HTTP/1.1 200 OK\r\nX-Rcoder-Publication: {marker}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{marker}",
                     marker.len()
                 );
-                let _ = socket.write_all(response.as_bytes());
+                let _unused = socket.write_all(response.as_bytes());
             }
         });
         let admin = std::net::TcpListener::bind("127.0.0.1:3018").expect("bind fake admin 3018");
@@ -1937,7 +1934,7 @@ path = "/"
         };
         crate::proxy::compiler::record_confirmed_publication(&outcome, &confirmed).unwrap();
         spawn_fake_admin(admin, expected_hash, confirmed.process_id);
-        crate::proxy::admin_probe::register_admin_endpoint(
+        admin_probe::register_admin_endpoint(
             "127.0.0.1:3018".into(),
             "combo".into(),
             "combo".into(),
@@ -1954,8 +1951,8 @@ path = "/"
         ));
         state.mark_initialized();
         state.set_release(combo_lock(service_port));
-        state.set_phase(crate::server::ServerPhase::Running);
-        let mut observer = super::BusinessReadinessObserver::new(state.clone());
+        state.set_phase(ServerPhase::Running);
+        let mut observer = BusinessReadinessObserver::new(state.clone());
         // This component fixture tests aggregate HTTP observations only. Its
         // explicit proof adapter is not production authority or real ownership
         // acceptance; native owner suites exercise retained Child/engine proof.
@@ -2049,7 +2046,7 @@ path = "/"
 
         // 4) 恢复 200 → ready again（不只记住一次成功）。
         mode.store(0, Ordering::Relaxed);
-        tokio::time::sleep(CACHE_TTL + std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(CACHE_TTL + Duration::from_millis(100)).await;
         let observed = observer.observe().await;
         assert!(
             observed.ready,
@@ -2058,6 +2055,6 @@ path = "/"
 
         // 只读纪律：整轮查询不回写编排探针 bool、不改相位。
         assert_eq!(state.runtime_status().is_ready(), probe_before);
-        assert!(matches!(state.phase(), crate::server::ServerPhase::Running));
+        assert!(matches!(state.phase(), ServerPhase::Running));
     }
 }

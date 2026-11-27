@@ -242,6 +242,7 @@ pub const ROUTES: &[Route] = &[
     Route::new("/api/v1/userapp/search-files", Verb::Get),
     Route::new("/api/v1/userapp/static/{app_id}", Verb::Get),
     Route::new("/api/v1/userapp/static/{app_id}", Verb::Options),
+    Route::new("/api/v1/userapp/static/{app_id}/meta", Verb::Get),
     Route::new("/api/v1/userapp/storage/{app_stage}/query", Verb::Post),
     Route::new("/api/v1/userapp/tasks/{task_id}", Verb::Get),
     Route::new("/api/v1/userapp/tasks/{task_id}/cancel", Verb::Post),
@@ -446,6 +447,13 @@ mod tests {
             "/api/computer/static/user/computer/css/main.css"
         ));
         assert!(allows(&Method::OPTIONS, "/api/v1/userapp/static/fixture"));
+        // 产物元数据预检（下载前 size 判阈值）：GET 放行；不挂 OPTIONS（容器侧
+        // 路由同形态，服务端调用无 preflight——若未来浏览器直调再同步放开）
+        assert!(allows(&Method::GET, "/api/v1/userapp/static/fixture/meta"));
+        assert!(!allows(
+            &Method::OPTIONS,
+            "/api/v1/userapp/static/fixture/meta"
+        ));
         assert!(!allows(
             &Method::OPTIONS,
             "/api/v1/userapp/fixture/prod/readiness"

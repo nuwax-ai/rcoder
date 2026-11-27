@@ -56,6 +56,15 @@ pub(crate) struct CachedPod {
 #[cfg(feature = "kubernetes")]
 pub(crate) const POD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 混住判据缓存值：`(pvc_exists, migration_state, sampled_at)`。sampled_at
+/// 为该行写入时刻（防旧查询结果覆盖更新写入，见 `upsert_cache_if_not_stale`）。
+#[cfg(feature = "kubernetes")]
+pub(crate) type WorkspaceMigrationCacheValue = (
+    bool,
+    shared_types::WorkspaceMigrationState,
+    std::time::Instant,
+);
+
 /// Kubernetes runtime implementation using kube-rs
 #[cfg(feature = "kubernetes")]
 pub struct KubernetesRuntime {
@@ -69,6 +78,12 @@ pub struct KubernetesRuntime {
     /// 失效时机:PVC destroy(destroy_workspace_pvc 等 remove)+ cleanup_all clear。
     /// 阶段2: rcoder 挂根聚合访问 agent subvolume (/app/cephfs-root/{subvolumePath}/...)。
     pub(crate) subvolume_path_cache: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    /// per-agent PVC 存在性 + 迁移状态缓存（混住判据, 30s TTL）：
+    /// key=**物理 PVC 名**（与 `workspace_pvc_name` 一致；早期曾用
+    /// `{service_type}/{identifier}`，PATCH 成功却写错键 → 路由读不到，
+    /// 已改，勿回退），value 见 [`WorkspaceMigrationCacheValue`]。
+    pub(crate) workspace_exists_cache:
+        Arc<RwLock<std::collections::HashMap<String, WorkspaceMigrationCacheValue>>>,
     /// 受管共享 Event publisher（批次 C）：Arc 共享，clone 不重建；非阻塞
     /// 提交，单消费者串行发布；Default = inactive（测试构造用）。
     pub(crate) event_publisher: super::k8s_event_publisher::KubernetesEventPublisher,
@@ -195,6 +210,7 @@ impl KubernetesRuntime {
             },
             pod_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             subvolume_path_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            workspace_exists_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             event_publisher,
         })
     }
@@ -239,4 +255,9 @@ mod builder_log_identity_tests;
 #[cfg(all(test, feature = "kubernetes"))]
 mod create_lease_tests;
 #[cfg(feature = "kubernetes")]
-mod workspace_runtime;
+mod migration_ops;
+#[cfg(feature = "kubernetes")]
+mod pod_overview;
+#[cfg(feature = "kubernetes")]
+#[cfg(feature = "kubernetes")]
+pub(crate) mod workspace_runtime;

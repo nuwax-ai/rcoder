@@ -13,6 +13,12 @@ use crate::service::skills as skills_service;
 use crate::service::temp_file::TemporaryFile;
 use crate::service::zip;
 
+/// initProjectTemplate 不落盘的模板顶层条目 (对齐 TS `INIT_TEMPLATE_RESERVED_ENTRIES`,
+/// nuwax-file-server a782dd2): `.tmp` 是工作区暂存根 (multer 上传与解压 staging
+/// 都在其中), 模板自带的顶层 `.tmp` 会覆盖运行时暂存内容——整体跳过。
+/// 仅模板初始化启用; 通用 zip 解压 (createProject 等) 行为不变。
+const INIT_TEMPLATE_RESERVED_ENTRIES: &[&str] = &[".tmp"];
+
 /// init-project-template 的 workspace 无关核心（返回 workspace 根；
 /// 响应拼装归各域壳层）。
 pub async fn init_project_template_core(
@@ -22,7 +28,12 @@ pub async fn init_project_template_core(
     enable_git: bool,
 ) -> Result<std::path::PathBuf, AppError> {
     tokio::fs::create_dir_all(&ws).await?;
-    zip::extract_to(data.path().to_path_buf(), ws.clone()).await?;
+    zip::extract_to_preserving_top_level(
+        data.path().to_path_buf(),
+        ws.clone(),
+        INIT_TEMPLATE_RESERVED_ENTRIES,
+    )
+    .await?;
     // git 双开关: GIT_ENABLED && enableGit → init + initial commit (对齐 nuwax)
     if state.config.git_enabled && enable_git {
         // 模板文件必须进入初始提交。nuwax 先 init 再 commitAllChanges；只调用
@@ -223,4 +234,108 @@ pub async fn push_skills_impl(
         failed_skills: r.failed_skills,
         agent_store_path,
     }))
+}
+
+#[cfg(test)]
+mod template_reserved_tests {
+    use super::*;
+    use crate::AppState;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn state(root: &Path) -> AppState {
+        use crate::Config;
+        use crate::service::build_manager::BuildManager;
+        use crate::service::dev_server::DevServerManager;
+        use crate::service::log_cache::LogCacheManager;
+        use crate::service::skill_download::SkillDownloader;
+        use crate::workspace::LocalWorkspaceResolver;
+
+        let config = Arc::new(Config {
+            project_source_dir: root.join("projects"),
+            computer_workspace_dir: root.join("computer"),
+            upload_project_dir: root.join("downloads"),
+            git_enabled: true,
+            ..Config::default()
+        });
+        AppState {
+            resolver: Arc::new(LocalWorkspaceResolver::new(
+                config.project_source_dir.clone(),
+                config.computer_workspace_dir.clone(),
+            )),
+            dev_server: Arc::new(DevServerManager::new(config.clone())),
+            build_manager: Arc::new(BuildManager::new(config.max_build_concurrency)),
+            log_cache: Arc::new(LogCacheManager::new(&config)),
+            skill_downloader: Arc::new(SkillDownloader::new(&config).unwrap()),
+            config,
+            preview: None,
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    async fn template_zip_as_temp(root: &Path) -> TemporaryFile {
+        let file = std::fs::File::create(root.join("tpl-src.zip")).unwrap();
+        let mut zip = ::zip::ZipWriter::new(file);
+        let options = ::zip::write::SimpleFileOptions::default();
+        use std::io::Write as _;
+        zip.add_directory(".tmp/", options).unwrap();
+        zip.start_file(".tmp/staging.txt", options).unwrap();
+        zip.write_all(b"template-owned").unwrap();
+        zip.start_file("src/main.py", options).unwrap();
+        zip.write_all(b"print('hello')").unwrap();
+        zip.finish().unwrap();
+        let bytes = std::fs::read(root.join("tpl-src.zip")).unwrap();
+        let mut writer = crate::service::temp_file::TemporaryFileWriter::create(
+            root,
+            "template",
+            64 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+        writer.write(&bytes::Bytes::from(bytes)).await.unwrap();
+        writer.finish().await.unwrap()
+    }
+
+    /// TS 契约 (a782dd2): 模板自带顶层 `.tmp` 整体跳过, 运行时暂存逐字节保留;
+    /// 普通文件落地并进入 enableGit 的初始提交。
+    #[tokio::test]
+    async fn init_template_preserves_runtime_tmp_and_commits_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let ws: PathBuf = dir.path().join("computer/u1/c1");
+        // 工作区已有运行时暂存
+        tokio::fs::create_dir_all(ws.join(".tmp")).await.unwrap();
+        tokio::fs::write(ws.join(".tmp/staging.txt"), "runtime-owned")
+            .await
+            .unwrap();
+
+        let temp = template_zip_as_temp(dir.path()).await;
+        init_project_template_core(&state, ws.clone(), temp, true)
+            .await
+            .unwrap();
+
+        // 暂存逐字节不变; 模板 .tmp 未落入
+        assert_eq!(
+            tokio::fs::read(ws.join(".tmp/staging.txt")).await.unwrap(),
+            b"runtime-owned".to_vec()
+        );
+        // 普通模板文件落地
+        assert_eq!(
+            tokio::fs::read(ws.join("src/main.py")).await.unwrap(),
+            b"print('hello')".to_vec()
+        );
+        // enableGit: 初始提交包含普通文件
+        let repo = gix::open(&ws).unwrap();
+        let tree = repo.head_tree().unwrap();
+        assert!(
+            tree.lookup_entry_by_path("src/main.py").unwrap().is_some(),
+            "template files must enter the initial commit"
+        );
+        assert!(
+            tree.lookup_entry_by_path(".tmp/staging.txt")
+                .unwrap()
+                .is_none(),
+            "skipped template .tmp must not be committed"
+        );
+    }
 }

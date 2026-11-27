@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn binary_digest_future_does_not_embed_large_io_buffers() {
     let future = binary_digest(Path::new("not-polled-official-proxy"));
-    let bytes = std::mem::size_of_val(&future);
+    let bytes = size_of_val(&future);
     assert!(
         bytes <= 8192,
         "binary digest future embeds {bytes} bytes; nested startup futures must keep I/O buffers on the heap"
@@ -57,7 +57,7 @@ fn basic(pid: u32) -> BasicCapabilities {
 }
 
 #[test]
-fn capabilities_require_the_owned_worker_and_exact_official_source() {
+fn capabilities_require_the_owned_worker_and_treat_identity_as_advisory() {
     let mut response = basic(19);
     assert!(validate_basic(&response, 19).is_ok());
     assert!(
@@ -66,11 +66,30 @@ fn capabilities_require_the_owned_worker_and_exact_official_source() {
             .to_string()
             .contains("another process")
     );
+    // 版本/来源身份差异只告警，不拦截启动（app-cli pin 与镜像 pingap 版本不一致时
+    // 不能让用户应用起不来）。
     response.git_hash = "unrelated-source".into();
-    assert!(validate_basic(&response, 19).is_err());
+    assert!(validate_basic(&response, 19).is_ok());
+    response.version = "9.9.9".into();
+    assert!(validate_basic(&response, 19).is_ok());
     response.git_hash = PINNED_COMMIT.into();
     response.supported_plugins.clear();
     assert!(validate_basic(&response, 19).is_err());
+}
+
+#[test]
+fn unparsable_pid_is_advisory_and_numeric_pid_is_accepted() {
+    // 上游把 pid 换成数字形态也能反序列化
+    let numeric: BasicCapabilities = serde_json::from_str(
+        r#"{"pid":4242,"version":"0.16.2","git_hash":"x","supported_plugins":["mock"]}"#,
+    )
+    .unwrap();
+    assert_eq!(numeric.pid, "4242");
+    assert!(validate_basic(&numeric, 4242).is_ok());
+    // 解析不出进程号（格式漂移）只告警，不拦截启动
+    let mut response = basic(19);
+    response.pid = "not-a-pid".into();
+    assert!(validate_basic(&response, 19).is_ok());
 }
 
 #[test]

@@ -341,10 +341,7 @@ impl DevServerManager {
                         return Ok(false);
                     };
                     external_store::verify_view(&view, &intent.request)?;
-                    if !view.state.is_terminal() {
-                        return Ok(false);
-                    }
-                    Ok(true)
+                    Ok(view.state.is_terminal())
                 }
                 PendingStopActivity::Local(attempt) => {
                     let supervisor = match &attempt.mode {

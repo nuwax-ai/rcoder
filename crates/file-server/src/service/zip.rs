@@ -32,20 +32,53 @@ const EXTRACTION_LIMITS: ExtractionLimits = ExtractionLimits {
 
 /// 异步解压 `zip_path` 到 `dst`。
 pub async fn extract_to(zip_path: PathBuf, dst: PathBuf) -> AppResult<()> {
+    extract_to_inner(zip_path, dst, Vec::new(), "zip_extract").await
+}
+
+/// 模板初始化解压: 跳过顶层保留项 (对齐 TS `initProjectTemplate` 的
+/// `INIT_TEMPLATE_RESERVED_ENTRIES`, nuwax-file-server a782dd2)。
+/// 工作区 `.tmp` 是运行时暂存根 (上传/打包 staging), 模板自带的同名顶层
+/// 条目不得覆盖既有内容——**整个顶层条目连同全部子项** (文件/目录/符号链接
+/// 形态) 跳过; 其余路径行为与 [`extract_to`] 完全一致 (安全校验/限额不变,
+/// 仅跳过项不计入解压预算)。通用解压默认行为不变。
+pub async fn extract_to_preserving_top_level(
+    zip_path: PathBuf,
+    dst: PathBuf,
+    reserved_top_level: &[&str],
+) -> AppResult<()> {
+    let reserved: Vec<String> = reserved_top_level
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    extract_to_inner(zip_path, dst, reserved, "zip_extract_template").await
+}
+
+async fn extract_to_inner(
+    zip_path: PathBuf,
+    dst: PathBuf,
+    reserved: Vec<String>,
+    op: &'static str,
+) -> AppResult<()> {
     let start = Instant::now();
     let zip_display = zip_path.display().to_string();
     let dst_display = dst.display().to_string();
-    tokio::task::spawn_blocking(move || extract_blocking(&zip_path, &dst))
+    tokio::task::spawn_blocking(move || extract_blocking_reserved(&zip_path, &dst, &reserved))
         .await
         .map_err(|e| AppError::system(format!("zip extract task join error: {e}")))??;
     tracing::info!(
-        op = "zip_extract",
+        op,
         elapsed_ms = start.elapsed().as_millis(),
         src = %zip_display,
         dst = %dst_display,
         "zip extraction completed"
     );
     Ok(())
+}
+
+fn extract_blocking_reserved(zip_path: &Path, dst: &Path, reserved: &[String]) -> AppResult<()> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| AppError::file(format!("zip open failed: {e}")))?;
+    extract_open_file_with_limits(file, dst, EXTRACTION_LIMITS, true, false, reserved)
 }
 
 /// Synchronous extraction for callers that move resource guards into their own blocking worker.
@@ -60,12 +93,12 @@ fn extract_blocking_with_limits(
 ) -> AppResult<()> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| AppError::file(format!("zip open failed: {e}")))?;
-    extract_open_file_with_limits(file, dst, limits, true, false)
+    extract_open_file_with_limits(file, dst, limits, true, false, &[])
 }
 
 /// Extract an already captured snapshot; never reopen its original source path.
 pub(crate) fn extract_open_file(file: std::fs::File, dst: &Path) -> AppResult<()> {
-    extract_open_file_with_limits(file, dst, EXTRACTION_LIMITS, true, true)
+    extract_open_file_with_limits(file, dst, EXTRACTION_LIMITS, true, true, &[])
 }
 
 /// Validate payload/CRC, limits and link topology with the same extraction loop.
@@ -73,7 +106,7 @@ pub(crate) fn extract_open_file(file: std::fs::File, dst: &Path) -> AppResult<()
 pub(crate) fn validate_open_file(file: std::fs::File) -> AppResult<()> {
     let check = tempfile::tempdir()
         .map_err(|e| AppError::system(format!("create zip validation directory: {e}")))?;
-    extract_open_file_with_limits(file, check.path(), EXTRACTION_LIMITS, false, true)
+    extract_open_file_with_limits(file, check.path(), EXTRACTION_LIMITS, false, true, &[])
 }
 
 fn zip_read_error(error: zip::result::ZipError, context: &str) -> AppError {
@@ -89,6 +122,7 @@ fn extract_open_file_with_limits(
     limits: ExtractionLimits,
     write_payload: bool,
     strict_paths: bool,
+    reserved_top_level: &[String],
 ) -> AppResult<()> {
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| zip_read_error(e, "zip parse failed"))?;
@@ -101,6 +135,8 @@ fn extract_open_file_with_limits(
     std::fs::create_dir_all(dst)?;
     let mut extracted_bytes = 0_u64;
     let mut links = shared_types::archive_links::ArchiveSymlinks::default();
+    // 保留项告警去重: 每个顶层名只 WARN 一次 (对齐 TS 的逐条目日志粒度)
+    let mut warned_reserved: std::collections::HashSet<String> = std::collections::HashSet::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -120,6 +156,21 @@ fn extract_open_file_with_limits(
         let relative = target
             .strip_prefix(dst)
             .map_err(|e| AppError::validation(format!("archive path: {e}")))?;
+        // 顶层保留项 (仅模板初始化解压传入, 通用解压为空): 安全校验/规范化后
+        // 按**首段路径**判定, `./.tmp` 等等价写法归一后同规则; 条目本身与其
+        // 全部子项 (文件/目录/链接) 一并跳过, 既有内容原样保留。
+        if let Some(first) = relative.components().next() {
+            let first = first.as_os_str().to_string_lossy().into_owned();
+            if reserved_top_level.contains(&first) {
+                if warned_reserved.insert(first.clone()) {
+                    tracing::warn!(
+                        entry = %first,
+                        "skip reserved top-level template entry"
+                    );
+                }
+                continue;
+            }
+        }
         let target = shared_types::archive_links::checked_archive_output(dst, relative)
             .map_err(|e| AppError::validation(format!("archive output: {e}")))?;
         if entry.is_symlink() {
@@ -900,5 +951,123 @@ mod tests {
 
         drop(fs::remove_dir_all(&src));
         drop(fs::remove_file(&out));
+    }
+
+    // ── 模板初始化顶层保留项 (对齐 TS INIT_TEMPLATE_RESERVED_ENTRIES, a782dd2) ──
+
+    fn write_template_zip(path: &Path) {
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.add_directory(".tmp/", options).unwrap();
+        zip.start_file(".tmp/marker.txt", options).unwrap();
+        zip.write_all(b"template-owned").unwrap();
+        zip.start_file(".tmp/deep/x.txt", options).unwrap();
+        zip.write_all(b"template-deep").unwrap();
+        // `./` 前缀的等价写法: 安全校验/规范化后应按同一规则跳过
+        zip.start_file("./.tmp/dotted.txt", options).unwrap();
+        zip.write_all(b"template-dotted").unwrap();
+        // 正常模板文件 + 保留名以外的相似路径
+        zip.start_file("app.js", options).unwrap();
+        zip.write_all(b"template-app").unwrap();
+        zip.start_file("sub/.tmp/inner.txt", options).unwrap();
+        zip.write_all(b"sub-tmp").unwrap();
+        zip.start_file(".tmp2/ok.txt", options).unwrap();
+        zip.write_all(b"tmp2").unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn template_extract_preserves_top_level_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("template.zip");
+        write_template_zip(&zip_path);
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(ws.join(".tmp")).unwrap();
+        fs::write(ws.join(".tmp/marker.txt"), b"runtime-owned").unwrap();
+        fs::write(ws.join(".tmp/runtime-keep.txt"), b"keep").unwrap();
+
+        extract_to_preserving_top_level(zip_path, ws.clone(), &[".tmp"])
+            .await
+            .unwrap();
+
+        // 既有暂存逐字节不变
+        assert_eq!(
+            fs::read(ws.join(".tmp/marker.txt")).unwrap(),
+            b"runtime-owned"
+        );
+        assert_eq!(fs::read(ws.join(".tmp/runtime-keep.txt")).unwrap(), b"keep");
+        // 模板 .tmp 的新增内容没有落入工作区 (含 ./ 等价写法与文件形态)
+        assert!(!ws.join(".tmp/deep").exists());
+        assert!(!ws.join(".tmp/dotted.txt").exists());
+        // 普通模板文件正常落地
+        assert_eq!(fs::read(ws.join("app.js")).unwrap(), b"template-app");
+        // sub/.tmp 与 .tmp2 正常处理
+        assert_eq!(fs::read(ws.join("sub/.tmp/inner.txt")).unwrap(), b"sub-tmp");
+        assert_eq!(fs::read(ws.join(".tmp2/ok.txt")).unwrap(), b"tmp2");
+    }
+
+    #[tokio::test]
+    async fn template_extract_skips_top_level_tmp_in_file_form() {
+        // 顶层 `.tmp` 以普通文件形态 (而非目录) 出现: 同样整体跳过
+        let dir = tempfile::tempdir().unwrap();
+        let file = fs::File::create(dir.path().join("file-form.zip")).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(".tmp", options).unwrap();
+        zip.write_all(b"tmp-as-file").unwrap();
+        zip.start_file("keep.txt", options).unwrap();
+        zip.write_all(b"keep").unwrap();
+        zip.finish().unwrap();
+
+        let ws = dir.path().join("ws");
+        extract_to_preserving_top_level(dir.path().join("file-form.zip"), ws.clone(), &[".tmp"])
+            .await
+            .unwrap();
+        assert!(!ws.join(".tmp").exists(), "file-form .tmp must be skipped");
+        assert_eq!(fs::read(ws.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn template_extract_without_tmp_behaves_like_extract_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = fs::File::create(dir.path().join("plain.zip")).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("a.txt", options).unwrap();
+        zip.write_all(b"a").unwrap();
+        zip.start_file("sub/b.txt", options).unwrap();
+        zip.write_all(b"b").unwrap();
+        zip.finish().unwrap();
+
+        let ws_a = dir.path().join("ws-a");
+        let ws_b = dir.path().join("ws-b");
+        extract_to_preserving_top_level(dir.path().join("plain.zip"), ws_a.clone(), &[".tmp"])
+            .await
+            .unwrap();
+        extract_to(dir.path().join("plain.zip"), ws_b.clone())
+            .await
+            .unwrap();
+        assert_eq!(fs::read(ws_a.join("a.txt")).unwrap(), b"a");
+        assert_eq!(fs::read(ws_b.join("a.txt")).unwrap(), b"a");
+        assert_eq!(
+            fs::read(ws_a.join("sub/b.txt")).unwrap(),
+            fs::read(ws_b.join("sub/b.txt")).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_extract_to_still_lands_top_level_tmp() {
+        // 通用解压默认行为不变: 模板里的 .tmp 照常落盘 (createProject 等依赖)
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("generic.zip");
+        write_template_zip(&zip_path);
+        let ws = dir.path().join("ws");
+        extract_to(zip_path, ws.clone()).await.unwrap();
+        assert_eq!(
+            fs::read(ws.join(".tmp/marker.txt")).unwrap(),
+            b"template-owned"
+        );
+        assert_eq!(fs::read(ws.join("app.js")).unwrap(), b"template-app");
     }
 }

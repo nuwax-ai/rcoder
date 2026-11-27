@@ -7,7 +7,7 @@
 
 mod agent_mgmt_forward;
 mod i18n_extractors;
-mod locale;
+pub(crate) mod locale;
 
 #[allow(unused_imports)]
 pub use rcoder_engine::utils::{

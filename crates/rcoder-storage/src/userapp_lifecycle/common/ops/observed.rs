@@ -1,5 +1,9 @@
 use super::*;
 
+/// 收束"无执行者声明"围栏时使用的记账执行者身份。只用于终态转移的
+/// AcquireExecutor 语义，不关联任何运行时进程，也不授权任何运行时工作。
+const UNCLAIMED_SETTLE_EXECUTOR: &str = "rcoder-recovery-settle";
+
 pub(crate) async fn finalize_observed_wake(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -78,6 +82,15 @@ pub(crate) async fn finalize_observed_wake(
 /// Failed with the original error preserved plus the observation evidence.
 /// Callers must have validated the evidence predicate for the kind; this
 /// method validates identity, revision and state only.
+///
+/// A fence without an executor claim (legacy rows or manual SQL — the current
+/// API cannot produce one) has no executor that could ever resume it. It is
+/// settled under the scanner identity only under a narrow, evidence-first
+/// gate: the known historical builder preflight rejection, the scanner's
+/// positive absence observation, and **no lease receipt row**. A recorded
+/// receipt means a native lease (K8s Lease / Docker flock) may still be alive
+/// and renewable; those fences are left untouched for their dedicated
+/// recovery paths.
 pub(crate) async fn settle_fenced_operation(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -93,13 +106,37 @@ pub(crate) async fn settle_fenced_operation(
         &snapshot.lifecycle_id,
     )
     .await?;
-    if op != *snapshot
-        || op.state != UserAppOperationState::RecoveryRequired
-        || op.executor_id.is_none()
-    {
+    if op != *snapshot || op.state != UserAppOperationState::RecoveryRequired {
         return Err(Error::VersionConflict);
     }
     let before_app = app.clone();
+    // Neither a claimed checkpoint nor a missing SQL receipt proves that
+    // creation was never dispatched. Require the historical preflight result
+    // together with its runtime observation, then recheck the SQL receipt.
+    if op.executor_id.is_none() {
+        if !op.is_legacy_builder_preflight_rejection()
+            || evidence.get("kind").and_then(serde_json::Value::as_str)
+                != Some(LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE)
+        {
+            return Err(Error::InvalidOperation(
+                "unclaimed fence settlement requires a verified builder preflight rejection".into(),
+            ));
+        }
+        if get_operation_lease(tx, backend, &op.app_id, &op.operation_id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::VersionConflict);
+        }
+    }
+    let settling_executor = match op.executor_id.clone() {
+        Some(executor) => executor,
+        None => {
+            let executor = UNCLAIMED_SETTLE_EXECUTOR.to_owned();
+            op.executor_id = Some(executor.clone());
+            executor
+        }
+    };
     let mut checkpoint = op.checkpoint.clone();
     checkpoint["fence_released_evidence"] = evidence.clone();
     // Internal transition only, under this transaction.
@@ -109,7 +146,7 @@ pub(crate) async fn settle_fenced_operation(
         lifecycle_id: op.lifecycle_id.clone(),
         operation_id: op.operation_id.clone(),
         expected_revision: op.revision,
-        executor_id: op.executor_id.clone().ok_or(Error::VersionConflict)?,
+        executor_id: settling_executor,
         state: UserAppOperationState::Failed,
         step: op.step.clone(),
         checkpoint,

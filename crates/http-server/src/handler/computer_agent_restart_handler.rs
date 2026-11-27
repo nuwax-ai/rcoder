@@ -159,6 +159,44 @@ pub async fn computer_agent_restart(
     let user_id = request.user_id.clone();
     let pod_id = request.pod_id.clone();
 
+    // 归属校验：调用方给了 user_id，且 project 已登记归属时，两者必须一致。
+    // 否则可以用自己的 user_id + 别人的 project_id 重启他人的 agent。
+    // 只在本接口生效；未给 user_id（pod_id 定位）或归属未知时跳过。
+    if let Some(claimed) = request
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        && let Some(owner) = state
+            .get_project(project_id)
+            .and_then(|project| project.user_id().map(str::to_owned))
+        && !owner.is_empty()
+        && owner != claimed
+    {
+        warn!(
+            "⛔ [COMPUTER_RESTART] Owner mismatch: project_id={}, claimed user_id={}, owner={}",
+            project_id, claimed, owner
+        );
+        // 归属不符：错误码沿用 ERR_COMPUTER_OWNER_CONFLICT（调用方按码分支），文案按
+        // Accept-Language 取重启场景的那条——码表里该码默认的文案是聊天场景的
+        // （"消息未发送"），对重启请求是错的。
+        return Ok(HttpResult::error_with_message(
+            shared_types::error_codes::ERR_COMPUTER_OWNER_CONFLICT,
+            locale,
+            &shared_types::get_i18n_message(
+                shared_types::error_codes::COMPUTER_RESTART_OWNER_CONFLICT_MESSAGE_KEY,
+                locale,
+            ),
+        ));
+    }
+
+    // 已知并发窗口（不改行为，仅记录）：重启=停止"当前在跑的执行"。
+    // gRPC 的 expected_session_id 语义是"**正在运行**的执行的会话"，而注册表里
+    // 的 session_id 是 resume 提示（agent 没跑时也保留），拿它当 expected 会被
+    // 判成 session_mismatch，把幂等成功打成冲突（实测：期望与当前字面相同仍
+    // mismatch）。所以不传 expected；代价是"点击重启到 RPC 到达之间若刚好有
+    // 新对话 spawn 了新执行，会被一并停掉"——调用方若需要精确，可显式传
+    // session_id（那时语义由调用方保证）。
     info!(
         "🔁 [COMPUTER_RESTART] Starting to restart Agent: user_id={:?}, pod_id={:?}, project_id={}, session_id={:?}",
         user_id, pod_id, project_id, request.session_id
@@ -277,13 +315,27 @@ pub async fn computer_agent_restart(
                     }));
                 }
                 "session_mismatch" => {
+                    // 执行已换代：期望停掉的那个执行已经不在（或已换成新会话）。
+                    // 原来这里返回 AGENT_NOT_FOUND(404)，会让人误以为"agent 不存在"，
+                    // 实际是"你要停的那个已经不是当前这个"。改成冲突语义并带上
+                    // 两侧身份，便于前端刷新后重试。
+                    let current = state
+                        .get_project(project_id)
+                        .and_then(|project| project.session_id().map(str::to_owned));
                     warn!(
-                        "[COMPUTER_RESTART] Session mismatch: project_id={}",
-                        project_id
+                        "[COMPUTER_RESTART] Session mismatch: project_id={}, expected={:?}, current={:?}",
+                        project_id, request.session_id, current
                     );
-                    return Ok(HttpResult::error_with_locale(
-                        shared_types::error_codes::ERR_AGENT_NOT_FOUND,
+                    // 带两侧身份的自定义文案（默认英文；动态值无法走码表），
+                    // 同一份信息上面的 warn 已留痕。
+                    return Ok(HttpResult::error_with_message(
+                        shared_types::error_codes::ERR_CONFLICT,
                         locale,
+                        &format!(
+                            "execution superseded: expected {}, current {}; refresh and retry",
+                            request.session_id.as_deref().unwrap_or("<any>"),
+                            current.as_deref().unwrap_or("<none>")
+                        ),
                     ));
                 }
                 "error" => {

@@ -33,7 +33,25 @@ impl DockerRuntime {
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         let prepared = self.prepare_app_container(params).await?;
-        self.create_prepared_app_container(prepared).await
+        let mut mounts = super::docker_app_mounts::app_mount_guard(self, &prepared.config).await?;
+        mounts
+            .until_settled(self.create_prepared_app_container(prepared))
+            .await
+    }
+
+    /// 先删旧容器、再建新容器（更新、换镜像重建）。删之前先拿挂载守卫：数据目录落在日志根里
+    /// 就拒绝，旧容器原样留着；守卫登记着这些 bind 源，直到新容器建出来——中间这一段它们
+    /// 不在任何容器的挂载里。
+    async fn replace_app_container(
+        &self,
+        prepared: PreparedAppContainer,
+        snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let mut mounts = super::docker_app_mounts::app_mount_guard(self, &prepared.config).await?;
+        self.delete_app_snapshot(snapshot).await?;
+        mounts
+            .until_settled(self.create_prepared_app_container(prepared))
+            .await
     }
 
     async fn prepare_app_container(
@@ -180,8 +198,9 @@ impl DockerRuntime {
         }
 
         // 挂载组装（prod 四目录压平，与 dev builder 同构）在 docker_app_mounts.rs——
-        // 锚点反解 fail fast + 预创建 + 四 bind（恒四个，非空）。
-        let mounts = Some(build_prod_flat_mounts(&app_id, params.user_id.as_deref()).await?);
+        // 锚点反解 fail fast + 预创建 + 四 bind（恒四个，非空）；数据目录落在可回收的
+        // 日志根里（日志根配得和 prod 目录树重叠）时在那里拒绝。
+        let mounts = Some(build_prod_flat_mounts(self, &app_id, params.user_id.as_deref()).await?);
 
         // 加入主网络（与 rcoder 同网络，Pingora 才能通过 container_ip 访问）
         // 同时保留网络名，供 start 后按网卡定位 container_ip（多网卡时避免 values().next() 取错）
@@ -417,8 +436,7 @@ impl DockerRuntime {
                 message: error.to_string(),
             })
         })?;
-        self.delete_app_snapshot(&snapshot).await?;
-        self.create_prepared_app_container(prepared).await
+        self.replace_app_container(prepared, &snapshot).await
     }
 
     pub(crate) async fn scale_deployment_impl(
@@ -636,8 +654,7 @@ impl DockerRuntime {
             operation_id: target.context.operation_id.clone(),
             resources: vec![target.resource.clone()],
         };
-        self.delete_app_snapshot(&snapshot).await?;
-        self.create_prepared_app_container(prepared).await?;
+        self.replace_app_container(prepared, &snapshot).await?;
         Ok(())
     }
 

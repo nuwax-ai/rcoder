@@ -1575,8 +1575,8 @@ mod tests {
         .await;
         server.abort();
         worker.abort();
-        let _ = server.await;
-        let _ = worker.await;
+        let _unused = server.await;
+        let _unused = worker.await;
         let OwnerDispatch::Terminal(view) = result
             .expect("fixture deadline")
             .expect("same original run must await reopened initialization")

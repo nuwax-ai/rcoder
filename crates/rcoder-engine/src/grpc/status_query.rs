@@ -30,11 +30,34 @@ pub async fn query_container_status(
     expected_session_id: Option<&str>,
     query_timeout: Duration,
 ) -> anyhow::Result<GetContainerStatusResponse> {
+    query_container_status_with_options(
+        pool,
+        grpc_addr,
+        user_id,
+        project_id,
+        expected_session_id,
+        query_timeout,
+        false, // 旧调用方零开销:默认不拉进程明细
+    )
+    .await
+}
+
+/// 带进程明细选项的查询(include_processes=true 时响应携带容器内进程明细)。
+pub async fn query_container_status_with_options(
+    pool: &Arc<GrpcChannelPool>,
+    grpc_addr: &str,
+    user_id: &str,
+    project_id: &str,
+    expected_session_id: Option<&str>,
+    query_timeout: Duration,
+    include_processes: bool,
+) -> anyhow::Result<GetContainerStatusResponse> {
     let mut client = pool.get_client(grpc_addr).await?;
     let request = tonic::Request::new(GetContainerStatusRequest {
         user_id: user_id.to_string(),
         project_id: project_id.to_string(),
         expected_session_id: expected_session_id.map(str::to_owned),
+        include_processes: Some(include_processes),
     });
     let response = time::timeout(query_timeout, client.get_container_status(request)).await??;
     Ok(response.into_inner())

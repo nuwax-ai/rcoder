@@ -86,19 +86,25 @@ async fn choose(cwd: &Path) -> Option<CheckPlan> {
     let package: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let present = |name: &'static str| async move {
         let base = cwd.join("node_modules/.bin").join(name);
-        if tokio::fs::try_exists(&base).await.unwrap_or(false) {
-            return true;
-        }
+        // found 仅在 Windows 分支被修改 —— 按平台安排 mut, 避免
+        // 非 Windows 构建的 unused_mut
         #[cfg(windows)]
-        for suffix in ["cmd", "exe", "bat"] {
-            if tokio::fs::try_exists(base.with_extension(suffix))
-                .await
-                .unwrap_or(false)
-            {
-                return true;
+        let mut found = tokio::fs::try_exists(&base).await.unwrap_or(false);
+        #[cfg(not(windows))]
+        let found = tokio::fs::try_exists(&base).await.unwrap_or(false);
+        #[cfg(windows)]
+        if !found {
+            for suffix in ["cmd", "exe", "bat"] {
+                if tokio::fs::try_exists(base.with_extension(suffix))
+                    .await
+                    .unwrap_or(false)
+                {
+                    found = true;
+                    break;
+                }
             }
         }
-        false
+        found
     };
     if package
         .get("scripts")

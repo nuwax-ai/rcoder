@@ -120,7 +120,7 @@ fn management_cleanup(entries: String) {
         let (server, calls) = rpc_fixture(&socket, entries).await;
         let result = SupervisordHost::cleanup_generation(&root).await;
         server.abort();
-        let _ = server.await;
+        let _unused = server.await;
         assert!(
             matches!(result, Ok(runtime_supervisor::CleanupOutcome::Empty)),
             "management-only supervisor scope must be observed empty: {result:?}"
@@ -192,7 +192,7 @@ async fn unregistered_managed_programs_and_foreign_named_programs_are_not_empty(
             "supervisor.getVersion" | "supervisor.getAllProcessInfo"
         )));
         server.abort();
-        let _ = server.await;
+        let _unused = server.await;
     }
 }
 
@@ -257,7 +257,7 @@ async fn unregistered_rpc_failure_and_shared_deadline_never_confirm_empty() {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             let body = "<methodResponse><fault><value><struct><member><name>faultCode</name><value><int>1</int></value></member><member><name>faultString</name><value><string>observed-failure</string></value></member></struct></value></fault></methodResponse>";
-            let _ = stream
+            let _unused = stream
                 .write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -284,7 +284,7 @@ async fn unregistered_rpc_failure_and_shared_deadline_never_confirm_empty() {
         }
         assert!(!root.join("cleanup-outcome.json").exists());
         server.abort();
-        let _ = server.await;
+        let _unused = server.await;
     }
 }
 
@@ -450,7 +450,7 @@ async fn unregistered_socket_replacement_between_empty_reads_cannot_confirm_clea
         (current.dev(), current.ino())
     );
     server.abort();
-    let _ = server.await;
+    let _unused = server.await;
     assert!(
         result.is_err(),
         "two empty replies from replaced daemons cannot prove one scope empty"

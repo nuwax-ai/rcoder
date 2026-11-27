@@ -456,6 +456,7 @@ fn runtime(client: kube::Client) -> KubernetesRuntime {
         },
         pod_cache: Default::default(),
         subvolume_path_cache: Default::default(),
+        workspace_exists_cache: Default::default(),
         event_publisher: Default::default(),
         event_counters: Default::default(),
     }
@@ -523,7 +524,7 @@ pub(super) async fn fixture(
         .service_type(ServiceType::UserappBuilder)
         .build();
     let mut spec = runtime
-        .build_agent_pod_spec("app", &ServiceType::UserappBuilder, &params)
+        .build_agent_pod_spec("app", &ServiceType::UserappBuilder, &params, false)
         .expect("spec");
     let env = spec.containers[0].env.get_or_insert_default();
     env.retain(|entry| entry.name != "APP_CLI_DEPLOY_TOKEN");
@@ -546,6 +547,10 @@ pub(super) async fn fixture(
     });
     let mut object = serde_json::to_value(&sts).expect("STS JSON");
     api_roundtrip(&mut object);
+    // 平台管理旧版本建模：agent 镜像统一为本测试族的平台仓库（与各用例的
+    // restart_image 同仓库），冷启动/重启归属守卫按仓库判定（ops.rs 与
+    // k8s_builder_restart.rs）；外部仓库镜像的保留行为由专项用例覆盖。
+    object["spec"]["template"]["spec"]["containers"][0]["image"] = "paired-runtime:old".into();
     object["spec"]["template"]["spec"]["containers"][0]["env"]
         .as_array_mut()
         .expect("env")
@@ -569,7 +574,7 @@ pub(super) async fn fixture(
                 domain["value"] = serde_json::json!({"authority":"old-api-authority","volume":"another-application-volume"}).to_string().into();
             }
             "release" => {
-                pod_spec["containers"][0]["image"] = "old-release:1".into();
+                pod_spec["containers"][0]["image"] = "paired-runtime:old-release".into();
                 pod_spec["containers"][0]["env"]
                     .as_array_mut()
                     .expect("env")
@@ -906,6 +911,7 @@ async fn compute_restart_then_cold_unbound_ensure_preserves_updated_compute_and_
         config: runtime.config.clone(),
         pod_cache: Default::default(),
         subvolume_path_cache: Default::default(),
+        workspace_exists_cache: Default::default(),
         event_publisher: Default::default(),
         event_counters: Default::default(),
     };

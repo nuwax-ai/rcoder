@@ -171,6 +171,14 @@ fn is_userapp_service_type(header_value: Option<&str>) -> bool {
     header_value.is_some_and(shared_types::is_userapp_service_type_value)
 }
 
+/// computer 域判定的 header 判据：`x-service-type` 值为 `computer-agent-runner` /
+/// `computer-normal-project`（归一后比较，单一事实源
+/// [`shared_types::is_computer_domain_service_type_value`]）。per-agent RBD 下这些
+/// 请求只有 rcoder 转发层能正确处理（TS@60001 读不到 agent 容器里的卷）。
+fn is_computer_domain_service_type(header_value: Option<&str>) -> bool {
+    header_value.is_some_and(shared_types::is_computer_domain_service_type_value)
+}
+
 /// dev 生命周期精确端点集合（`/api/build/*` 下由预览协调器收口的子集；
 /// build/parse 等其余 build 端点不受影响）。
 pub const COORDINATED_DEV_PATHS: [&str; 7] = [
@@ -267,8 +275,11 @@ impl FileServerProxyConfig {
     }
 
     /// 分流规则纯函数（按 [`RoutePolicy`] 分派）：
-    /// - [`RoutePolicy::TsFirst`]：`/api/v1/userapp*` 前缀或
-    ///   `x-service-type: userapp` header（任一命中）→ Rust 上游，其余 → TS 上游
+    /// - [`RoutePolicy::TsFirst`]：`/api/v1/userapp*` 前缀、`x-service-type: userapp`
+    ///   header，或 computer 域 `x-service-type`（`computer-agent-runner` /
+    ///   `computer-normal-project`，任一命中）→ Rust 上游，其余 → TS 上游。
+    ///   computer 域必须进 Rust：per-agent RBD 下用户工作区只在 agent 容器里
+    ///   （转发层：[RBD 用户]→容器 / [共享用户]→本地共享卷），TS 读不到
     /// - [`RoutePolicy::AllRust`]：一律 Rust 上游
     /// - [`RoutePolicy::AllTs`]：一律 TS 上游
     ///
@@ -281,7 +292,9 @@ impl FileServerProxyConfig {
         }
         let to_rust = match self.policy {
             RoutePolicy::TsFirst => {
-                is_userapp_path(path) || is_userapp_service_type(service_type_header)
+                is_userapp_path(path)
+                    || is_userapp_service_type(service_type_header)
+                    || is_computer_domain_service_type(service_type_header)
             }
             RoutePolicy::AllRust => true,
             RoutePolicy::AllTs => false,
@@ -387,6 +400,38 @@ mod coordinated_dev_tests {
             assert!(
                 matches!(ts_first.upstream_port_for(path, None), Upstream::Ts(_)),
                 "{path} must stay on ts when coordination disabled"
+            );
+        }
+    }
+
+    /// computer 域（Java 下发的容器运行时类型）在 ts_first 下进 Rust 上游：
+    /// per-agent RBD 的用户工作区只在 agent 容器里，TS@60001 读不到，转发层必须可见。
+    #[test]
+    fn ts_first_routes_computer_domain_service_type_to_rust() {
+        let ts_first = config(RoutePolicy::TsFirst, false);
+        for (path, header) in [
+            ("/api/computer/get-file-list", "computer-agent-runner"),
+            ("/api/computer/files-update", "computer-normal-project"),
+            ("/api/git/commit", "taskAgent"),
+            ("/api/computer/static/6/c1/f.txt", "normalProject"),
+        ] {
+            assert!(
+                matches!(
+                    ts_first.upstream_port_for(path, Some(header)),
+                    Upstream::Rust(_)
+                ),
+                "{path} + x-service-type={header} must route to rust"
+            );
+        }
+        // userApp / pageApp / 无 header 仍走 TS（存量域不变）
+        for (path, header) in [
+            ("/api/project/list", Some("pageApp")),
+            ("/api/project/list", Some("web-agent-runner")),
+            ("/api/project/list", None),
+        ] {
+            assert!(
+                matches!(ts_first.upstream_port_for(path, header), Upstream::Ts(_)),
+                "{path} + header={header:?} must stay on ts"
             );
         }
     }

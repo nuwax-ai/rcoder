@@ -224,7 +224,7 @@ impl Journal {
         }
         // Validate before publishing. Value retains unknown fields and every
         // unrelated replay; serializing StoredReceipt would discard them.
-        let _: StoredReceipt = serde_json::from_value(value.clone())
+        let _unused: StoredReceipt = serde_json::from_value(value.clone())
             .context("validate normalized deployment receipt")?;
         let backup = self.root.join(format!(
             "{OPERATION_RECORD}.generation-compat-{}.backup",

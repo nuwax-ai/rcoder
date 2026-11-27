@@ -90,7 +90,7 @@ impl ServiceSpecFile {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name != keep_release_id && name != RESIDENT_SPEC_ID {
-                let _ = std::fs::remove_dir_all(entry.path());
+                let _unused = std::fs::remove_dir_all(entry.path());
             }
         }
     }

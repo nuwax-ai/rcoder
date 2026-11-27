@@ -928,7 +928,18 @@ async fn fence_state_on_store(
     Arc<AppState>,
     Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
 ) {
-    let state = runtime_state(runtime, store.clone(), fence_settle_grace_secs).await;
+    // 夹具里两类围栏共用同一覆盖值：无执行者用例同样需要可控门槛。
+    let state = runtime_state_with_config(
+        runtime,
+        store.clone(),
+        crate::config::AppConfig {
+            fence_settle_grace_secs,
+            unclaimed_settle_grace_secs: fence_settle_grace_secs,
+            ..Default::default()
+        },
+        app_manager::config::AppAccessMode::Docker,
+    )
+    .await;
     // 构造围栏记录：admit(Pending) → advance(Running, executor) →
     // advance(RecoveryRequired, step=runtime_updated)。
     let lifecycle = store.ensure_identity("fenced").await.expect("identity");
@@ -2046,6 +2057,203 @@ async fn default_recovery_metadata_claim_reconciles_but_unknown_generation_write
             } else {
                 UserAppOperationState::RecoveryRequired
             }
+        );
+    }
+}
+
+/// 无执行者围栏夹具：自定义围栏 step，返回 store 句柄供 test-support 钩子
+/// 清空执行者（构造历史版本数据 / 人工 SQL 的形态）。
+async fn unclaimed_fence_state(
+    runtime: Arc<FenceRuntime>,
+    kind: shared_types::UserAppOperationKind,
+    operation_id: &str,
+    seed: TerminalSeed,
+    fence_settle_grace_secs: Option<u64>,
+    bind_receipt: Option<shared_types::UserAppOperationLeaseReceipt>,
+) -> (
+    Arc<AppState>,
+    Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
+) {
+    let metadata_dir = tempfile::tempdir().expect("metadata directory");
+    let store = Arc::new(
+        rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+            &metadata_dir.path().join("userapp.turso.db"),
+        )
+        .await
+        .expect("store"),
+    );
+    std::mem::forget(metadata_dir);
+    fence_state_on_store(
+        runtime,
+        kind,
+        operation_id,
+        store,
+        fence_settle_grace_secs,
+        bind_receipt,
+        seed,
+    )
+    .await
+}
+
+fn legacy_preflight_seed() -> TerminalSeed {
+    TerminalSeed {
+        state: UserAppOperationState::RecoveryRequired,
+        step: "creation_result",
+        checkpoint: Some(serde_json::Value::Null),
+        error_message: Some(
+            "ensure UserappBuilder failed: Concurrent resource update: Application resource identity mismatch: rcoder.io/application-id",
+        ),
+    }
+}
+
+/// A positive observation of the recognized historical rejection frees admission.
+#[tokio::test]
+async fn unclaimed_legacy_preflight_settles_after_positive_absence() {
+    let operation_id = "op-unclaimed-legacy-preflight";
+    let runtime = FenceRuntime::scenario(None, None);
+    runtime
+        .retained_creation_absent
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (state, store) = unclaimed_fence_state(
+        runtime,
+        UserAppOperationKind::EnsureBuilder,
+        operation_id,
+        legacy_preflight_seed(),
+        Some(0),
+        None,
+    )
+    .await;
+    store
+        .clear_operation_executor_for_test("fenced", operation_id)
+        .await
+        .expect("clear executor");
+    let snapshot = settled(&state, operation_id).await;
+    assert!(snapshot.executor_id.is_none(), "fixture: 无执行者声明");
+    reconcile_fenced_ensure(&state, &snapshot)
+        .await
+        .expect("settle");
+    let record = settled(&state, operation_id).await;
+    assert_eq!(record.state, UserAppOperationState::Failed);
+    assert_eq!(
+        record.checkpoint["fence_released_evidence"]["kind"],
+        shared_types::LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE,
+        "{:?}",
+        record.checkpoint["fence_released_evidence"]
+    );
+    assert_eq!(
+        record.executor_id.as_deref(),
+        Some("rcoder-recovery-settle")
+    );
+    let admitted = state
+        .userapp_store
+        .admit_with_input(
+            &UserAppAdmission {
+                app_id: "fenced".into(),
+                lifecycle_id: Some(record.lifecycle_id.clone()),
+                operation_id: format!("{operation_id}-retry"),
+                request_id: Some(format!("req-{operation_id}-retry")),
+                request_fingerprint: "ef".repeat(32),
+                kind: UserAppOperationKind::EnsureBuilder,
+                command: None,
+                metadata: None,
+                runtime_policy_on_success: None,
+            },
+            None,
+        )
+        .await
+        .expect("admit after settle");
+    assert!(matches!(admitted, UserAppAdmissionOutcome::Accepted(_)));
+}
+
+/// 无执行者围栏但原租约回执仍在 → 保持围栏（原生锁可能仍活着且可续租）。
+#[tokio::test]
+async fn unclaimed_fence_with_original_receipt_keeps() {
+    let operation_id = "op-unclaimed-receipt";
+    let runtime = FenceRuntime::scenario(None, None);
+    let (state, store) = unclaimed_fence_state(
+        runtime,
+        UserAppOperationKind::EnsureBuilder,
+        operation_id,
+        legacy_preflight_seed(),
+        Some(0),
+        Some(shared_types::UserAppOperationLeaseReceipt::Docker {
+            service_type: ServiceType::UserappBuilder,
+            device: 1,
+            inode: 3,
+            token: "legacy".into(),
+        }),
+    )
+    .await;
+    store
+        .clear_operation_executor_for_test("fenced", operation_id)
+        .await
+        .expect("clear executor");
+    let snapshot = settled(&state, operation_id).await;
+    assert!(snapshot.executor_id.is_none(), "fixture: 无执行者声明");
+    reconcile_fenced_ensure(&state, &snapshot)
+        .await
+        .expect("scan keeps receipt fence");
+    assert_eq!(
+        settled(&state, operation_id).await.state,
+        UserAppOperationState::RecoveryRequired,
+        "回执仍在时不得收束"
+    );
+}
+
+#[tokio::test]
+async fn unclaimed_fences_without_preflight_and_runtime_evidence_stay_fenced() {
+    for (step, seed, confirms_absence) in [
+        (
+            "claimed",
+            TerminalSeed {
+                state: UserAppOperationState::RecoveryRequired,
+                step: "claimed",
+                checkpoint: Some(serde_json::Value::Null),
+                error_message: None,
+            },
+            true,
+        ),
+        (
+            "runtime_updated",
+            TerminalSeed::fence(UserAppOperationState::RecoveryRequired),
+            true,
+        ),
+        ("creation_result", legacy_preflight_seed(), false),
+    ] {
+        let operation_id = format!("op-unclaimed-{step}");
+        let runtime = FenceRuntime::scenario(None, None);
+        runtime
+            .retained_creation_absent
+            .store(confirms_absence, std::sync::atomic::Ordering::SeqCst);
+        let (state, store) = unclaimed_fence_state(
+            runtime,
+            UserAppOperationKind::EnsureBuilder,
+            &operation_id,
+            seed,
+            Some(0),
+            None,
+        )
+        .await;
+        store
+            .clear_operation_executor_for_test("fenced", &operation_id)
+            .await
+            .expect("clear executor");
+        let snapshot = settled(&state, &operation_id).await;
+        assert_eq!(snapshot.step, step);
+        assert!(snapshot.executor_id.is_none());
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("scan leaves fence in place");
+        assert_eq!(settled(&state, &operation_id).await, snapshot);
+        let app = state
+            .userapp_store
+            .get_application("fenced")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            app.active_operations.dev.as_deref(),
+            Some(operation_id.as_str())
         );
     }
 }

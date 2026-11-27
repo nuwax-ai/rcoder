@@ -122,7 +122,7 @@ pub(super) fn builder_verdict(
                     return Ok(crate::runtime::k8s_observation::Verdict::Pending);
                 }
                 if pod.metadata.deletion_timestamp.is_none()
-                    && pod_agent_image_matches(pod, expected_image)
+                    && pod_agent_image_satisfies(pod, expected_image)
                     && pod_agent_workspace_matches(pod, mode.expected_workspace)
                     && (if mode.require_ready {
                         pod.status
@@ -413,6 +413,52 @@ pub(super) fn statefulset_agent_image_matches(sts: &StatefulSet, expected: Optio
             .and_then(|container| container.image.as_deref())
             == Some(image)
     })
+}
+
+/// 启动复核的满足式判定（spec sandbox-image-version-drift R1）：期望镜像已
+/// 落盘（精确相等），或归属守卫已按仓库判定跳过对齐——保留镜像与期望引用
+/// 不同仓库（外部/钉住）视为满足；同仓库不同 tag 不满足（滚动应当发生）。
+fn agent_image_satisfies(actual: Option<&str>, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    match actual {
+        Some(image) => {
+            image == expected
+                || container_runtime_api::image_repository(image)
+                    != container_runtime_api::image_repository(expected)
+        }
+        None => false,
+    }
+}
+
+pub(super) fn statefulset_agent_image_satisfies(sts: &StatefulSet, expected: Option<&str>) -> bool {
+    agent_image_satisfies(
+        sts.spec
+            .as_ref()
+            .and_then(|spec| spec.template.spec.as_ref())
+            .and_then(|spec| {
+                spec.containers
+                    .iter()
+                    .find(|container| container.name == "agent")
+            })
+            .and_then(|container| container.image.as_deref()),
+        expected,
+    )
+}
+
+pub(super) fn pod_agent_image_satisfies(pod: &Pod, expected: Option<&str>) -> bool {
+    agent_image_satisfies(
+        pod.spec
+            .as_ref()
+            .and_then(|spec| {
+                spec.containers
+                    .iter()
+                    .find(|container| container.name == "agent")
+            })
+            .and_then(|container| container.image.as_deref()),
+        expected,
+    )
 }
 
 pub(super) fn pod_agent_image_matches(pod: &Pod, expected: Option<&str>) -> bool {

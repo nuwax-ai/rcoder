@@ -68,6 +68,23 @@ pub struct ContainerCreateOptions {
 pub struct ComputerContainerManager;
 
 impl ComputerContainerManager {
+    /// 迁移编排互斥锁（与 ensure/chat 共用同一 per-workload 锁）。
+    ///
+    /// cutover/phase_a 全程持锁封死并发编排的竞态（并发终审 B/D）:
+    /// 双 cutover 的 Job 同名互删 + 同节点双挂 mirror 删数据 + 编排期间
+    /// chat/ensure 穿透重建共享形态 agent。第二个编排请求在 WAITER_BUDGET
+    /// 内排队, 拿到锁后由入口校验（持锁后重读）拒绝。
+    /// ⚠️ 编排内调 ensure 前必须 drop 返回的 guard——ensure 内部 acquire
+    /// 同一 key, tokio Mutex 不可重入, 持锁调用死锁。
+    pub async fn acquire_migration_lock(
+        user_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, AppError> {
+        let deadline = tokio::time::Instant::now() + creation::WAITER_BUDGET;
+        creation::acquire(&ServiceType::ComputerAgentRunner, user_id, deadline).await
+    }
+}
+
+impl ComputerContainerManager {
     /// 根据 user_id 或 pod_id 获取或创建容器（支持指定 ServiceType）
     ///
     /// 容器命名规则:

@@ -1,5 +1,6 @@
 //! Real Turso + the production ensure/probe/forward pipeline, with a local
-//! authenticated HTTP file peer and a read-only runtime observation fixture.
+//! authenticated HTTP file peer (静态平台 token) and a read-only runtime
+//! observation fixture.
 //! Register this file as a child of `upstream`, so no visibility is widened.
 //! Docker uses its real port 60000; deploy-host uses a physical Published entry
 //! for the actual ephemeral listener. Pure Kubernetes DNS needs its own cluster.
@@ -16,13 +17,12 @@ use axum::{
     routing::get,
 };
 use container_runtime_api::{
-    AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
+    AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeResult, ContainerRuntimeStatus,
+    RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
 };
 use shared_types::{
     AppResourceIdentity, AppResourceKind, BuilderControlTarget, ContainerBasicInfo,
-    FileServerRequestCredentials, ProjectAndContainerInfo, ServiceType, UserAppExecutionContext,
-    UserAppLifecycleStore,
+    ProjectAndContainerInfo, ServiceType, UserAppExecutionContext, UserAppLifecycleStore,
 };
 use std::sync::{
     Arc, Mutex,
@@ -30,6 +30,8 @@ use std::sync::{
 };
 
 const FILES_PATH: &str = "/api/v1/userapp/get-file-list";
+/// dev 转发恒定无凭据（fd-scan 已删且不继承主入口 token，见 file_credentials.rs）。
+/// fixture 的 file peer 以"期望空 token"表达无鉴权形态。
 
 #[derive(Clone)]
 struct CurrentPeer {
@@ -45,8 +47,6 @@ struct ObservedHttp {
 
 struct PipelineRuntime {
     current: Arc<Mutex<CurrentPeer>>,
-    credential_reads: AtomicUsize,
-    observed_credentials: Mutex<Vec<BuilderControlTarget>>,
     inspections: AtomicUsize,
     creates: AtomicUsize,
 }
@@ -171,32 +171,6 @@ impl AgentContainerRuntime for PipelineRuntime {
         assert!(binding.is_none(), "this fixture has no legacy binding");
         Ok(self.target(context))
     }
-
-    async fn get_bound_builder_file_credentials(
-        &self,
-        target: &BuilderControlTarget,
-    ) -> ContainerRuntimeResult<FileServerRequestCredentials> {
-        self.credential_reads.fetch_add(1, Ordering::SeqCst);
-        self.observed_credentials
-            .lock()
-            .unwrap()
-            .push(target.clone());
-        let actual = self.current.lock().unwrap();
-        let workload = target.workload.as_ref().unwrap();
-        if workload.kind != AppResourceKind::Container
-            || workload.uid != actual.info.container_id
-            || workload.name != actual.info.container_name
-            || target.context.app_id != actual.info.project_id
-            || target.pod.is_some()
-        {
-            return Err(ContainerRuntimeError::Conflict(
-                "file credential capture names another physical peer".into(),
-            ));
-        }
-        Ok(FileServerRequestCredentials {
-            proxy_token: Some(actual.token.clone()),
-        })
-    }
 }
 
 #[async_trait::async_trait]
@@ -247,7 +221,11 @@ async fn file_peer(
         token: token.clone(),
     });
     let actual = peer.current.lock().unwrap();
-    if token.as_deref() != Some(actual.token.as_str()) || headers.contains_key("x-api-key") {
+    let token_ok = match actual.token.as_str() {
+        "" => token.is_none(),
+        expected => token.as_deref() == Some(expected),
+    };
+    if !token_ok || headers.contains_key("x-api-key") {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"success": false})),
@@ -341,7 +319,7 @@ async fn forward_files(state: &AppState, app: &str, expected_uid: &str) {
 /// It exercises production ensure/cross-verify, the probe and the forwarder;
 /// the runtime is a controlled observation fixture, not a Docker claim.
 #[tokio::test]
-async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current_uid_token() {
+async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current_uid() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
         rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
@@ -354,7 +332,8 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
         "probepipe{}",
         &uuid::Uuid::new_v4().simple().to_string()[..10]
     );
-    let lifecycle = store.ensure_identity(&app).await.unwrap();
+    // 身份必须在 run 之前落库（后续流程按 app 解析 lifecycle），返回值本身不再断言。
+    store.ensure_identity(&app).await.unwrap();
     // Full physical IDs are unique as well as the alias: a parallel fixture
     // cannot share this case's published-observation invalidation generation.
     let old_uid = format!(
@@ -380,12 +359,10 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
             service_url: format!("http://127.0.0.1:{}", shared_types::AGENT_FILE_SERVER_PORT),
             workload_uid: None,
         },
-        token: "actual-cold-file-token".into(),
+        token: String::new(),
     }));
     let runtime = Arc::new(PipelineRuntime {
         current: current.clone(),
-        credential_reads: AtomicUsize::new(0),
-        observed_credentials: Mutex::new(vec![]),
         inspections: AtomicUsize::new(0),
         creates: AtomicUsize::new(0),
     });
@@ -394,7 +371,7 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
     {
         let config = &mut Arc::get_mut(&mut state).unwrap().config;
         config.file_server_proxy = Some(file_server_proxy::FileServerProxyConfig {
-            auth_token: Some("rotated-template-token-must-not-be-used".into()),
+            auth_token: Some("main-entry-token-must-not-reach-builder".into()),
             ..Default::default()
         });
         config.userapp_storage.ensure_timeout_seconds = 10;
@@ -433,27 +410,23 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
         axum::serve(listener, router).await.unwrap();
     }));
 
-    // Cold probe and actual forwarding each obtain credentials for their peer.
+    // Cold probe then actual forwarding.
     forward_files(&state, &app, &old_uid).await;
-    assert_eq!(runtime.credential_reads.load(Ordering::SeqCst), 2);
     assert_eq!(
         *requests.lock().unwrap(),
         vec![
             ObservedHttp {
                 path: "/api/version".into(),
-                token: Some("actual-cold-file-token".into())
+                token: None
             },
             ObservedHttp {
                 path: FILES_PATH.into(),
-                token: Some("actual-cold-file-token".into())
+                token: None
             },
         ]
     );
 
     // Call the actual inner resolver as well as the complete forwarding path.
-    // Save its count now; check the hot forward delta first so the old
-    // credentials-before-cache block fails with its concrete 2-versus-1 read.
-    let before_resolve = runtime.credential_reads.load(Ordering::SeqCst);
     let address = resolve_dev_addr_inner(
         &state,
         &app,
@@ -466,25 +439,13 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
         address,
         dev_file_server_addr(&state, &runtime.info()).unwrap()
     );
-    let after_resolve = runtime.credential_reads.load(Ordering::SeqCst);
-    current.lock().unwrap().token = "actual-hot-current-token".into();
     forward_files(&state, &app, &old_uid).await;
-    assert_eq!(
-        runtime.credential_reads.load(Ordering::SeqCst) - after_resolve,
-        1,
-        "hot forwarding still reads current runtime credentials once, never zero or twice"
-    );
-    assert_eq!(
-        after_resolve - before_resolve,
-        0,
-        "a hot positive probe does not read credentials just to skip that probe"
-    );
     assert_eq!(requests.lock().unwrap().len(), 3);
     assert_eq!(
         requests.lock().unwrap()[2],
         ObservedHttp {
             path: FILES_PATH.into(),
-            token: Some("actual-hot-current-token".into()),
+            token: None,
         }
     );
 
@@ -493,34 +454,19 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
     // additional probe is required by the current TTL policy, but credentials
     // for forwarding must be captured from the new physical peer.
     let before_inspections = runtime.inspections.load(Ordering::SeqCst);
-    let before_replacement_reads = runtime.credential_reads.load(Ordering::SeqCst);
-    let before_targets = runtime.observed_credentials.lock().unwrap().len();
     {
         let mut actual = current.lock().unwrap();
         actual.info.container_id = new_uid.clone();
         actual.info.created_at = chrono::Utc::now();
-        actual.token = "actual-replacement-current-token".into();
     }
     #[cfg(feature = "deploy-host")]
     published_route.replace(&runtime.info());
     register_current(&state, &runtime.info());
     forward_files(&state, &app, &new_uid).await;
-    assert_eq!(
-        runtime.credential_reads.load(Ordering::SeqCst) - before_replacement_reads,
-        1
-    );
     assert!(
         runtime.inspections.load(Ordering::SeqCst) > before_inspections,
         "warm probe caching must not bypass ensure's actual physical cross-verification"
     );
-    {
-        let targets = runtime.observed_credentials.lock().unwrap();
-        assert_eq!(targets.len() - before_targets, 1);
-        let target = &targets[before_targets];
-        assert_eq!(target.context.lifecycle_id, lifecycle.lifecycle_id);
-        assert_eq!(target.workload.as_ref().unwrap().uid, new_uid);
-        assert!(target.pod.is_none());
-    }
     {
         let observed = requests.lock().unwrap();
         assert_eq!(observed.len(), 4);
@@ -536,7 +482,7 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
             observed[3],
             ObservedHttp {
                 path: FILES_PATH.into(),
-                token: Some("actual-replacement-current-token".into()),
+                token: None,
             }
         );
     }

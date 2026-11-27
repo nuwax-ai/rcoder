@@ -245,7 +245,7 @@ impl SupervisordHost {
         self.stop_business().await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn shutdown_owner_entry(
         &self,
         runtime_root: &Path,

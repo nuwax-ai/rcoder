@@ -24,6 +24,13 @@ pub struct DockerRuntime {
     /// 列表缓存携带状态代次：命中时与 [`ContainerStateHandle::list_epoch`]
     /// 比对，变更（创建/删除/更新）后立即可见，不再单靠 TTL。
     list_cache: Cache<(), (u64, Vec<RuntimeContainerInfo>)>,
+    // The RCoder container's mount table stays fixed for its lifetime. Shared by
+    // the log directory mount check and by creating a replacement builder's log
+    // directory, so both see the same mapping.
+    pub(super) log_path_resolver: tokio::sync::OnceCell<crate::HostPathResolver>,
+    /// 日志清理器最近一次取到的那份视图：当时登记表的代次，和按那份清单算好的观察结果。删目录
+    /// 之前的最后一次确认靠它知道那份清单还作不作数，见 `log_dir_mounts`
+    log_directory_view: std::sync::Mutex<Option<log_dir_mounts::LogDirectoryView>>,
 }
 
 impl DockerRuntime {
@@ -31,11 +38,46 @@ impl DockerRuntime {
     pub fn new(inner: Arc<DockerManager>) -> Self {
         Self {
             inner,
-            list_cache: Cache::builder()
-                .max_capacity(1)
-                .time_to_live(Duration::from_secs(15))
-                .build(),
+            list_cache: Self::new_list_cache(),
+            log_path_resolver: tokio::sync::OnceCell::new(),
+            log_directory_view: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 用已知的挂载表构造，日志目录的路径映射不再做容器自检
+    ///
+    /// 只供测试使用：本 crate 的测试，或其它 crate 经下面的专用入口。显式注入的挂载表
+    /// 优先于 deploy-host 形态。
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_log_path_resolver(
+        inner: Arc<DockerManager>,
+        log_path_resolver: crate::HostPathResolver,
+    ) -> Self {
+        Self {
+            inner,
+            list_cache: Self::new_list_cache(),
+            log_path_resolver: tokio::sync::OnceCell::from(log_path_resolver),
+            log_directory_view: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 仅供其它 crate 的测试使用：显式注入日志目录的路径映射，不做容器自检
+    ///
+    /// 需要启用 `test-support` feature，生产构建里不存在。注入的挂载表优先于
+    /// deploy-host 形态，这样真实 Docker 见证在任意 feature 组合下都是确定的。
+    #[cfg(feature = "test-support")]
+    pub fn with_log_path_resolver_for_tests(
+        inner: Arc<DockerManager>,
+        log_path_resolver: crate::HostPathResolver,
+    ) -> Self {
+        Self::with_log_path_resolver(inner, log_path_resolver)
+    }
+
+    fn new_list_cache() -> Cache<(), (u64, Vec<RuntimeContainerInfo>)> {
+        Cache::builder()
+            .max_capacity(1)
+            .time_to_live(Duration::from_secs(15))
+            .build()
     }
 }
 
@@ -201,7 +243,10 @@ pub(super) fn extract_container_ports(
 
 mod agent_runtime;
 mod container_query;
+pub(crate) mod host_path_space;
+pub(crate) mod log_dir_mounts;
 mod partial_creation;
+mod pod_overview;
 #[cfg(test)]
 mod tests;
 

@@ -183,6 +183,11 @@ async fn process_prompt<N: SessionNotifier>(
 ) -> bool {
     debug!("[SACP] received Prompt request");
 
+    // 第一条用户消息到达 ⇒ 关闭该会话的内存看门狗"启动窗口"。
+    // 用户消息之前不可能有用户命令，所以窗口内出现的进程都是 agent 自身。
+    // 幂等；未安装看门狗时 no-op。
+    process_utils::mem_watch::mark_session_active(project_id);
+
     // 从 meta 中提取 request_id
     let request_id = prompt_request
         .meta

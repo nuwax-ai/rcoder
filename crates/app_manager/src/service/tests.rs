@@ -834,6 +834,46 @@ async fn kubernetes_lease_conflict_fails_fast_without_queueing() {
     assert!(!runtime.lease_held.load(Ordering::SeqCst));
 }
 
+/// Docker 模式孤儿 marker 受控回收(flock 活性证明):上次持有者死亡留下的
+/// 非空锁文件不再永久围栏该应用——下一次操作在获取点已持有 flock 时回收
+/// 残留并放行,原入口自动恢复。(修复前:Conflict "incomplete application
+/// mutation requires operator recovery" 永久拦截,只能人工 SSH 清锁。)
+#[tokio::test]
+async fn docker_orphan_marker_is_reclaimed_by_next_operation() {
+    let directory = tempfile::tempdir().expect("directory");
+    let runtime = Arc::new(MockRuntime::default());
+    let service =
+        test_service_with_mode(directory.path(), runtime.clone(), AppAccessMode::Docker).await;
+    let app_id = "orphandocker";
+    let locks =
+        std::path::Path::new(&service.config.operation_lock_root).join(".app-operation-locks");
+    let lock_path = locks.join(format!("prod-{app_id}.lock"));
+    // 模拟进程死亡残留:持有者已写 marker、未完成即退出(内核已释放 flock)
+    std::fs::create_dir_all(&locks).expect("lock directory");
+    std::fs::write(&lock_path, "0192f0ac-1111-4222-8333-444455556666")
+        .expect("orphan marker from a dead holder");
+    let process = service
+        .release_locks
+        .entry((app_id.to_owned(), shared_types::UserAppOperationScope::Prod))
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+        .lock_owned()
+        .await;
+    let guard = service
+        .operation_guard(app_id, process, false)
+        .await
+        .expect("next operation reclaims the orphan marker under held flock");
+    assert!(
+        std::fs::read(&lock_path).expect("lock file").is_empty(),
+        "orphan marker reclaimed at acquisition"
+    );
+    drop(guard);
+    assert!(
+        std::fs::read(&lock_path).expect("lock file").is_empty(),
+        "clean release keeps the marker empty"
+    );
+}
+
 /// 正式信封验收：忙锁 stop 经真实 handler + axum router + envelope_errors
 /// 中间件 → HTTP 200、success=false、code=ERR_OPERATION_IN_PROGRESS（不能只看 HTTP 状态）。
 #[tokio::test]
@@ -1076,10 +1116,12 @@ pub(crate) async fn creation_unknown_outcome_keeps_recovery_fence() {
         .create_app(create_request("appunknown"))
         .await
         .expect_err("fence must block new operations");
-    assert!(
-        matches!(&fenced, AppOperationError::Conflict(message)
-            if message.contains("requires operator recovery")),
-        "expected recovery fence conflict, got: {fenced}"
+    // 围栏仍在,但由记录层承担(RecoveryRequired 操作占用 active_operations):
+    // 文件层孤儿 marker 已在下一次获取点受控回收,不再永久拦截。
+    assert_eq!(
+        fenced.code(),
+        shared_types::ERR_OPERATION_IN_PROGRESS,
+        "record-level fence, got: {fenced}"
     );
 }
 
@@ -1648,10 +1690,12 @@ async fn stop_rejection_releases_ownership_but_uncertain_result_retains_it() {
                 .await
                 .expect("release test lease");
         } else {
-            assert!(
-                next.is_err(),
-                "uncertain stop cannot authorize another writer"
-            );
+            // 孤儿 marker 在下一次获取点受控回收:不确定结局的 stop 不再永久
+            // 拒绝下一个写入者;对账由 RecoveryRequired 记录驱动的恢复链收敛。
+            next.expect("next writer reclaims the orphan marker")
+                .finish()
+                .await
+                .expect("release test lease");
         }
         assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
     }
@@ -2759,7 +2803,7 @@ async fn rejected_delete_version_releases_kubernetes_operation_before_return() {
 }
 
 #[tokio::test]
-async fn cancelled_docker_mutation_blocks_later_deletion_before_side_effects() {
+async fn cancelled_docker_mutation_marker_no_longer_fences_later_deletion() {
     let root = tempfile::tempdir().expect("directory");
     let runtime = Arc::new(MockRuntime::default());
     let service = test_service(root.path(), runtime.clone()).await;
@@ -2775,11 +2819,15 @@ async fn cancelled_docker_mutation_blocks_later_deletion_before_side_effects() {
         .expect("lease");
     operation.mark_mutating().expect("durable mutation marker");
     drop(operation);
-    assert!(matches!(
-        service.delete_app("cancelledwriter", false, None).await,
-        Err(AppOperationError::Conflict(_))
-    ));
-    assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+    // 文件 marker 只是物理残留:它单独不再构成永久围栏(修复前 delete_app 被
+    // Conflict "requires operator recovery" 无限期拒绝,普通用户无法自救)。
+    // 真实围栏由记录层承担——有持久 RecoveryRequired 记录的场景见
+    // creation_unknown_outcome_keeps_recovery_fence(记录占用 → 拒绝受理);
+    // 无记录的孤儿残留由下一次获取受控回收,删除流程按捕获身份收敛。
+    service
+        .delete_app("cancelledwriter", false, None)
+        .await
+        .expect("later deletion is admitted and converges");
     assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -3066,21 +3114,28 @@ mod purge_http_cancellation {
             .expect("owned deletion completed");
         // The process lock is a deterministic completion barrier for the outer
         // purge: its guard must survive caller cancellation until all tail work.
+        let marker = root
+            .path()
+            .join(".app-operation-locks/prod-cancelledhttppurge.lock");
+        // 不确定结局保留物理 marker(完成后清理由尾部收尾,读取时机与 acquire
+        // 竞态,完成分支不做前置断言)。保留的残留不再永久拦截——下一次获取
+        // 在已持有 flock 时受控回收并继续。
+        if outcome != 0 {
+            assert!(
+                !std::fs::read(&marker).expect("marker").is_empty(),
+                "uncertain deletion retains the physical marker"
+            );
+        }
         let next = tokio::time::timeout(
             Duration::from_secs(3),
             service.acquire_process_release_lock(app_id),
         )
         .await
-        .expect("operation ended");
-        let marker = root
-            .path()
-            .join(".app-operation-locks/prod-cancelledhttppurge.lock");
+        .expect("operation ended")
+        .expect("next writer reclaims the retained marker");
+        next.finish().await.expect("release new operation");
 
         if outcome == 0 {
-            let next = next.expect("completed purge must release durable mutation marker");
-            next.finish()
-                .await
-                .expect("release new read-only operation");
             assert!(
                 service
                     .metadata
@@ -3099,9 +3154,7 @@ mod purge_http_cancellation {
                     .any(|row| row.app_id == app_id
                         && row.state == shared_types::UserAppLifecycleState::Deleted)
             );
-            assert!(std::fs::read(marker).expect("marker").is_empty());
         } else {
-            assert!(next.is_err(), "unknown deletion must not release marker");
             assert!(
                 service
                     .metadata
@@ -3110,7 +3163,6 @@ mod purge_http_cancellation {
                     .expect("metadata query")
                     .is_some()
             );
-            assert!(!std::fs::read(marker).expect("marker").is_empty());
         }
     }
     #[tokio::test]
@@ -3388,6 +3440,45 @@ async fn controlled_restart_deduplicates_and_is_distinct_from_start() {
             .is_err()
     );
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), before + 1);
+}
+
+#[tokio::test]
+async fn traffic_cold_wake_carries_platform_image_into_start_write() {
+    restart_image_env();
+    let root = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(root.path(), "coldwakeimage").await;
+    service
+        .stop_app_controlled(
+            "coldwakeimage",
+            shared_types::UserAppControlRequest {
+                lifecycle_id: None,
+                request_id: Some("stop-before-wake".into()),
+            },
+        )
+        .await
+        .expect("stop");
+    let before_restart = runtime.restart_calls.load(Ordering::SeqCst);
+    let outcome = service
+        .wake_app_on_traffic("coldwakeimage", std::time::Duration::from_secs(5))
+        .await
+        .expect("cold wake");
+    assert!(
+        matches!(
+            outcome,
+            shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning
+        ),
+        "{outcome:?}"
+    );
+    // 冷唤醒与显式启动共享同一镜像意图（spec sandbox-image-version-drift R1）：
+    // 平台镜像受理时冻结并进入启动写入；归属守卫在 k8s 写边界。
+    assert_eq!(
+        runtime.restart_calls.load(Ordering::SeqCst),
+        before_restart + 1
+    );
+    assert_eq!(
+        runtime.restart_images.lock().expect("images").as_slice(),
+        &[Some("registry.test/app-runtime:ut".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -3801,14 +3892,11 @@ async fn pending_full_delete_recovery_owns_deleting_lifecycle_until_completion()
             assert!(identity.active_operations.is_empty());
         }
         let repeated = service.resume_pending_control(&pending).await;
-        if cleanup_fails {
-            assert!(
-                repeated.is_err(),
-                "partial deletion must retain its resource lease"
-            );
-        } else {
-            assert!(!repeated.expect("old completed scan ignored"));
-        }
+        // 孤儿 marker 不再把恢复扫描挡在锁外(修复前 cleanup_fails 分支在此被
+        // 文件围栏 Conflict 拒绝):非 Pending 快照如实返回无可续跑项;不确定
+        // 删除仍由记录层拥有(Deleting 态 + active_operations 占用),且绝不
+        // 重放清理副作用(下方计数断言)。
+        assert!(!repeated.expect("recovery scan must not be locked out"));
         assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 1);
         assert_eq!(dev.calls.load(Ordering::SeqCst), 1);
     }
@@ -5400,6 +5488,10 @@ mod activation_final_query_identity_tests {
         restart: bool,
         replay: bool,
     ) {
+        // 本组用例的前提是"未配置平台镜像"：配了平台镜像时 start 会走 restart
+        // （换镜像必须重启）。env 是进程级的，先跑过的用例可能已设置它，
+        // 这里显式清掉，避免结论随执行顺序漂移。
+        crate::test_support::clear_runtime_image_env();
         let directory = tempfile::tempdir().expect("directory");
         let (service, runtime) = created_app_service(directory.path(), "activationquery").await;
         let before = service.get_lifecycle("activationquery").await.unwrap();

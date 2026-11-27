@@ -1,14 +1,30 @@
 //! Windows 原生生命周期集成测试（XP 生命周期门禁的真机等价物）。
 //!
 //! 场景：空 workspace 的 app-cli serve --control-only 常驻：
-//! /health 200 应答 → 强杀（taskkill /F）→ 进程退出、端口释放。
+//! /health 200 应答 → 强杀（TerminateProcess）→ 进程退出、端口释放。
 //! 对照 Unix 侧 serve_restart/bin_startup（#![cfg(unix)]）——本文件补
 //! Windows 侧的最小真实生命周期闭环。
 #![cfg(windows)]
 
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// 结束 app-cli 并确认它已经退出：用保留的进程句柄终止它，再在期限内用 `try_wait` 确认。
+/// 只保证 app-cli 自己退出，不保证它的子进程都已结束——整棵树的语义由 owner crash 那个
+/// 测试覆盖。期限内没有退出就明确失败，不留下没人管的进程。
+fn terminate_and_confirm(child: &mut Child) {
+    let killed = child.kill().err();
+    let grace = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().expect("observe app-cli").is_none() {
+        assert!(
+            killed.is_none() && Instant::now() < grace,
+            "app-cli (pid {}) did not exit after TerminateProcess; kill reported {killed:?}",
+            child.id()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
 
 fn free_port_address() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
@@ -35,7 +51,7 @@ fn http_get_health(addr: &str) -> Option<u16> {
         .and_then(|code| code.parse().ok())
 }
 
-/// 空容器 idle 生命周期：spawn → /health 200 → taskkill → 端口释放。
+/// 空容器 idle 生命周期：spawn → /health 200 → 强杀 → 端口释放。
 #[test]
 fn windows_idle_serve_lifecycle() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -79,16 +95,7 @@ fn windows_idle_serve_lifecycle() {
     assert!(healthy, "idle app-cli must answer /health 200 at {address}");
 
     // 强杀（容器终止等价物）
-    let killed = Command::new("taskkill")
-        .args(["/PID", &child.id().to_string(), "/F", "/T"])
-        .output()
-        .expect("taskkill");
-    assert!(
-        killed.status.success(),
-        "taskkill must succeed: {}",
-        String::from_utf8_lossy(&killed.stderr)
-    );
-    child.wait().expect("reap app-cli");
+    terminate_and_confirm(&mut child);
 
     // 端口随进程终止释放（可重新绑定）
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -158,10 +165,7 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
                 status.success(),
                 "control-only caller must reuse the verified owner"
             );
-            let _ = Command::new("taskkill")
-                .args(["/PID", &first.id().to_string(), "/F", "/T"])
-                .output();
-            let _ = first.wait();
+            terminate_and_confirm(&mut first);
             return;
         }
         if http_get_health(&address) == Some(200) && second_status.is_none() && !first_alive {
@@ -170,10 +174,7 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
                 status.success(),
                 "control-only caller must reuse the verified owner"
             );
-            let _ = Command::new("taskkill")
-                .args(["/PID", &second.id().to_string(), "/F", "/T"])
-                .output();
-            let _ = second.wait();
+            terminate_and_confirm(&mut second);
             return;
         }
         std::thread::sleep(Duration::from_millis(200));

@@ -119,6 +119,8 @@ impl DockerManager {
                 {
                     return Some((project_id, None, true));
                 }
+                // 已停止的 agent 容器：超过保留窗口则回收（这是 auto_remove
+                // 关闭后唯一的清理路径——容器死后没人 ensure 时不能永久留存）
                 Some((project_id, None, false))
             }
             Err(e) => {

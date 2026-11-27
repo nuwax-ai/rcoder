@@ -73,10 +73,19 @@ pub trait WorkspaceResolver: Send + Sync {
 pub struct LocalWorkspaceResolver {
     project_root: PathBuf,
     computer_root: PathBuf,
+    /// 单用户卷视角（终审 F2）: Some(bound_user_id) 时 computer 解析为
+    /// `{root}/{cid}`（跳过 user_id 段）——per-agent RBD 卷根即该用户家
+    /// 目录（agent 工作目录 /home/user/{cid}），共享卷的 {root}/{uid}/{cid}
+    /// 双层布局不再适用。同时做归属校验：请求 user_id ≠ 绑定 user_id 时
+    /// 拒绝解析（validation 错误而非 403——转发层定位错误属于请求不合法，
+    /// 不是已鉴权但无权限）。
+    single_user_computer: Option<String>,
 }
 
 impl LocalWorkspaceResolver {
     /// 从环境变量构造, 缺省回退到 `shared_types::paths` 常量。
+    /// `RCODER_AGENT_BOUND_USER_ID` 非空 → 单用户卷视角（agent 容器内嵌
+    /// 形态经此启用; rcoder 主进程不设该 env, 保持共享双层布局）。
     pub fn from_env() -> Self {
         let project_root = std::env::var(ENV_PROJECT_SOURCE_DIR)
             .map(PathBuf::from)
@@ -84,17 +93,36 @@ impl LocalWorkspaceResolver {
         let computer_root = std::env::var(ENV_COMPUTER_WORKSPACE_DIR)
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(COMPUTER_WORKSPACE_ROOT));
+        let single_user_computer = std::env::var("RCODER_AGENT_BOUND_USER_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         Self {
             project_root,
             computer_root,
+            single_user_computer,
         }
     }
 
-    /// 显式指定根目录；供配置文件启动和嵌入式 lib 调用。
+    /// 显式指定根目录；供配置文件启动和嵌入式 lib 调用（共享双层布局）。
     pub fn new(project_root: PathBuf, computer_root: PathBuf) -> Self {
         Self {
             project_root,
             computer_root,
+            single_user_computer: None,
+        }
+    }
+
+    /// 显式单用户卷视角构造（bound_user_id 做归属校验锚）。
+    pub fn new_single_user(
+        project_root: PathBuf,
+        computer_root: PathBuf,
+        bound_user_id: String,
+    ) -> Self {
+        Self {
+            project_root,
+            computer_root,
+            single_user_computer: Some(bound_user_id),
         }
     }
 }
@@ -202,11 +230,24 @@ impl WorkspaceResolver for LocalWorkspaceResolver {
     }
 
     async fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf> {
-        // 二级: {root}/{user}/{cid} (对齐 nuwax gitService.js)
+        let cid = validated_identifier(&ctx.cid, "cId")?;
+        if let Some(bound) = &self.single_user_computer {
+            // 单用户卷视角（per-agent RBD 容器内嵌形态）: 卷根即用户家目录,
+            // {root}/{cid}; 请求 user_id 必须与卷绑定用户一致（防转发层
+            // 定位错乱时跨用户读写）。
+            if &ctx.user_id != bound {
+                return Err(AppError::validation(format!(
+                    "userId '{}' does not match the volume owner",
+                    ctx.user_id
+                )));
+            }
+            return Ok(self.computer_root.join(cid));
+        }
+        // 二级: {root}/{user}/{cid} (对齐 nuwax gitService.js, 共享卷布局)
         Ok(self
             .computer_root
             .join(validated_identifier(&ctx.user_id, "userId")?)
-            .join(validated_identifier(&ctx.cid, "cId")?))
+            .join(cid))
     }
 }
 
@@ -265,6 +306,8 @@ impl WorkspaceResolver for SubvolumeWorkspaceResolver {
     async fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf> {
         let project_id = validated_identifier(&ctx.project_id, "projectId")?;
         // 回滚开关 false → 直接 fallback Local (共享 PVC, 生产行为)
+        // 注: per_agent_rbd 下这里仍走 Local —— 混住期存量共享用户靠此回落;
+        // RBD 用户的拦截/判据在转发层 (computer_forward, 按用户粒度), 不在此。
         if !shared_types::per_agent_pvc_enabled() {
             return self.fallback.resolve_project(ctx).await;
         }
@@ -289,7 +332,7 @@ impl WorkspaceResolver for SubvolumeWorkspaceResolver {
     async fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf> {
         let user_id = validated_identifier(&ctx.user_id, "userId")?;
         let cid = validated_identifier(&ctx.cid, "cId")?;
-        // 回滚开关 false → 直接 fallback Local
+        // 回滚开关 false → 直接 fallback Local (per_agent_rbd 语义同上, 见 resolve_project 注)
         if !shared_types::per_agent_pvc_enabled() {
             return self.fallback.resolve_computer(ctx).await;
         }

@@ -432,14 +432,19 @@ impl Drop for Fixture {
         // No name/PID sweep, new owner shutdown, or source/volume removal.
         let state = self.state.clone();
         let captured = self.owner.clone();
+        let owner_pid = self.owner_pid;
         let cleanup = std::thread::spawn(move || {
             let runtime = runtime_supervisor::runtime().unwrap();
             runtime.block_on(async {
-                if let Some(owner) = captured
+                // Only the exact captured native owner may receive cleanup
+                // Shutdown. No name/PID sweep, new owner shutdown, or source/
+                // volume removal. Status 查询失败（路径缺失等）也不能跳过
+                // 等待——退出确认以进程观察为准（codex follow-up）。
+                if let Some(owner) = captured.as_deref()
                     && let Ok(before) = runtime_supervisor::control_verified(
                         &state,
                         runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
-                        &owner,
+                        owner,
                     )
                     .await
                 {
@@ -447,27 +452,54 @@ impl Drop for Fixture {
                         runtime_supervisor::Request::new(runtime_supervisor::Action::Shutdown);
                     request.capture_generation(before.generation.as_deref());
                     let _result =
-                        runtime_supervisor::control_verified(&state, request, &owner).await;
-                    let until = tokio::time::Instant::now() + Duration::from_secs(10);
-                    while tokio::time::Instant::now() < until {
-                        if runtime_supervisor::Owner::try_acquire(&state)
-                            .ok()
-                            .flatten()
-                            .is_some()
-                        {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(40)).await;
-                    }
+                        runtime_supervisor::control_verified(&state, request, owner).await;
                 }
-            });
+                // 确认条件：锁可获取，或捕获的 owner 进程已退出；两者都无
+                // 从观察（无 owner id 且无 pid）时不得据此判失败。
+                let until = tokio::time::Instant::now() + Duration::from_secs(30);
+                while tokio::time::Instant::now() < until {
+                    if runtime_supervisor::Owner::try_acquire(&state)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        return true;
+                    }
+                    if let Some(pid) = owner_pid
+                        && !process_utils::process_exists(pid).unwrap_or(true)
+                    {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+                owner_pid.is_none() && captured.is_none()
+            })
         });
-        let _result = cleanup.join();
+        let released = cleanup.join().unwrap_or(false);
         for child in &mut self.clients {
             if matches!(child.try_wait(), Ok(None)) {
                 let _result = child.kill();
             }
             let _result = child.wait();
+        }
+        // codex follow-up（2026-11-20）：等不到锁释放（owner/guardian 仍在
+        // 运行——ENOENT/EPERM 都不足以确认退出）时，绝不能让临时目录随之
+        // 析构——运行中的进程会在已删除路径上自旋，累积成孤儿 serve/
+        // guardian。测试失败并保留诊断目录。
+        if !released {
+            let directory = std::mem::replace(
+                &mut self._directory,
+                tempfile::TempDir::new().expect("diagnostic replacement tempdir"),
+            );
+            eprintln!(
+                "run_source_owner fixture: owner did not exit within 10s; \
+                 keeping fixture directory for diagnostics: {}",
+                directory.path().display()
+            );
+            std::mem::forget(directory);
+            if !std::thread::panicking() {
+                panic!("owner/guardian still alive after Shutdown; fixture directory kept");
+            }
         }
     }
 }
@@ -1302,8 +1334,8 @@ impl Fixture {
         use std::io::{BufRead, BufReader};
         let mut child = self
             .command("run", log)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();

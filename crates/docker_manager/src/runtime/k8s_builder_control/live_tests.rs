@@ -45,6 +45,7 @@ async fn personal_k8s_restart_converges_workspace_and_preserves_pvc() -> anyhow:
         },
         pod_cache: Default::default(),
         subvolume_path_cache: Default::default(),
+        workspace_exists_cache: Default::default(),
         event_publisher: Default::default(),
         event_counters: Default::default(),
     };

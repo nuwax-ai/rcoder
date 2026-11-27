@@ -5,6 +5,40 @@ pub(super) fn lock_builder_file(root: &std::path::Path, name: &str) -> Result<Bu
     lock_builder_file_with_marker(root, name, shared_types::AppFileMutationMarker::new())
 }
 
+/// 锁归档旁文件后缀（`<lock>.lock.orphaned`）：孤儿授权/获取/结算记录的
+/// 追加日志，validate fallback 按行解析。
+const LOCK_ARCHIVE_EXTENSION: &str = "lock.orphaned";
+
+fn lock_archive_path(lock_path: &std::path::Path) -> std::path::PathBuf {
+    lock_path.with_extension(LOCK_ARCHIVE_EXTENSION)
+}
+
+/// 归档旁文件追加一条记录（best-effort：I/O 失败只影响 validate fallback
+/// 的精度，不影响持锁/释放本身）。
+#[cfg(unix)]
+fn append_lock_archive(lock_path: &std::path::Path, suffix: &str) {
+    let archive = lock_archive_path(lock_path);
+    let entry = format!(
+        "[{}] {}\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        suffix,
+    );
+    if let Some(parent) = archive.parent() {
+        let _unused = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&archive)
+    {
+        use std::io::Write as _;
+        let _unused = file.write_all(entry.as_bytes());
+    }
+}
+
 pub(super) fn lock_builder_file_with_marker(
     root: &std::path::Path,
     name: &str,
@@ -15,6 +49,10 @@ pub(super) fn lock_builder_file_with_marker(
         .marker
         .begin(&lease.file)
         .map_err(|e| Error::DockerError(format!("persist builder operation marker: {e}")))?;
+    // 获取即落归档授权记录（codex 复审 2026-11-20）：正常持锁不写归档会让
+    // 后继完成的 done 无法撤销更早的裸权威（行序不能替代锁代次）。
+    #[cfg(unix)]
+    append_lock_archive(&lease.path, lease.marker.operation_id());
     Ok(lease)
 }
 
@@ -34,8 +72,32 @@ pub(super) fn prepare_builder_file(
         .map_err(|e| Error::DockerError(format!("builder operation lock file: {e}")))?;
     file.try_lock()
         .map_err(|e| Error::Conflict(format!("builder operation lease unavailable: {e}")))?;
-    shared_types::AppFileMutationMarker::check_clean(&file)
-        .map_err(|e| Error::Conflict(format!("builder operation requires recovery: {e}")))?;
+    // The exclusive flock is held here: a nonempty marker can only be a former
+    // holder's remnant (kernel-released flock proves the holder stopped), so
+    // reclaim it instead of fencing the application forever. Record-backed
+    // fencing (compute control records, operation leases) is unaffected — it
+    // reads durable storage, not this physical remnant.
+    let lock_path = root.join(name);
+    match shared_types::AppFileMutationMarker::reclaim_orphaned(
+        &file,
+        Some(&lock_path.with_extension("lock.orphaned")),
+    ) {
+        Ok(None) => {}
+        Ok(Some(orphan_operation_id)) => {
+            tracing::warn!(
+                lock_path = %lock_path.display(),
+                archive = %lock_archive_path(&lock_path).display(),
+                orphan_operation_id,
+                "Reclaimed orphaned builder operation marker under held flock; previous holder is proven stopped; operation id archived for reconciliation"
+            );
+        }
+        Err(error) => {
+            return Err(Error::Conflict(format!(
+                "builder operation lease marker at {}: {error}",
+                lock_path.display()
+            )));
+        }
+    }
     Ok(BuilderFileLease {
         file,
         path: root.join(name),
@@ -50,7 +112,10 @@ impl shared_types::PreparedComputeLease for BuilderFileLease {
     async fn activate(&mut self) -> std::result::Result<(), String> {
         self.marker
             .begin(&self.file)
-            .map_err(|error| format!("Activate compute lease: {error}"))
+            .map_err(|error| format!("Activate compute lease: {error}"))?;
+        #[cfg(unix)]
+        append_lock_archive(&self.path, self.marker.operation_id());
+        Ok(())
     }
 }
 
@@ -144,9 +209,77 @@ pub(super) fn validate_file_receipt(
         .take(token.len() as u64 + 1)
         .read_to_end(&mut owner)
         .map_err(|error| Error::DockerError(format!("Read operation lease owner: {error}")))?;
+    if owner == token.as_bytes() {
+        return Ok(true);
+    }
+    // 活 marker 非空且与回执不符：当前权威属于其他执行者——**不走归档**
+    // （第十一轮 P1：旧回执曾凭归档在同 inode 新执行者写入时误验真）。
+    if !owner.is_empty() {
+        return Ok(false);
+    }
+    // 活 marker 为空（被归档回收清零）：查归档。codex 复审（2026-11-20）
+    // 两反例定案的代次规则——归档行序不等于锁代次：
+    // - 本 token 验真 ⟺ 存在裸授权记录（获取/归档写入），且其后：
+    //   · 无本 token 的 done（已结算，幂等——重复 done 不改变结论）
+    //   · 无**更晚获取**的其他 token 裸记录（后继代次接管）
+    //   · 无"没有任何裸记录"的其他 token done（兼容无获取记录的旧归档/
+    //     旧部署：无法证明其代次更早，按后继处置）
+    // - 更早获取的其他 token 的迟到 done **不撤销**本 token（裸记录位置
+    //   在本 token 之前 = 旧代次，其重复释放不改变在逈权威）。
+    let archive = lock_archive_path(path);
+    if let Ok(content) = std::fs::read_to_string(&archive) {
+        struct Record {
+            token: String,
+            done: bool,
+        }
+        let records: Vec<(usize, Record)> = content
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let (_, rest) = line.split_once(' ')?;
+                let rest = rest.trim();
+                let (token, done) = match rest.strip_prefix("done ") {
+                    Some(token) => (token.trim().to_string(), true),
+                    None => (rest.to_string(), false),
+                };
+                (!token.is_empty()).then_some((index, Record { token, done }))
+            })
+            .collect();
+        let own_last_bare = records
+            .iter()
+            .filter(|(_, record)| !record.done && record.token == token.as_str())
+            .map(|(index, _)| *index)
+            .max();
+        let Some(own_last_bare) = own_last_bare else {
+            return Ok(false);
+        };
+        let revoked = records.iter().any(|(index, record)| {
+            if *index <= own_last_bare {
+                return false;
+            }
+            if record.token == token.as_str() {
+                // 本 token 的 done：结算。
+                record.done
+            } else if record.done {
+                // 其他 token 的 done：仅当其为更晚获取（裸记录在本 token
+                // 之后）或完全无裸记录（代次不可证，按后继处置）时撤销。
+                let acquired_after = records.iter().any(|(bare_index, bare)| {
+                    *bare_index > own_last_bare && !bare.done && bare.token == record.token
+                });
+                let has_any_bare = records
+                    .iter()
+                    .any(|(_, candidate)| !candidate.done && candidate.token == record.token);
+                acquired_after || !has_any_bare
+            } else {
+                // 其他 token 更晚获取的裸记录：后继代次接管。
+                true
+            }
+        });
+        return Ok(!revoked);
+    }
     // Empty markers are already released, not authority to resume this operation.
     // Dropping this temporary fd unlocks without clearing or rewriting the marker.
-    Ok(owner == token.as_bytes())
+    Ok(false)
 }
 
 #[cfg(not(unix))]
@@ -248,6 +381,31 @@ pub(super) fn release_file_receipt(
     marker
         .complete(&file)
         .map_err(|error| Error::Conflict(format!("Operation lease ownership changed: {error}")))?;
+    // 释放成功：向归档旁文件追加 done 标记——validate 的归档 fallback 据此
+    // 停止把该 token 验真（第十一轮 P1：已释放回执不得凭归档复活）。
+    // best-effort（归档不可写只影响 fallback 精度，不影响释放本身）。
+    {
+        let archive = lock_archive_path(path);
+        let entry = format!(
+            "[{}] done {}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            token
+        );
+        if let Some(parent) = archive.parent() {
+            let _unused = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&archive)
+        {
+            use std::io::Write as _;
+            let _unused = file.write_all(entry.as_bytes());
+        }
+    }
     file.unlock()
         .map_err(|error| Error::DockerError(format!("Unlock completed operation lease: {error}")))
 }
@@ -352,6 +510,10 @@ impl shared_types::AppOperationLease for BuilderFileLease {
         self.marker
             .complete(&self.file)
             .map_err(|error| format!("complete builder operation marker: {error}"))?;
+        // 结算即落归档 done 记录：validate fallback 据此停止把本 token 的
+        // 裸授权验真（codex 反例：不写则归档裸记录在正常完成后仍复活）。
+        #[cfg(unix)]
+        append_lock_archive(&self.path, &format!("done {}", self.marker.operation_id()));
         self.file
             .unlock()
             .map_err(|error| format!("release builder operation lease: {error}"))?;

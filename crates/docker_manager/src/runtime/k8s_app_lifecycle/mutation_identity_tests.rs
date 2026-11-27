@@ -98,3 +98,31 @@ fn conditional_workload_patch_retains_requested_changes_and_captured_identity() 
     assert!(app_mutation_identity("rcoder-app-one".into(), &missing).is_err());
     assert!(app_mutation_identity("replacement-name".into(), &missing).is_err());
 }
+
+/// 仓库段提取（启动对齐归属守卫的判定基础）：tag/digest 剥离、带端口
+/// registry 的主机段保留、daemon 内容 ID（sha256:…）无仓库段恒不匹配。
+#[test]
+fn image_repository_extracts_platform_scope_from_references() {
+    assert_eq!(
+        image_repository("registry.test/ns/app-runtime:0.1.306"),
+        "registry.test/ns/app-runtime"
+    );
+    assert_eq!(
+        image_repository("registry.test/ns/app-runtime@sha256:abc"),
+        "registry.test/ns/app-runtime"
+    );
+    assert_eq!(
+        image_repository("registry.test/ns/app-runtime"),
+        "registry.test/ns/app-runtime"
+    );
+    assert_eq!(
+        image_repository("localhost:5000/ns/app:v1"),
+        "localhost:5000/ns/app"
+    );
+    assert_eq!(
+        image_repository("localhost:5000/ns/app"),
+        "localhost:5000/ns/app"
+    );
+    assert_eq!(image_repository("app:v1"), "app");
+    assert_eq!(image_repository("sha256:deadbeef"), "sha256");
+}

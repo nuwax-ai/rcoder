@@ -71,10 +71,48 @@ async fn wait_row_for_pid(root: &Path, event: &str, project: &str, pid: u32) {
     });
 }
 
-// Observe only this test's actual ACP fixture children: Chat preparation also
-// launches a short-lived `python -v` version probe, which is not an ACP owner.
-// Reject zombies rather than treating kill(0) as proof of a live execution.
-fn owned_live_fixture_children() -> Vec<u32> {
+/// 进程级全局 `SESSION_CACHE` 的保留字互斥锁。
+///
+/// 下面几个用例要按**生产保留字**（`"pending"` / `""`，即 preparation 状态的
+/// sentinel）往全局缓存里插入或断言"不该有条目"。保留字是测试意图的一部分
+/// ——换成随机 id 就再也走不到"不可路由"那条路了;而全局键在并行测试间共享,
+/// 两个用例同时插 `"pending"` 就会互相覆盖、互相误判。
+/// 因此这些用例必须互斥执行,锁在本用例结束(含 panic 路径)时释放。
+static SENTINEL_CACHE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn sentinel_cache_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    SENTINEL_CACHE_LOCK.lock().await
+}
+
+/// 本测试自己 spawn 记录里的 fixture 子进程 pid（按 root 隔离）。
+///
+/// 每个测试用独立 tempdir 作 root，`protocol.jsonl` 因此是测试私有的；
+/// 进程级的 `ps` 则不然——并行测试共享同一进程，会看到别的测试刚拉起的
+/// fixture 子进程。归属必须以本测试的 spawn 记录为准。
+fn own_fixture_pids(root: &Path) -> Vec<u32> {
+    let mut pids: Vec<u32> = rows(root)
+        .iter()
+        .filter(|row| row["event"] == "spawn")
+        .filter_map(|row| row["pid"].as_u64())
+        .map(|pid| pid as u32)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Observe only this test's actual ACP fixture children: Chat preparation also
+/// launches a short-lived `python -v` version probe, which is not an ACP owner.
+/// Reject zombies rather than treating kill(0) as proof of a live execution.
+///
+/// 归属按 `own_fixture_pids` 收窄（并行测试不能互相看见子进程），但**存活与
+/// 僵尸状态仍由 ps 独立判定**——不看日志怎么说。这样既保持隔离，又不把
+/// "日志记了 spawn 但进程还活着/已成僵尸" 这类真实泄漏放过去。
+fn owned_live_fixture_children(root: &Path) -> Vec<u32> {
+    let owned = own_fixture_pids(root);
+    if owned.is_empty() {
+        return Vec::new();
+    }
     let observer = std::process::Command::new("ps")
         .args(["-ww", "-axo", "pid=,ppid=,stat=,args="])
         .stdout(std::process::Stdio::piped())
@@ -93,7 +131,11 @@ fn owned_live_fixture_children() -> Vec<u32> {
         let pid: u32 = fields.next().unwrap().parse().unwrap();
         let parent: u32 = fields.next().unwrap().parse().unwrap();
         let state = fields.next().unwrap();
-        if parent == std::process::id() && pid != observer_pid && line.contains(&fixture) {
+        if parent == std::process::id()
+            && pid != observer_pid
+            && owned.binary_search(&pid).is_ok()
+            && line.contains(&fixture)
+        {
             assert!(
                 !state.starts_with('Z'),
                 "owned fixture child {pid} is a zombie"
@@ -186,6 +228,7 @@ async fn service(root: &Path, create_budget: u64) -> AgentServiceImpl {
 
 #[tokio::test]
 async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retry() {
+    let _sentinel = sentinel_cache_guard().await;
     for (invalid_id, resume) in [
         ("pending", ""),
         ("", ""),
@@ -214,7 +257,7 @@ async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retr
             .into_inner();
         wait_row(root.path(), "new", &project, 1).await;
         let accepted_before_cleanup = response.success;
-        let live_before_cleanup = owned_live_fixture_children();
+        let live_before_cleanup = owned_live_fixture_children(root.path());
         let prompt_before_cleanup = rows(root.path()).iter().any(|row| row["event"] == "prompt");
         let published_sid = AGENT_REGISTRY.get_session_by_project(&project);
         // On an unfixed baseline Stop hides this actual execution. Capture its
@@ -244,7 +287,7 @@ async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retr
             .into_inner();
         assert!(retried.success, "normal retry must recover: {retried:?}");
         wait_row(root.path(), "prompt", &project, 1).await;
-        let live_after_retry = owned_live_fixture_children();
+        let live_after_retry = owned_live_fixture_children(root.path());
         stop(&service, &project, &retried.session_id).await;
         assert!(
             !accepted_before_cleanup,
@@ -272,7 +315,7 @@ async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retr
             1,
             "retry must have exactly one actual execution"
         );
-        assert!(owned_live_fixture_children().is_empty());
+        assert!(owned_live_fixture_children(root.path()).is_empty());
         assert!(
             response
                 .error
@@ -287,6 +330,7 @@ async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retr
 
 #[tokio::test]
 async fn early_acp_notification_cannot_publish_state_labels_before_a_real_session_exists() {
+    let _sentinel = sentinel_cache_guard().await;
     for invalid in ["pending", ""] {
         let root = tempfile::tempdir().unwrap();
         let service = Arc::new(service(root.path(), 10).await);
@@ -367,12 +411,13 @@ async fn early_acp_notification_cannot_publish_state_labels_before_a_real_sessio
                 .count(),
             1
         );
-        assert!(owned_live_fixture_children().is_empty());
+        assert!(owned_live_fixture_children(root.path()).is_empty());
     }
 }
 
 #[tokio::test]
 async fn progress_subscription_rejects_unassigned_identity_without_touching_legacy_cache() {
+    let _sentinel = sentinel_cache_guard().await;
     let root = tempfile::tempdir().unwrap();
     let service = service(root.path(), 10).await;
     for invalid in ["", "pending"] {
@@ -486,7 +531,7 @@ async fn early_foreign_notification_cannot_mutate_another_live_project() {
     wait_row(root.path(), "prompt", &second_project, 1).await;
     stop(&service, &second_project, &second.session_id).await;
     let first_still_live = !original.stop_handle.as_ref().unwrap().is_stopped();
-    let live_after_second_stop = owned_live_fixture_children().len();
+    let live_after_second_stop = owned_live_fixture_children(root.path()).len();
     stop(&service, &first_project, &first.session_id).await;
     assert_eq!(
         after_foreign_notification, before,
@@ -496,11 +541,12 @@ async fn early_foreign_notification_cannot_mutate_another_live_project() {
     assert_eq!(live_after_second_stop, 1);
     assert_ne!(second.session_id, first.session_id);
     assert_eq!(second.session_id, second_sid);
-    assert!(owned_live_fixture_children().is_empty());
+    assert!(owned_live_fixture_children(root.path()).is_empty());
 }
 
 #[tokio::test]
 async fn legacy_unroutable_execution_remains_stoppable_and_recovers_without_loading_state_labels() {
+    let _sentinel = sentinel_cache_guard().await;
     for mode in ["stop", "run", "auto-reload"] {
         let root = tempfile::tempdir().unwrap();
         let service = service(root.path(), 10).await;
@@ -565,7 +611,7 @@ async fn legacy_unroutable_execution_remains_stoppable_and_recovers_without_load
             .into_inner();
         assert!(recovered.success, "legacy {mode} recovery: {recovered:?}");
         wait_row(root.path(), "prompt", &project, 2).await;
-        let live = owned_live_fixture_children();
+        let live = owned_live_fixture_children(root.path());
         stop(&service, &project, &recovered.session_id).await;
         assert!(
             agent_runner::service::SESSION_CACHE
@@ -608,7 +654,7 @@ async fn legacy_unroutable_execution_remains_stoppable_and_recovers_without_load
             2,
             "accepted prompts must not be replayed"
         );
-        assert!(owned_live_fixture_children().is_empty());
+        assert!(owned_live_fixture_children(root.path()).is_empty());
     }
 }
 
@@ -1208,7 +1254,7 @@ async fn stop_and_same_sid_replacement(exit: ControlledExitCause) {
     drop(agent_abstraction::session::lock_execution_transition(&project).await);
     std::fs::write(root.path().join(format!("{project}.exit-barrier")), "").unwrap();
     let release = FixtureExitBarrier(root.path().join(format!("{project}.exit-release")));
-    assert_eq!(owned_live_fixture_children(), vec![old_pid]);
+    assert_eq!(owned_live_fixture_children(root.path()), vec![old_pid]);
     match exit {
         ControlledExitCause::Eof => lifecycle.cancel(),
         ControlledExitCause::Sigterm => nix::sys::signal::kill(
@@ -1225,7 +1271,7 @@ async fn stop_and_same_sid_replacement(exit: ControlledExitCause) {
     assert_eq!(started["cause"], cause);
     assert!(!lifecycle.is_stopped());
     assert_eq!(
-        owned_live_fixture_children(),
+        owned_live_fixture_children(root.path()),
         vec![old_pid],
         "the original must remain physically alive at the exit barrier"
     );
@@ -1258,7 +1304,7 @@ async fn stop_and_same_sid_replacement(exit: ControlledExitCause) {
         "replacement cannot complete before the old execution exits"
     );
     assert_eq!(
-        owned_live_fixture_children(),
+        owned_live_fixture_children(root.path()),
         vec![old_pid],
         "an unfinished Stop cannot be overtaken by a new child spawn"
     );
@@ -1693,4 +1739,125 @@ async fn actual_acp_abnormal_exit_after_cancel_keeps_rpc_failure_and_error_ident
         "abnormal-cancel-rid"
     );
     stop(&service, project, &response.session_id).await;
+}
+
+#[tokio::test]
+async fn process_roles_follow_the_watchdog_scope_end_to_end() {
+    // 端到端回归(用户实拍发现):`python3 -m websockify` 曾被标成"可淘汰"。
+    // 角色必须由进程树决定,与看门狗真实行为同源。这里自造一棵"agent 命令树"
+    // (root + 后代),连同真实 spawn 的 agent 一起验证三条不变式:
+    //   1. 已注册 root 的后代 → workload(看门狗真会杀)
+    //   2. root 自身          → 永不淘汰(杀 root 等于杀会话)
+    //   3. 树外进程           → infra(远程桌面/系统服务在此列)
+    process_utils::mem_watch::registry::install();
+    let registry = process_utils::mem_watch::registry::global().expect("registry");
+
+    let root = tempfile::tempdir().unwrap();
+    let service = service(root.path(), 3).await;
+    let project = "protocol-process-roles";
+    let response = service
+        .chat(Request::new(chat(root.path(), project, "", true, "hold")))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "chat: {response:?}");
+    wait_row(root.path(), "prompt", project, 1).await;
+
+    // 自造命令树:sh(root) → sleep(后代)。另有一个完全无关的树外进程。
+    let mut tree = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 60 & wait"])
+        .spawn()
+        .expect("spawn tree");
+    let tree_root = tree.id();
+    let mut outsider = std::process::Command::new("/bin/sh")
+        .args(["-c", "exec sleep 60"])
+        .spawn()
+        .expect("spawn outsider");
+    let outsider_pid = outsider.id();
+    // register 要读 /proc/<pid>/stat 与 exe,macOS 上没有 → 只在 Linux 上注册
+    if cfg!(target_os = "linux") {
+        assert!(
+            registry
+                .register("protocol-roles-tree", tree_root)
+                .is_some(),
+            "注册命令树 root 失败"
+        );
+    }
+
+    // posix_spawn 返回时 sh 刚 exec,还没 fork 出后代——给命令树留出建立时间
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (rows, groups) =
+        agent_runner::service::agent_resource_monitor::sample_container_processes();
+    let role_of = |pid: u32| rows.iter().find(|r| r.pid == pid).map(|r| r.role);
+    use agent_runner::service::agent_resource_monitor::ProcessRole;
+
+    if cfg!(target_os = "linux") {
+        assert!(!rows.is_empty(), "Linux 上必须能采到容器进程");
+
+        // 1) 树内后代必须是 workload
+        let descendant = rows
+            .iter()
+            .find(|r| r.ppid == tree_root && r.pid != tree_root)
+            .map(|r| (r.pid, r.role));
+        assert!(
+            matches!(descendant, Some((_, ProcessRole::Workload))),
+            "已注册 root 的后代必须标成可淘汰,实际 {descendant:?}"
+        );
+
+        // 2) root 自身永不淘汰
+        assert_ne!(
+            role_of(tree_root),
+            Some(ProcessRole::Workload),
+            "root 自身不能被标成可淘汰(杀 root 等于杀会话)"
+        );
+
+        // 3) 树外进程必须是 infra
+        assert_eq!(
+            role_of(outsider_pid),
+            Some(ProcessRole::Infra),
+            "树外进程必须不淘汰"
+        );
+
+        // 4) 不变式:所有 workload 行的 RSS 之和必须等于分组值
+        let sum: u64 = rows
+            .iter()
+            .filter(|r| r.role == ProcessRole::Workload)
+            .map(|r| r.rss_bytes)
+            .sum();
+        assert_eq!(
+            sum, groups.workload_rss_bytes,
+            "workload 分组必须等于逐行求和"
+        );
+    }
+
+    // ── agent 进程组聚合(新接口 /computer/pod/resources 的 agent 字段) ──
+    // 面板靠它拿 agent 维度 CPU/内存,不再轮询 /computer/agent/status。
+    if cfg!(target_os = "linux") {
+        let (_, _, scan) =
+            agent_runner::service::agent_resource_monitor::sample_container_processes_and_agents();
+        let agents = scan.entries;
+        // 每个 project 一条；这里注册了一个会话
+        let a = agents
+            .iter()
+            .find(|a| a.session_id.is_some())
+            .unwrap_or_else(|| {
+                panic!(
+                    "有注册会话时必须给出 agent 聚合, 实际 entries={agents:?} stats={:?}",
+                    scan.stats
+                )
+            });
+        assert!(a.process_count >= 1, "agent 进程组至少要含根进程: {a:?}");
+        assert!(a.rss_bytes > 0, "agent 进程组 RSS 必须为正: {a:?}");
+        assert!(a.cpu_seconds >= 0.0, "累计 CPU 秒非负: {a:?}");
+        assert!(!a.status.is_empty(), "状态不能为空: {a:?}");
+        assert!(a.session_id.is_some(), "已注册会话应带上 session_id: {a:?}");
+    }
+
+    stop(&service, project, &response.session_id).await;
+    registry.unregister("protocol-roles-tree", tree_root);
+    drop(tree.kill());
+    drop(tree.wait());
+    drop(outsider.kill());
+    drop(outsider.wait());
 }

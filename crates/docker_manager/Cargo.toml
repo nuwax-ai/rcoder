@@ -42,7 +42,6 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 
 # Utilities
-dashmap = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 
 # Shared types
@@ -71,6 +70,8 @@ default = []
 kubernetes = ["kube", "k8s-openapi", "tokio-util"]
 # deploy-host 宿主机运行形态：路径恒等映射/独立网络/端口发布
 deploy-host = ["shared_types/deploy-host"]
+# 仅供其它 crate 的测试注入挂载表等夹具；生产构建不启用
+test-support = []
 
 [dev-dependencies]
 rustls = { workspace = true }

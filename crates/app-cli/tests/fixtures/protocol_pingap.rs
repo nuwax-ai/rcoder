@@ -12,8 +12,8 @@ use std::{
     time::Duration,
 };
 
-const VERSION: &str = "0.15.0";
-const COMMIT: &str = "8270a1ebb7a238ea86fa220215714613410378bb";
+const VERSION: &str = "0.16.1";
+const COMMIT: &str = "695538b2745dcf9df812d2fa8f2e4ad8c7cbb1fb";
 
 /// Single-executable protocol fixture: the reported PID remains the real root.
 pub fn binary_entry(args: &[String]) -> Result<()> {
@@ -112,7 +112,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let user = user.clone();
             let password = password.clone();
             std::thread::spawn(move || {
-                let _ = respond(stream, state, Some((user, password)));
+                let _unused = respond(stream, state, Some((user, password)));
             });
         }
     });
@@ -123,7 +123,7 @@ pub fn run(args: &[String]) -> Result<()> {
             for stream in listener.incoming().flatten() {
                 let state = state.clone();
                 std::thread::spawn(move || {
-                    let _ = respond(stream, state, None);
+                    let _unused = respond(stream, state, None);
                 });
             }
         });

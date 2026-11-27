@@ -112,6 +112,10 @@ async fn agent_runner_run(cli_args: CliArgs) -> anyhow::Result<()> {
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let _telemetry = Arc::new(telemetry);
 
+    // 内存看门狗：安装会话注册表 + 启动采样任务。
+    // 默认 mode=off（空转），可用文件开关 / env 在运行期打开，见 docs/agent-mem-watch.md。
+    process_utils::mem_watch::install_and_start();
+
     // 初始化 FeatureFlags（进程级单例：读 RCODER_EMBED_FILE_SERVER 等环境开关）
     shared_types::FeatureFlags::init();
 
@@ -329,6 +333,8 @@ async fn agent_runner_run(cli_args: CliArgs) -> anyhow::Result<()> {
         //         置于 HTTP server 之后: 避免 proxy 先占 60000 而上游 8086 未就绪的 502 窗口
         if shared_types::FeatureFlags::get().embed_file_server {
             agent_runner::file_server_embed::spawn_file_server_proxy(config.port).await;
+            // 容器内技能目录启动对账（RBD 独占卷在容器内，主进程对账扫不到）
+            agent_runner::skill_startup_reconcile::spawn_startup_reconcile();
         }
 
         // 🔥 4. 同时等待 gRPC（如果有）和信号

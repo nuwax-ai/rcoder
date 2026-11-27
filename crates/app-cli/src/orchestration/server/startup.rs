@@ -78,7 +78,7 @@ pub async fn owner_serve(
     args: &RuntimeArgs,
     state_root: std::path::PathBuf,
     application_id: String,
-    session: std::sync::Arc<runtime_supervisor::OwnerSession>,
+    session: Arc<runtime_supervisor::OwnerSession>,
     run_mode: bool,
 ) -> Result<()> {
     let normalized = args.for_management()?;
@@ -362,7 +362,7 @@ pub async fn owner_serve(
         )
         .await
         .context("owner exit has unsettled admitted configuration writes")?;
-    if let Err(error) = crate::services::supervisor::resident::shutdown().await {
+    if let Err(error) = supervisor::resident::shutdown().await {
         state.begin_failure(
             format!("owner resident shutdown unconfirmed: {error:#}"),
             true,
@@ -418,12 +418,12 @@ impl runtime_supervisor::OwnerCleanup for OwnerResidentCleanup {
             tokio::time::timeout_at(deadline, crate::proxy::compiler::publication_guard())
                 .await
                 .map_err(|error| {
-                    crate::supervisor::ShutdownUnconfirmed(format!(
+                    supervisor::ShutdownUnconfirmed(format!(
                         "owner publication control remains unsettled at shutdown deadline: {error}"
                     ))
                 })?;
         crate::proxy::compiler::wait_for_file_replacements_until(deadline).await?;
-        if crate::services::supervisor::resident::owner_scope_root()?.is_none() {
+        if supervisor::resident::owner_scope_root()?.is_none() {
             let session = self
                 .session
                 .upgrade()
@@ -434,23 +434,23 @@ impl runtime_supervisor::OwnerCleanup for OwnerResidentCleanup {
             )
             .await
             .map_err(|error| {
-                crate::supervisor::ShutdownUnconfirmed(format!(
+                supervisor::ShutdownUnconfirmed(format!(
                     "owner cleanup capability was not confirmed before its deadline: {error}"
                 ))
             })??;
-            crate::services::supervisor::resident::bind_owner(scope, &self.args)?;
+            supervisor::resident::bind_owner(scope, &self.args)?;
         }
         if let Some(host) = SupervisordHost::from_env_until(deadline).await? {
-            let scope = crate::services::supervisor::resident::owner_scope()?
+            let scope = supervisor::resident::owner_scope()?
                 .context("supervisord owner cleanup capability missing")?;
             let runtime_root = crate::proxy::compiler::runtime_root(&self.args.log_dir)?;
             host.shutdown_owner_entry_until(&runtime_root, &scope, deadline)
                 .await?;
         }
-        tokio::time::timeout_at(deadline, crate::services::supervisor::resident::shutdown())
+        tokio::time::timeout_at(deadline, supervisor::resident::shutdown())
             .await
             .map_err(|error| {
-                crate::supervisor::ShutdownUnconfirmed(format!(
+                supervisor::ShutdownUnconfirmed(format!(
                     "owner resident shutdown remains unconfirmed at its deadline: {error}"
                 ))
             })?
@@ -464,8 +464,8 @@ impl Drop for DegradeManagementOnDrop<'_> {
     fn drop(&mut self) {
         if self.0.initializing() {
             self.0.mark_initialized();
-            if matches!(self.0.phase(), crate::server::ServerPhase::Idle) {
-                self.0.set_phase(crate::server::ServerPhase::Failed(
+            if matches!(self.0.phase(), ServerPhase::Idle) {
+                self.0.set_phase(ServerPhase::Failed(
                     "business initialization failed; management degraded but queryable".into(),
                 ));
             }
@@ -491,11 +491,11 @@ async fn business_session(
     args: RuntimeArgs,
     state_root: std::path::PathBuf,
     state: Arc<ServerState>,
-    session: std::sync::Arc<runtime_supervisor::OwnerSession>,
+    session: Arc<runtime_supervisor::OwnerSession>,
     launch: runtime_supervisor::BusinessLaunch,
     foreground: bool,
 ) -> Result<()> {
-    let driver_reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let driver_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let result = business_session_inner(
         args,
         state_root,
@@ -526,17 +526,17 @@ async fn business_session_inner(
     mut args: RuntimeArgs,
     state_root: std::path::PathBuf,
     state: Arc<ServerState>,
-    session: std::sync::Arc<runtime_supervisor::OwnerSession>,
+    session: Arc<runtime_supervisor::OwnerSession>,
     launch: runtime_supervisor::BusinessLaunch,
     foreground: bool,
-    driver_reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    driver_reached: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let ready_guard = session.ready_guard(&launch.generation);
     // R3：业务初始化失败的任何路径都不得把管理面永久留在 initializing
     //（deploy/status 503 → file-server 预检 90s 超时）——失败即降级开放
     // 管理查询（phase=Failed 承载原因），Stop/身份仍可用。
     let _degrade_on_error = DegradeManagementOnDrop(&state);
-    if crate::services::supervisor::resident::owner_scope_root()?.is_none() {
+    if supervisor::resident::owner_scope_root()?.is_none() {
         let application_id = state
             .runtime_kernel()
             .context("resident requires runtime identity")?
@@ -544,7 +544,7 @@ async fn business_session_inner(
             .application_id
             .clone();
         let scope = session.resident_scope(&application_id).await?;
-        crate::services::supervisor::resident::bind_owner(scope, &args)?;
+        supervisor::resident::bind_owner(scope, &args)?;
     }
     // RV04：停止交接状态在 admission 线性化点内探测（durable intent +
     // operation_id；phase 由 launch 保留 Stopped 终态），不再用会话外
@@ -591,7 +591,7 @@ async fn business_session_inner(
     let signal_state = state.clone();
     let signal_task = tokio::spawn(async move {
         tokio::select! {
-            () = crate::supervisor::sigterm_watch() => {},
+            () = supervisor::sigterm_watch() => {},
             _ = tokio::signal::ctrl_c() => {},
         }
         // Serialize with any already accepted blocking journal commit.
@@ -1093,7 +1093,7 @@ async fn business_session_inner(
 /// 清空 operation_id，使已完成的停止不构成在途交接；该探测在 admission
 /// 线性化点内执行，与 WorkerControl::shutdown 的"先取锁再取消"配合，
 /// 取消令牌换代不再丢弃已受理的停止。
-fn stop_handover_in_progress(session: &std::sync::Arc<runtime_supervisor::OwnerSession>) -> bool {
+fn stop_handover_in_progress(session: &Arc<runtime_supervisor::OwnerSession>) -> bool {
     let snapshot = session.snapshot();
     snapshot.operation_id.is_some()
         && matches!(
@@ -1196,7 +1196,7 @@ async fn serve_supervised_worker(
     let signal_state = state.clone();
     let signal_task = tokio::spawn(async move {
         tokio::select! {
-            () = crate::supervisor::sigterm_watch() => {},
+            () = supervisor::sigterm_watch() => {},
             _ = tokio::signal::ctrl_c() => {},
         }
         let closer = signal_state.clone();
@@ -1643,7 +1643,7 @@ pub(super) async fn finish_clean_shutdown(
         "configuration writes remain unsettled; shutdown cannot be acknowledged"
     );
     anyhow::ensure!(
-        !crate::supervisord_host::SupervisordHost::mutations_pending()?,
+        !SupervisordHost::mutations_pending()?,
         "dispatched supervisor writes remain unsettled; shutdown cannot be acknowledged"
     );
     anyhow::ensure!(
@@ -1736,7 +1736,7 @@ mod kernel_startup_tests;
 /// 装配运行操作内核（serve 专用；dispatch 把内核动作翻译进既有执行通道）。
 pub(super) async fn assemble_runtime_kernel(
     state: &Arc<ServerState>,
-    args: &crate::config::RuntimeArgs,
+    args: &RuntimeArgs,
 ) -> Result<Arc<crate::runtime_kernel::RuntimeKernel>> {
     use crate::runtime_kernel::{DispatchAction, RuntimeKernel, RuntimeStore};
     let application_id = std::env::var("PROJECT_ID")
@@ -2407,7 +2407,7 @@ async fn wait_business_management(
 pub(super) async fn establish_startup_quiescence(
     state: &ServerState,
     supervised: bool,
-    stop_owned: impl std::future::Future<Output = Result<()>>,
+    stop_owned: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     if !supervised {
         let guard = state

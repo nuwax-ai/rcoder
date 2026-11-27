@@ -8,6 +8,9 @@ repository.workspace = true
 
 [features]
 default = []
+# 测试辅助面（仅供 rcoder-engine 的 dev-dependencies 打开）：暴露构造
+# "历史版本数据/人工 SQL"形态的测试钩子，不进入生产构建。
+test-support = []
 # deploy-host 宿主机运行形态（lookup 分支）
 deploy-host = ["shared_types/deploy-host"]
 

@@ -348,14 +348,13 @@ impl AgentHttpService for LocalAgentHttpService {
                 "session_id belongs to a different project",
             );
         }
-        match target.status {
-            shared_types::AgentStatus::Idle | shared_types::AgentStatus::Terminating => {
-                return HttpResult::success(RcoderAgentCancelResponse {
-                    success: true,
-                    session_id,
-                });
-            }
-            shared_types::AgentStatus::Active | shared_types::AgentStatus::Pending => {}
+        // 没有正在执行的回合（Idle / Terminating）时取消幂等成功；只有
+        // is_processing()（Active / Pending）才需要真正发取消信号。
+        if !target.status.is_processing() {
+            return HttpResult::success(RcoderAgentCancelResponse {
+                success: true,
+                session_id,
+            });
         }
         if target.cancel_tx.is_closed() {
             return HttpResult::error(

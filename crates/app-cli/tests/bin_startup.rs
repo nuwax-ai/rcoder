@@ -483,14 +483,14 @@ fn serve_attach_without_existing_instance_starts_as_owner() {
     command.arg("--attach");
     let mut child = command.spawn().expect("spawn attach serve");
     // 等待足够时间让进程完成 attach 检测（无实例 → serve_without_attach）
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    std::thread::sleep(Duration::from_secs(3));
     // 进程应该仍然存活（进入了 serve 流程，不会立即因 attach 失败退出）
     assert!(
         child.try_wait().expect("try_wait").is_none(),
         "attach without existing instance should proceed to serve, not exit immediately"
     );
-    let _ = child.kill();
-    let _ = child.wait();
+    let _unused = child.kill();
+    let _unused = child.wait();
 }
 
 /// P2-08：serve --attach 身份不匹配 → 立即退出（exit 1）。
@@ -519,7 +519,7 @@ fn serve_attach_identity_mismatch_exits_fast() {
             axum::serve(listener, app).await.unwrap();
         });
     });
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(500));
 
     let (_dir, workspace) = temp_workspace();
     write_lock(&workspace, MINIMAL_LOCK);
@@ -573,16 +573,16 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
                 !status.success(),
                 "loser must exit non-zero (owner lock / bind conflict)"
             );
-            let _ = first.kill();
-            let _ = first.wait();
+            let _unused = first.kill();
+            let _unused = first.wait();
             return;
         }
         if second_healthy && !first_alive {
             // 反向胜出：second 存活健康、first 已退出非零
             let status = first.wait().unwrap();
             assert!(!status.success(), "loser must exit non-zero");
-            let _ = second.kill();
-            let _ = second.wait();
+            let _unused = second.kill();
+            let _unused = second.wait();
             return;
         }
         std::thread::sleep(Duration::from_millis(200));

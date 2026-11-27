@@ -1,5 +1,8 @@
 //! Native Turso/real-file-lease worker: unreceipted legacy marker safety only.
 //! Does not prove recovery of the newer receipted terminal release protocol.
+//! Marker semantics follow aafff772: under an acquirable flock a nonempty
+//! marker is a dead holder's remnant — controlled reclaim (with archive),
+//! not a permanent fence.
 use anyhow::{Context, Result, bail};
 use rcoder_storage::userapp_lifecycle::TursoUserAppStore;
 use shared_types::{
@@ -78,8 +81,10 @@ async fn execute(root: &Path, store: &TursoUserAppStore) -> Result<()> {
         .create_new(true)
         .open(root.join("operation.lock"))?;
     file.lock()?;
+    // check_clean 已由 reclaim_orphaned 取代（aafff772）。此处锁文件由
+    // create_new 排他新建、必为空，`begin` 自身即拒绝外来非空标记，
+    // 无需也不应在失败前截断任何内容。
     let marker = AppFileMutationMarker::for_operation(&operation.operation_id)?;
-    AppFileMutationMarker::check_clean(&file)?;
     marker.begin(&file)?;
     let mut running = store
         .advance(&progress(
@@ -155,22 +160,35 @@ async fn verify(root: &Path, store: &TursoUserAppStore) -> Result<()> {
         .read(true)
         .write(true)
         .open(root.join("operation.lock"))?;
-    file.lock()?; // SIGKILL released the OS lock, but not durable mutation ownership.
-    if AppFileMutationMarker::check_clean(&file).is_ok() {
+    file.lock()?; // SIGKILL released the OS lock; flock 可获取即证明旧持有者已停。
+    // aafff772 语义：遗留非空 marker 是死者遗物，不再是永久围栏——受控回收
+    // 读回孤儿 ID（归档留证）后清零；静默消失才是缺陷。归档命名与生产调用点
+    // （operation_lock / file_lease）一致：`<lock>.orphaned`。
+    let archive = root.join("operation.lock").with_extension("lock.orphaned");
+    let Some(orphan) = AppFileMutationMarker::reclaim_orphaned(&file, Some(&archive))? else {
         bail!("abandoned durable marker was silently cleared");
+    };
+    if orphan.trim() != operation.operation_id {
+        bail!(
+            "orphan marker owner mismatch: expected {}, got {orphan}",
+            operation.operation_id
+        );
+    }
+    if !archive.exists() {
+        bail!("orphan marker reclaim did not archive recovery evidence");
     }
     let next = AppFileMutationMarker::for_operation("replacement-operation")?;
-    if next.begin(&file).is_ok()
-        || std::fs::read_to_string(root.join("operation.lock"))? != operation.operation_id
-    {
-        bail!("replacement executor reclaimed the unfinished file marker");
+    next.begin(&file)
+        .context("replacement executor failed to retake reclaimed marker")?;
+    if std::fs::read_to_string(root.join("operation.lock"))? != "replacement-operation" {
+        bail!("reclaimed marker was not retaken by replacement executor");
     }
     if root.join("payload").exists() || std::fs::read(root.join("execution-count"))? != b"1" {
         bail!("completed side effect was repeated or restored");
     }
     println!(
         "{}",
-        serde_json::json!({"terminal_not_reexecuted": true, "marker_retained": true,
+        serde_json::json!({"terminal_not_reexecuted": true, "marker_orphan_reclaimed": true,
         "operation_id": operation.operation_id, "evidence_level": "native_process_turso_file_lease"})
     );
     Ok(())

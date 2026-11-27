@@ -12,7 +12,7 @@ pub(crate) fn previous_binding(workspace: &Path, state_root: &Path) -> Result<Op
         return Ok(None);
     };
     // Readable foreign identity is not stale metadata for this application.
-    let _ = read_identity(&managed, false)?;
+    let _unused = read_identity(&managed, false)?;
     let path = state_root.join("supervisor.json");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,

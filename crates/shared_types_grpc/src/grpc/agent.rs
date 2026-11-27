@@ -555,6 +555,35 @@ pub struct GetContainerStatusRequest {
     /// 降级为缺省），防止状态与资源聚合自不同换代的执行。旧调用方不填，行为不变。
     #[prost(string, optional, tag = "3")]
     pub expected_session_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// 是否返回容器内进程明细（默认 false——旧调用方零开销）
+    #[prost(bool, optional, tag = "4")]
+    pub include_processes: ::core::option::Option<bool>,
+}
+/// 容器内 agent 执行的聚合（进程组维度，与容器 cgroup 维度分开统计）
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentExecution {
+    /// 该执行所属 project（同一 user 容器可并存多个 project，重启需按它定位）
+    #[prost(string, tag = "6")]
+    pub project_id: ::prost::alloc::string::String,
+    /// 当前执行的会话 ID
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// 执行状态：Processing / Idle / Terminating
+    #[prost(string, tag = "2")]
+    pub status: ::prost::alloc::string::String,
+    /// agent 进程组 RSS 合计（字节，含其 MCP 子进程）
+    #[prost(uint64, tag = "3")]
+    pub rss_bytes: u64,
+    /// agent 进程组**累计** CPU 秒（utime+stime）。
+    /// 刻意给累计值而非百分比：百分比需要服务端保存差分基线，多个消费者
+    /// （面板轮询 + 平台自身查询）会互相改写基线、拿到 None 或失真值。
+    /// 累计值无状态，任意多个消费者可各自差分。
+    #[prost(double, tag = "4")]
+    pub cpu_seconds: f64,
+    /// agent 进程组内进程数
+    #[prost(uint32, tag = "5")]
+    pub process_count: u32,
 }
 /// 容器状态响应
 #[allow(clippy::all)]
@@ -595,6 +624,59 @@ pub struct GetContainerStatusResponse {
     /// 容器 CPU 核数限额（cgroup cpu.max quota/period；未设限或缺省为 None）
     #[prost(double, optional, tag = "11")]
     pub container_cpu_limit_cores: ::core::option::Option<f64>,
+    /// 容器内进程明细（按 RSS 降序 top N；仅请求 include_processes 时填充）
+    #[prost(message, repeated, tag = "12")]
+    pub processes: ::prost::alloc::vec::Vec<ContainerProcess>,
+    /// 容器内进程总数
+    #[prost(int32, optional, tag = "13")]
+    pub process_count: ::core::option::Option<i32>,
+    /// 桌面/系统 RSS（字节，永不淘汰组）
+    #[prost(uint64, optional, tag = "14")]
+    pub infra_rss_bytes: ::core::option::Option<u64>,
+    /// 平台服务 RSS（字节，永不淘汰组：claude/MCP/file-server）
+    #[prost(uint64, optional, tag = "15")]
+    pub platform_rss_bytes: ::core::option::Option<u64>,
+    /// 会话工作负载 RSS（字节，看门狗可淘汰范围）
+    #[prost(uint64, optional, tag = "16")]
+    pub workload_rss_bytes: ::core::option::Option<u64>,
+    /// 当前 project 是否有已注册的 agent 执行（与资源采集是否降级无关）。
+    /// 观测端据此判断"agent 在不在"，不能用 cpu_percent/memory_mb 推断——
+    /// 那两个字段在采集降级时同样为 None，会把活着的 agent 显示成已退出。
+    #[prost(bool, optional, tag = "17")]
+    pub agent_present: ::core::option::Option<bool>,
+    /// 容器内**所有** agent 执行的进程组聚合（仅请求 include_processes 时填充）。
+    ///
+    /// 刻意是列表：一个 user 容器可并存多个 project（工作目录 /home/user/<id>），
+    /// 每个 project 有独立的 agent 进程组。只报一个会让多会话场景漏报。
+    ///
+    /// 供观测端用**新接口**拿到 agent 维度数据，无需再调 /computer/agent/status
+    /// ——那个接口的 cpu_percent 是服务端差分，外部轮询会干扰它的基线。
+    #[prost(message, repeated, tag = "18")]
+    pub agents: ::prost::alloc::vec::Vec<AgentExecution>,
+}
+/// 容器内单进程快照（资源观测用）
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ContainerProcess {
+    #[prost(uint32, tag = "1")]
+    pub pid: u32,
+    #[prost(uint32, tag = "2")]
+    pub ppid: u32,
+    /// 内核 comm（≤15 字符，可能被进程改写）
+    #[prost(string, tag = "3")]
+    pub comm: ::prost::alloc::string::String,
+    /// RSS（字节）
+    #[prost(uint64, tag = "4")]
+    pub rss_bytes: u64,
+    /// 累计 CPU 时间（秒，utime+stime）
+    #[prost(double, tag = "5")]
+    pub cpu_seconds: f64,
+    /// 角色分组：infra | platform | workload（与看门狗保护语义对齐）
+    #[prost(string, tag = "6")]
+    pub group: ::prost::alloc::string::String,
+    /// 命令行前缀（≤120 字符）
+    #[prost(string, tag = "7")]
+    pub args_head: ::prost::alloc::string::String,
 }
 /// VNC 状态查询请求
 #[allow(clippy::all)]

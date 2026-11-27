@@ -6,7 +6,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "UserApp domain (build/tasks/dev-server/file mirror APIs) split from file-server; assembles full/container routers"
-homepage.workspace = true
 repository.workspace = true
 publish.workspace = true
 
@@ -24,7 +23,7 @@ file-server = { workspace = true }
 # 共享类型（HttpResult 信封 / manifest / BuildProgressEvent / userapp 常量）
 shared_types = { workspace = true }
 userapp-log-reader = { workspace = true }
-runtime-state-layout = { path = "../runtime-state-layout" }
+runtime-state-layout = { workspace = true }
 # 前端框架探测（framework-info 接口的探测引擎，纯函数独立 crate）
 frontend-detector = { workspace = true }
 

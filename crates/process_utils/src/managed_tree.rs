@@ -277,15 +277,34 @@ impl ManagedChild {
     async fn await_tree_exit(&mut self, budget: Duration) -> Option<ExitStatus> {
         let deadline = tokio::time::Instant::now() + budget;
         let mut root_status: Option<ExitStatus> = None;
+        // codex follow-up（2026-11-20）：ps 观察持续失败时 20ms 固定重试会把
+        // 失败探测放大成高频 ps 风暴（本机实测 1s 21 次）。观察失败保守按
+        // 存活，但重试间隔指数退避（100ms→2s 封顶），观察恢复即重置。
+        let mut failure_backoff = Duration::from_millis(100);
         loop {
             if root_status.is_none() {
                 root_status = self.try_wait_root().ok().flatten();
             }
-            if let Some(status) = root_status
-                && !self.process_group_alive(deadline).await
-            {
-                self.quiescent_exit = Some(status);
-                return self.finish_confirmed_root().await;
+            match self.observe_group_alive(deadline).await {
+                Some(false) => {
+                    if let Some(status) = root_status {
+                        self.quiescent_exit = Some(status);
+                        return self.finish_confirmed_root().await;
+                    }
+                    failure_backoff = Duration::from_millis(100);
+                }
+                Some(true) => {
+                    failure_backoff = Duration::from_millis(100);
+                }
+                None => {
+                    let now = tokio::time::Instant::now();
+                    if now + failure_backoff >= deadline {
+                        return None;
+                    }
+                    tokio::time::sleep_until(deadline.min(now + failure_backoff)).await;
+                    failure_backoff = (failure_backoff * 2).min(Duration::from_secs(2));
+                    continue;
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 return None;
@@ -297,17 +316,16 @@ impl ManagedChild {
         }
     }
 
-    /// 进程组是否仍有存活成员（观察失败按存活处理——保守不误报收束）。
+    /// 三值观察：Some(alive) = 观察成功；None = 观察失败（保守按存活，
+    /// 由调用方决定退避策略）。
     #[cfg(unix)]
-    async fn process_group_alive(&self, deadline: tokio::time::Instant) -> bool {
-        let Some(pid) = self.pid else {
-            return true;
-        };
+    async fn observe_group_alive(&self, deadline: tokio::time::Instant) -> Option<bool> {
+        let pid = self.pid?;
         match tokio::time::timeout_at(deadline, crate::execution_tree::has_live_group_members(pid))
             .await
         {
-            Ok(Ok(live)) => live,
-            Ok(Err(_)) | Err(_) => true,
+            Ok(Ok(live)) => Some(live),
+            Ok(Err(_)) | Err(_) => None,
         }
     }
 

@@ -27,7 +27,7 @@ async fn proxy_stop_exact_consumes_the_absolute_deadline_at_read_and_reload() {
                 } else {
                     "<methodResponse><params><param><value><array><data/></array></value></param></params></methodResponse>"
                 };
-                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                let _unused = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
             }
         });
         let host = SupervisordHost::protocol_fixture(socket, root.path().join("dynamic.conf"));
@@ -60,7 +60,7 @@ async fn proxy_stop_exact_consumes_the_absolute_deadline_at_read_and_reload() {
             start.elapsed()
         );
         server.abort();
-        let _ = server.await;
+        let _unused = server.await;
     }
 }
 
@@ -109,7 +109,7 @@ fn start_phase_deadline(slow: &'static str) {
                         method => panic!("unexpected mutation after deadline: {method}"),
                     };
                     let body = format!("<methodResponse><params><param><value>{value}</value></param></params></methodResponse>");
-                    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                    let _unused = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
                 }
             });
             let host = SupervisordHost::protocol_fixture(socket, root.join("dynamic.conf"));
@@ -126,7 +126,7 @@ fn start_phase_deadline(slow: &'static str) {
             host.client.wait_mutations_until(tokio::time::Instant::now() + std::time::Duration::from_secs(1)).await.unwrap();
             assert!(process_host.current.is_none(), "a late reply cannot alter request outcome");
             server.abort();
-            let _ = server.await;
+            let _unused = server.await;
             supervisor::resident::shutdown().await.unwrap();
             drop(lease);
             owner_test_context::restore_spec_env(saved);

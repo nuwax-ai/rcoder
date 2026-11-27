@@ -164,16 +164,41 @@ async fn confirmed_hot_failure_releases_ownership_while_pending_and_foreign_stat
             )
             .await;
             assert!(result.is_err());
-            let next = service
-                .try_acquire_process_release_lock("hotterminal")
-                .await;
-            assert_eq!(
-                next.is_ok(),
-                release,
-                "k8s={kubernetes}, phase={phase}, recovery={recovery:?}, persisted={persisted}, stage={stage}"
-            );
-            if let Ok(next) = next {
-                next.finish().await.expect("release next");
+            if kubernetes {
+                // K8s 形态无文件 marker:保留/释放由运行时租约承载,语义不变
+                // (未释放的持有可能仍在变更,获取按租约围栏拒绝)。
+                let next = service
+                    .try_acquire_process_release_lock("hotterminal")
+                    .await;
+                assert_eq!(
+                    next.is_ok(),
+                    release,
+                    "k8s={kubernetes}, phase={phase}, recovery={recovery:?}, persisted={persisted}, stage={stage}"
+                );
+                if let Ok(next) = next {
+                    next.finish().await.expect("release next");
+                }
+            } else {
+                let marker = std::path::Path::new(&service.config.operation_lock_root)
+                    .join(".app-operation-locks/prod-hotterminal.lock");
+                // Docker 形态:释放区分仍由完成路径决定——确认的终局失败清
+                // marker,未决/外来状态保留物理证据(文件非空)。
+                assert_eq!(
+                    std::fs::read(&marker)
+                        .map(|content| content.is_empty())
+                        .unwrap_or(true),
+                    release,
+                    "k8s={kubernetes}, phase={phase}, recovery={recovery:?}, persisted={persisted}, stage={stage}"
+                );
+                // 保留的孤儿 marker 不再永久拦截(修复前未释放分支在此永久
+                // Conflict):下一次获取受控回收并继续,对账由记录层承担。
+                service
+                    .try_acquire_process_release_lock("hotterminal")
+                    .await
+                    .expect("next writer reclaims the retained marker")
+                    .finish()
+                    .await
+                    .expect("release next");
             }
         }
     }

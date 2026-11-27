@@ -110,8 +110,8 @@ impl Drop for OwnedCli {
         if let Some(mut child) = self.0.take()
             && matches!(child.try_wait(), Ok(None))
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _unused = child.kill();
+            let _unused = child.wait();
         }
     }
 }
@@ -302,7 +302,7 @@ fn supervised_stop_kills_term_ignoring_grandchild_and_releases_ports() {
         Duration::from_secs(10),
     );
     let second_pid = second.0.as_mut().expect("owned child").id();
-    let _ = Command::new("kill")
+    let _unused = Command::new("kill")
         .args(["-TERM", &second_pid.to_string()])
         .status();
     let second_child = second.0.as_mut().expect("owned child");
