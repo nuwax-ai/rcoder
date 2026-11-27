@@ -16,8 +16,8 @@ use super::container_params::ContainerCreateParams;
 use super::types::{
     AgentPodDiagnostic, AppEventInfo, ContainerLogEntry, ContainerRuntimeError,
     ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus,
-    ExecResult, LogDirectoryMounts, RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo,
-    StorageResizeOutcome,
+    ExecResult, LogDirectoryMounts, ReclaimPermit, ReclaimRefused, RemovedContainerInfo, ResourceUsage,
+    RuntimeContainerInfo, StorageResizeOutcome,
 };
 
 // mpsc 仍在 lib.rs re-export（`container_runtime_api::mpsc::Receiver` 被 docker_manager /
@@ -766,6 +766,35 @@ pub trait AgentContainerRuntime: Send + Sync {
     ) -> ContainerRuntimeResult<LogDirectoryMounts> {
         Err(ContainerRuntimeError::ConfigurationError(
             "log directory mount inventory is not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// Take permission to delete one candidate log directory. Call it as
+    /// the last step before deleting the directory and hold the permit
+    /// until the deletion has returned. Candidates are in the RCoder
+    /// process's filesystem namespace, as above.
+    ///
+    /// The inventory is one snapshot. A creator that registers a path after
+    /// the snapshot was taken is invisible to it, and a creator that
+    /// replays an expired directory may do exactly that. This call closes
+    /// that race: it is one atomic step with the creators' registration.
+    ///
+    /// - A creator has already registered the candidate, or a path below
+    ///   it: [`ReclaimRefused::InUse`]. The caller keeps the directory.
+    /// - The runtime cannot decide: [`ReclaimRefused::Unconfirmed`]. Keep
+    ///   it.
+    /// - Otherwise a permit is returned, and until it is dropped a creator
+    ///   that registers the candidate waits for the deletion to finish
+    ///   instead of binding a directory that is being removed.
+    ///
+    /// Like the inventory, the default refuses: an unsupported runtime
+    /// must never delete.
+    async fn begin_log_directory_reclaim(
+        &self,
+        _candidate: &std::path::Path,
+    ) -> Result<ReclaimPermit, ReclaimRefused> {
+        Err(ReclaimRefused::Unconfirmed(
+            "log directory reclaim is not supported by this runtime".to_string(),
         ))
     }
 

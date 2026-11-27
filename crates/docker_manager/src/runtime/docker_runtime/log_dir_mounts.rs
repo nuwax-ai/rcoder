@@ -62,15 +62,21 @@
 //! 创建方判不出在不在日志根里的 bind 源也登记在这里（它用的是同一个走法，对这条源同样判不
 //! 出来，所以不让创建失败，改为登记）。这样的源定不了位，本轮所有候选都保留——确认不了就不删。
 //!
-//! 登记只对"这一轮读到的"有效：创建方在取完登记之后才登记的，这一轮看不到（见
-//! `crate::log_directory::pending` 的边界）。所以清理器删之前的复查不能省，创建方也不复用
-//! 过期目录。
+//! 登记只对"这一轮读到的"有效：创建方在取完登记之后才登记的，这一轮看不到。所以清理器删
+//! 每个目录之前还要回来确认一次（[`begin_reclaim`]）：判定和取清单时是同一个（[`classify`]），
+//! 只把 Docker 清单换成登记本身。
+//!
+//! 确认分两步，顺序不能反：先给目录打上"正在删"的标记，再核对登记。标记之后才登记的创建方
+//! 一定看得到标记、会等这次删除结束，所以核对时登记里没有就是真没有。反过来先核对再打标记，
+//! 两步之间登记的创建方两头都看不到。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use bollard::models::ContainerSummary;
-use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult, LogDirectoryMounts};
+use container_runtime_api::{
+    ContainerRuntimeError, ContainerRuntimeResult, LogDirectoryMounts, ReclaimPermit, ReclaimRefused,
+};
 use tokio::sync::OnceCell;
 
 use super::host_path_space::{
@@ -321,6 +327,41 @@ pub(super) async fn mounted_log_directories(
         }
     }
     Ok(mounts)
+}
+
+/// 清理器删一个候选目录之前的最后一次确认，见模块说明"正在准备挂载的目录"。
+///
+/// 许可（[`ReclaimPermit`]）由调用方拿到删除结束：它 drop 时才解除"正在删"的标记，登记着
+/// 这个目录的创建方也在那之前一直等
+pub(super) async fn begin_reclaim(
+    manager: &DockerManager,
+    log_path_resolver: &OnceCell<HostPathResolver>,
+    candidate: &Path,
+) -> Result<ReclaimPermit, ReclaimRefused> {
+    let space = path_space(manager, log_path_resolver)
+        .await
+        .map_err(|error| ReclaimRefused::Unconfirmed(error.to_string()))?;
+    let registered = match space.to_host(candidate) {
+        Ok(path) => crate::normalize_path(&path),
+        Err(error) => return Err(ReclaimRefused::Unconfirmed(mapping_failure(&error))),
+    };
+    let mark = crate::log_directory::mark_reclaim(&registered)
+        .map_err(ReclaimRefused::Unconfirmed)?;
+    let fs = LocalFileSystem;
+    let observations = observe(
+        &space,
+        &crate::log_directory::pending_bind_sources(),
+        &fs,
+    )
+    .await;
+    match classify(candidate, &space, &observations, &fs).await {
+        LogDirMount::Unmounted => Ok(ReclaimPermit::release_on_drop(move || drop(mark))),
+        LogDirMount::Mounted => Err(ReclaimRefused::InUse(format!(
+            "a starting container has registered {} or a path below it",
+            registered.display()
+        ))),
+        LogDirMount::Unconfirmed(reason) => Err(ReclaimRefused::Unconfirmed(reason)),
+    }
 }
 
 #[cfg(test)]

@@ -996,6 +996,16 @@ impl AgentContainerRuntime for DockerRuntime {
             .await
     }
 
+    async fn begin_log_directory_reclaim(
+        &self,
+        candidate: &std::path::Path,
+    ) -> Result<
+        container_runtime_api::ReclaimPermit,
+        container_runtime_api::ReclaimRefused,
+    > {
+        log_dir_mounts::begin_reclaim(&self.inner, &self.log_path_resolver, candidate).await
+    }
+
     /// Docker 基础诊断：find_container → docker inspect → 读 State(OOMKilled/exit_code/running)。
     /// 用于 gRPC 连接失败时的根因识别（OOM / 容器不在），生成精准友好错误，而非裸 transport error。
     /// inspect 失败(容器重建中等)→ 返回默认诊断(无根因)，调用方按"保留原文"处理，不误判。
