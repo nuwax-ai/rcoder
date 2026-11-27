@@ -11,7 +11,7 @@ use super::templates::{directory_visible_to_this_process, path_after_resolved_ba
 use super::{HostPathLookup, MountContext};
 use crate::DockerError;
 use crate::container_builder::ContainerConfigBuilder;
-use crate::log_directory::PendingBinds;
+use crate::log_directory::{LOG_MOUNTS_LABEL, LogMountRecord, PendingBinds, encode_log_mounts};
 use crate::runtime::docker_runtime::host_path_space::{LogDomainAdmission, LogDomainVerdict};
 
 /// 按配置逐条加挂载。`auto_injected_paths` 是自动注入已经占用的容器内路径；新建的日志目录
@@ -53,6 +53,9 @@ pub(super) async fn add_config_mounts(
 
     // 缓存已解析的路径，避免重复解析
     let mut resolved_paths_cache: HashMap<String, std::path::PathBuf> = HashMap::new();
+    // RCoder 为这个容器独占新建了目录的日志挂载。记到容器的 label 上：之后重启它时，只有记录
+    // 里的挂载才换成新目录
+    let mut created_log_mounts: Vec<LogMountRecord> = Vec::new();
 
     // 添加配置文件中定义的挂载点
     for mount_config in &service_config.mounts {
@@ -174,6 +177,10 @@ pub(super) async fn add_config_mounts(
             mount_variables.insert("log_dir_name".to_string(), log_dir_name.clone());
             resolved_host_path = resolve_host_path(&mount_variables);
             resolved_container_path = resolve_container_path(&mount_variables);
+            created_log_mounts.push(LogMountRecord {
+                target: resolved_container_path.clone(),
+                source: resolved_host_path.clone(),
+            });
         }
         if reclaimable || unclassified {
             pending_binds
@@ -233,6 +240,9 @@ pub(super) async fn add_config_mounts(
             container_path: resolved_container_path,
             read_only: mount_config.read_only,
         });
+    }
+    if !created_log_mounts.is_empty() {
+        builder = builder.label(LOG_MOUNTS_LABEL, encode_log_mounts(&created_log_mounts));
     }
 
     Ok(builder)

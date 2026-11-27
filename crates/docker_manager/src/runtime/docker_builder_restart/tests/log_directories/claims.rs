@@ -4,8 +4,9 @@
 
 use super::*;
 
-/// 日志挂载的源判不出在不在日志根里（它经过一个指到 RCoder 挂载之外的符号链接），但归档能核实
-/// 它是日志挂载：照样换新目录。日志目录是一次性的，旧的那个可能早已过期、清理器正在回收。
+/// 日志挂载的源判不出在不在日志根里（它经过一个指到 RCoder 挂载之外的符号链接），但归档的
+/// 记录能核实它是日志挂载：照样换新目录。日志目录是一次性的，旧的那个可能早已过期、清理器正在
+/// 回收。
 #[tokio::test]
 async fn a_log_mount_that_cannot_be_classified_gets_a_new_directory() {
     let mut restart = LoggedRestart::new();
@@ -38,6 +39,7 @@ async fn a_log_mount_that_cannot_be_classified_gets_a_new_directory() {
         }
     }
     restart.archive.binds[0] = format!("{old_directory}:{LOG_TARGET}:rw,z");
+    restart.re_record(LOG_TARGET, &old_directory);
     let daemon = scripted(creation_script(step(
         "POST",
         "/containers/create",
@@ -89,8 +91,8 @@ async fn a_log_mount_that_cannot_be_classified_gets_a_new_directory() {
     );
 }
 
-/// 判不出来时换新目录只是尽量：那个位置被别的挂载挡住、RCoder 看不到，新目录建不出来，就照
-/// 原样重放并登记旧目录。不让恢复失败。
+/// 记录里的日志挂载、源却在日志根之外：换新目录只是尽量。那个位置被别的挂载挡住、RCoder 看
+/// 不到，新目录建不出来，就照原样重放并登记旧目录。不让恢复失败。
 #[tokio::test]
 async fn an_evidenced_log_mount_that_cannot_get_a_new_directory_is_replayed() {
     let mut restart = LoggedRestart::new();
@@ -111,6 +113,7 @@ async fn an_evidenced_log_mount_that_cannot_get_a_new_directory_is_replayed() {
         }
     }
     restart.archive.binds[0] = format!("{old_directory}:{LOG_TARGET}:rw,z");
+    restart.re_record(LOG_TARGET, &old_directory);
     let seen_at_create = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&seen_at_create);
     let daemon = scripted_with_hook(
@@ -141,6 +144,14 @@ async fn an_evidenced_log_mount_that_cannot_get_a_new_directory_is_replayed() {
     );
     assert!(daemon.body(4)["Labels"][RESTART_LOG_DIR].is_null());
     assert_eq!(replacement.expected_volumes, restart.template.volumes);
+    // 没换成：替代容器的日志挂载记录还是归档里那一条，源没变。下次重启它，照样认得出
+    assert_eq!(
+        daemon.body(4)["Labels"][LOG_MOUNTS_LABEL]
+            .as_str()
+            .and_then(|label| serde_json::from_str::<Value>(label).ok()),
+        Some(json!([{ "target": LOG_TARGET, "source": old_directory }])),
+        "a replayed log mount keeps its archived record"
+    );
     // 旧目录的源登记到替代容器建出来
     let seen = seen_at_create.lock().unwrap().clone();
     assert!(seen.contains(&PathBuf::from(&old_directory)), "{seen:?}");

@@ -4,14 +4,18 @@
 use super::*;
 
 /// 换源计划被拒绝时，原容器一根手指都不碰：能提前定的都定在动旧容器之前，连 Docker 都不问。
+/// 这里用"记录里的日志挂载在归档里却没有挂载见证"把计划拒掉。
 #[tokio::test]
 async fn a_refused_plan_leaves_the_retained_original_in_place() {
     let restart = LoggedRestart::new();
     let mut archive = restart.archive.clone();
-    archive.binds.push(format!(
-        "{}/stray-20251026080000:/app/stray",
-        restart.host_root().display()
-    ));
+    let stray = format!("{}/stray-20251026080000", restart.host_root().display());
+    archive.binds.push(format!("{stray}:/app/stray"));
+    archive
+        .log_mounts
+        .as_mut()
+        .unwrap()
+        .push(log_mount("/app/stray", &stray));
     let daemon = scripted(vec![]).await;
 
     let result = restart.restore_archive(&daemon, archive).await;
@@ -213,7 +217,7 @@ fn archived(receipts: &std::path::Path, restart: &LoggedRestart) -> BuilderResta
 }
 
 /// 替代容器的 inspect 响应，带着重新采集时要求的身份 label
-fn inspectable(
+pub(super) fn inspectable(
     template: &BuilderRestartTemplate,
     id: &str,
     extra_labels: Value,

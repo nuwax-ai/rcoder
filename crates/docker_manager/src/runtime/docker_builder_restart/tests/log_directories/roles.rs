@@ -1,63 +1,7 @@
-//! 哪些挂载换、换源记录怎么核：持久数据（`/home/user` 下面）永不换源，哪怕它落在日志根里；
-//! 换源记录里不能出现持久数据和不是日志挂载的挂载；记录里没有的挂载和归档一模一样。
+//! 哪些挂载换、换源记录怎么核：换源记录里不能出现持久数据和不在日志挂载记录里的挂载；
+//! 记录里没有的挂载和归档一模一样；取不到挂载表时读换源记录不拦。数据挂载在 `data_mounts`。
 
 use super::*;
-
-/// 日志根的配置盖住了工作区（旧容器、改过日志根的部署）：工作区是持久数据，不换。替代容器
-/// 绑的还是原来那个目录；日志挂载照换。工作区的源登记到替代容器建出来。
-#[tokio::test]
-async fn a_workspace_under_the_log_root_keeps_its_directory() {
-    let mut restart = LoggedRestart::new();
-    restart.move_workspace_under_log_root();
-    std::fs::write(restart.workspace.path().join("keep"), b"data").unwrap();
-    let workspace = restart.workspace.path().to_string_lossy().into_owned();
-    let seen_at_create = Arc::new(Mutex::new(Vec::new()));
-    let recorder = Arc::clone(&seen_at_create);
-    let daemon = scripted_with_hook(
-        creation_script(step("POST", "/containers/create", 200, created())),
-        Arc::new(move |request: &str| {
-            if request.starts_with("POST") && request.contains("/containers/create") {
-                recorder
-                    .lock()
-                    .unwrap()
-                    .extend(crate::log_directory::pending_bind_sources());
-            }
-        }),
-    )
-    .await;
-
-    let replacement = restart.restore(&daemon).await.unwrap();
-
-    let name = restart.bound_log_name(&daemon, 4, LOG_TARGET);
-    let new_directory = new_log_directory(&restart, &name);
-    let binds = daemon.body(4)["HostConfig"]["Binds"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        binds.contains(&json!(format!("{workspace}:{WORKSPACE_TARGET}"))),
-        "the workspace keeps its directory: {binds:?}"
-    );
-    assert_eq!(
-        restart.bound_sources(&daemon, 4),
-        json!({ LOG_TARGET: new_directory })
-            .as_object()
-            .cloned()
-            .unwrap(),
-        "the workspace is never recorded as replaced"
-    );
-    assert_eq!(
-        replacement.expected_volumes,
-        restart.expected_volumes(&[(LOG_TARGET, &new_directory)])
-    );
-    // 工作区的源登记着：它落在日志根里，是清理器的过期候选
-    let mut seen = seen_at_create.lock().unwrap().clone();
-    seen.sort();
-    let mut expected = vec![PathBuf::from(new_directory), PathBuf::from(&workspace)];
-    expected.sort();
-    assert_eq!(seen, expected);
-    assert!(restart.workspace.path().join("keep").is_file());
-}
 
 /// 日志挂载在日志根下更深处：替代容器的新目录建在同一层，日志根下那第一级目录的修改时间
 /// 不会自己变，清理器会一直把它当过期候选。恢复时把它刷新到现在，清理器删前的复查才看得出
@@ -218,81 +162,17 @@ async fn a_resumed_label_that_names_an_auxiliary_mount_is_refused() {
     daemon.assert_followed(2);
 }
 
-/// 旧版本保留的停止容器还在、工作区落在日志根里：工作区的源在删旧容器**之前**就登记，一直到
-/// 替代容器建出来。旧容器一删它就不在任何容器的挂载里了，到建替代容器之间还要确认镜像。
-#[tokio::test]
-#[allow(unsafe_code)] // 测试内设置进程环境变量；nextest 每个用例独立进程
-async fn data_under_the_log_root_is_registered_before_the_old_container_is_removed() {
-    let receipts = tempfile::tempdir().unwrap();
-    unsafe {
-        std::env::set_var("RCODER_OPERATION_RECEIPT_ROOT", receipts.path());
-    }
-    let mut restart = LoggedRestart::new();
-    restart.move_workspace_under_log_root();
-    // 真实归档里的卷按挂载点排好，和从容器读回的见证同序
-    restart
-        .template
-        .volumes
-        .sort_by(|a, b| (&a.name, &a.uid).cmp(&(&b.name, &b.uid)));
-    let workspace = restart.workspace.path().to_string_lossy().into_owned();
-    crate::runtime::docker_compute_receipt::save_stop(&restart.template.source)
-        .await
-        .unwrap();
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let recorder = Arc::clone(&seen);
-    let daemon = scripted_with_hook(
-        vec![
-            step(
-                "GET",
-                ORIGINAL_UID,
-                200,
-                retained_original(&restart.template),
-            ),
-            step("GET", "/images/", 200, image_inspect()),
-            step("DELETE", ORIGINAL_UID, 204, json!({})),
-            step("GET", ORIGINAL_UID, 404, no_such_container()),
-            step("GET", "rcoder-app-builder-", 404, no_such_container()),
-            step("GET", "/images/", 200, image_inspect()),
-            step("GET", "/info", 200, daemon_info()),
-            step("POST", "/containers/create", 200, created()),
-        ],
-        Arc::new(move |request: &str| {
-            let deleting = request.starts_with("DELETE");
-            let preparing_image = request.starts_with("GET") && request.contains("/images/");
-            let creating = request.starts_with("POST") && request.contains("/containers/create");
-            if deleting || preparing_image || creating {
-                recorder.lock().unwrap().push((
-                    request.split_whitespace().next().unwrap_or("").to_owned(),
-                    crate::log_directory::pending_bind_sources(),
-                ));
-            }
-        }),
-    )
-    .await;
-
-    restart.restore(&daemon).await.unwrap();
-
-    daemon.assert_followed(8);
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 4, "{seen:?}");
-    for (request, sources) in seen.iter() {
-        assert!(
-            sources.contains(&PathBuf::from(&workspace)),
-            "{request}: the data directory is nobody's mount once the old container is gone: {sources:?}"
-        );
-    }
-}
-
-/// 取不到挂载表时读换源记录：判不出来不拦。记录里有一条挂载点不带 `container-logs`、
-/// `CONTAINER_LOG_NAME` 也没记它的挂载——认它是因为它的源目录名就是日志目录名
-/// （`<容器名>-<时间戳>`，建替代容器的时候判它在日志根里，所以换了），续做照样认。
+/// 取不到挂载表时读换源记录：判不出来不拦。记录里有一条日志挂载——挂载点不带 `container-logs`、
+/// 环境变量也没记它，认它靠的是创建时的日志挂载记录（建替代容器的时候判它在日志根里，所以换了），
+/// 续做照样认。
 #[cfg(not(feature = "deploy-host"))]
 #[tokio::test]
-async fn without_a_mount_table_a_recorded_swap_is_accepted_for_a_mount_without_a_log_name() {
+async fn without_a_mount_table_a_recorded_swap_is_accepted_for_a_mount_the_env_does_not_name() {
     let mut restart = LoggedRestart::new();
-    // 旧目录名就是日志目录名：归档里没有它的挂载点证据，认角色靠的是这个名字
-    let old_cache = new_log_directory(&restart, "rcoder-app-builder-265-20251026080000");
+    // 它在日志挂载记录里，环境变量一个都没提它
+    let old_cache = restart.host_root().join("cache-old");
     std::fs::create_dir_all(&old_cache).unwrap();
+    let old_cache = old_cache.to_string_lossy().into_owned();
     restart
         .template
         .volumes
@@ -301,6 +181,12 @@ async fn without_a_mount_table_a_recorded_swap_is_accepted_for_a_mount_without_a
         .archive
         .binds
         .push(format!("{old_cache}:/app/cache"));
+    restart
+        .archive
+        .log_mounts
+        .as_mut()
+        .unwrap()
+        .push(log_mount("/app/cache", &old_cache));
     let fresh_log = new_log_directory(&restart, "rcoder-app-builder-265-20251026090000");
     let fresh_cache = new_log_directory(&restart, "rcoder-app-builder-265-20251026091000");
     let daemon = scripted(vec![
@@ -352,76 +238,64 @@ async fn without_a_mount_table_a_recorded_swap_is_accepted_for_a_mount_without_a
     );
 }
 
-/// 回归（Codex 第四轮 P1）：一条自定义的数据挂载落在日志根下面，源里有数据。只按源路径挑换源
-/// 对象的话，替代容器绑的是新建的空目录，数据就丢了。认角色：它不是日志目录（名字不带时间戳、
-/// 归档里也没有它的挂载点证据），永不换源——替代容器绑的还是原来那个目录，数据在。
+/// 同一个换源记录、归档里却没有这条日志挂载的记录：换它没有依据，拒绝。取不到挂载表也一样拒——
+/// 认角色只看归档，不依赖挂载表。
+#[cfg(not(feature = "deploy-host"))]
 #[tokio::test]
-async fn a_custom_data_mount_under_the_log_root_keeps_its_directory() {
+async fn without_a_mount_table_a_swap_of_an_unrecorded_mount_is_refused() {
     let mut restart = LoggedRestart::new();
-    let project_directory = restart.host_root().join("project");
-    std::fs::create_dir_all(&project_directory).unwrap();
-    std::fs::write(project_directory.join("keep.txt"), b"project data").unwrap();
-    let project = project_directory.to_string_lossy().into_owned();
+    // 名字长得就是日志目录的样子，还带着时间戳。它不在记录里：不是 RCoder 建的
+    let old_data = restart.host_root().join("customer-data-20251026080000");
+    std::fs::create_dir_all(&old_data).unwrap();
+    let old_data = old_data.to_string_lossy().into_owned();
     restart
         .template
         .volumes
-        .push(host_path_volume("/mnt/project", &project));
-    restart.archive.binds.push(format!("{project}:/mnt/project"));
-    let seen_at_create = Arc::new(Mutex::new(Vec::new()));
-    let recorder = Arc::clone(&seen_at_create);
-    let daemon = scripted_with_hook(
-        creation_script(step("POST", "/containers/create", 200, created())),
-        Arc::new(move |request: &str| {
-            if request.starts_with("POST") && request.contains("/containers/create") {
-                recorder
-                    .lock()
-                    .unwrap()
-                    .extend(crate::log_directory::pending_bind_sources());
-            }
-        }),
-    )
+        .push(host_path_volume("/mnt/project", &old_data));
+    restart
+        .archive
+        .binds
+        .push(format!("{old_data}:/mnt/project"));
+    let daemon = scripted(vec![
+        step("GET", "_ping", 200, json!("OK")),
+        step("GET", ORIGINAL_UID, 404, no_such_container()),
+        step(
+            "GET",
+            "rcoder-app-builder-",
+            200,
+            retained_replacement(
+                &restart.template,
+                json!({
+                    RESTORE: restart.template.archive.uid.clone(),
+                    RESTART_LOG_DIR: json!({
+                        LOG_TARGET: new_log_directory(&restart, "rcoder-app-builder-265-20251026090000"),
+                        "/mnt/project": new_log_directory(&restart, "customer-data-20251026090000"),
+                    })
+                    .to_string(),
+                }),
+            ),
+        ),
+    ])
     .await;
+    let runtime = DockerRuntime::new(docker_manager_configured(
+        daemon.address,
+        crate::DockerManagerConfig {
+            log_reclaim_root: restart.visible_root(),
+            ..Default::default()
+        },
+    ));
 
-    let replacement = restart.restore(&daemon).await.unwrap();
+    let result = runtime
+        .replace_builder_container(
+            &restart.template,
+            &restart.archive,
+            original(&restart.template),
+        )
+        .await;
 
-    // 数据挂载原样重放：绑的还是原来那个目录
-    let binds = daemon.body(4)["HostConfig"]["Binds"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
     assert!(
-        binds.contains(&json!(format!("{project}:/mnt/project"))),
-        "the data mount must keep its source: {binds:?}"
+        matches!(&result, Err(Error::Conflict(message)) if message.contains("which is not a log mount")),
+        "{result:?}"
     );
-    // 换源记录里没有它
-    let recorded = daemon.body(4)["Labels"][RESTART_LOG_DIR]
-        .as_str()
-        .and_then(|label| serde_json::from_str::<Value>(label).ok());
-    assert!(
-        recorded
-            .as_ref()
-            .and_then(|label| label.get("/mnt/project"))
-            .is_none(),
-        "a data mount is never recorded as swapped: {recorded:?}"
-    );
-    assert!(
-        project_directory.join("keep.txt").is_file(),
-        "its data is untouched"
-    );
-    // 源登记到替代容器建出来
-    let seen = seen_at_create.lock().unwrap().clone();
-    assert!(
-        seen.contains(&PathBuf::from(&project)),
-        "the data mount is registered until the replacement exists: {seen:?}"
-    );
-    // 日志挂载照换
-    let fresh = restart
-        .host_root()
-        .join(restart.bound_log_name(&daemon, 4, LOG_TARGET))
-        .to_string_lossy()
-        .into_owned();
-    assert_eq!(
-        replacement.expected_volumes,
-        restart.expected_volumes(&[(LOG_TARGET, &fresh)])
-    );
+    daemon.assert_followed(3);
 }

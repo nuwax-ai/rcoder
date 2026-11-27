@@ -18,10 +18,13 @@
 //! The log mount is the one bind that is not replayed verbatim: the replacement
 //! gets a new log directory instead, see [`log_directory`].
 use super::docker_runtime::DockerRuntime;
-use crate::log_directory::{DirectoryBeingReclaimed, PendingBinds};
 use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
-use log_directory::{FreshLogDirectories, plan};
-use log_label::RESTART_LOG_DIR;
+use log_directory::{FreshLogDirectories, plan, replacement_log_mounts};
+use log_label::{LOG_MOUNTS_LABEL, RESTART_LOG_DIR};
+
+use crate::log_directory::{
+    DirectoryBeingReclaimed, LogMountRecord, PendingBinds, decode_log_mounts, encode_log_mounts,
+};
 
 /// 这次恢复给出的替代容器：按名称找到或刚创建的那一个，以及它应当有的挂载
 #[derive(Debug, PartialEq)]
@@ -75,6 +78,33 @@ struct Archive {
     nano_cpus: Option<i64>,
     cpu_shares: Option<i64>,
     cpuset_cpus: Option<String>,
+    /// 原容器创建时 RCoder 为它独占新建目录的日志挂载（容器 label）。升级之前建的容器没有
+    #[serde(default)]
+    log_mounts: Option<Vec<LogMountRecord>>,
+}
+
+/// 替代容器带的两份记录，都写在它的 label 上
+#[derive(Default)]
+struct ReplacementLabels {
+    /// 换过源的日志挂载：挂载点 → 新目录。一条都没换时不写
+    log_directories: Option<String>,
+    /// 这个替代容器的日志挂载记录，见 `log_directory::record`
+    log_mounts: Vec<LogMountRecord>,
+}
+
+/// 原容器 label 上的日志挂载记录。读不出来按没有处理：换源只认记录，没有记录一条都不换
+fn archived_log_mounts(labels: Option<&HashMap<String, String>>) -> Option<Vec<LogMountRecord>> {
+    let label = labels?.get(LOG_MOUNTS_LABEL)?;
+    match decode_log_mounts(label) {
+        Some(records) => Some(records),
+        None => {
+            tracing::error!(
+                %label,
+                "A builder carries a log mount record RCoder cannot read; its mounts are replayed as archived"
+            );
+            None
+        }
+    }
 }
 
 fn fail(message: impl std::fmt::Display) -> Error {
@@ -443,6 +473,7 @@ impl DockerRuntime {
             nano_cpus: host.and_then(|h| h.nano_cpus),
             cpu_shares: host.and_then(|h| h.cpu_shares),
             cpuset_cpus: host.and_then(|h| h.cpuset_cpus.clone()),
+            log_mounts: archived_log_mounts(config.labels.as_ref()),
         };
         let volumes = bind_witness(&inspect)?;
         if archive.binds.is_empty() {
@@ -714,12 +745,15 @@ impl DockerRuntime {
         )
         .await?;
         fresh.apply(&mut replay, &binds.plans);
-        let log_label = fresh.has_sources().then(|| fresh.label());
+        let labels = ReplacementLabels {
+            log_directories: fresh.has_sources().then(|| fresh.label()),
+            log_mounts: replacement_log_mounts(archive, &fresh),
+        };
         // 创建请求马上发出。之后拿不到确切结果——包括这个 future 等应答时被取消——登记都会
         // 转去"结果不明"保留着：替代容器可能已经建出来、正绑着这些目录
         fresh.request_sent();
         match self
-            .create_replacement(template, &replay, log_label.as_deref(), original)
+            .create_replacement(template, &replay, &labels, original)
             .await
         {
             Ok(id) => {
@@ -751,12 +785,11 @@ impl DockerRuntime {
         &self,
         template: &BuilderRestartTemplate,
         replay: &Archive,
-        log_label: Option<&str>,
+        labels: &ReplacementLabels,
         original: &AppResourceIdentity,
     ) -> std::result::Result<String, CreateFailure> {
         let client = self.inner.get_docker_client();
-        let mut body =
-            restore_body(template, replay, log_label).map_err(CreateFailure::NotCreated)?;
+        let mut body = restore_body(template, replay, labels).map_err(CreateFailure::NotCreated)?;
         crate::native_domain::stamp(client, &mut body)
             .await
             .map_err(|e| {
@@ -894,11 +927,13 @@ fn observed_rejection(
 /// Rebuild the create body from the archive. Identity labels are re-derived
 /// from the operation context (never replayed), the restore marker makes a
 /// retry idempotent, and the captured image/config replay verbatim — except the
-/// log mounts, which follow `log_label` when there are any.
+/// log mounts, which follow the swap record when there are any. The log mount
+/// record is this replacement's own: the mounts RCoder created just now plus
+/// the archived ones it did not replace.
 fn restore_body(
     template: &BuilderRestartTemplate,
     archive: &Archive,
-    log_label: Option<&str>,
+    records: &ReplacementLabels,
 ) -> Result<bollard::models::ContainerCreateBody> {
     let context = &template.source.context;
     let name = template
@@ -916,8 +951,14 @@ fn restore_body(
     );
     labels.insert("identifier".into(), context.app_id.clone());
     labels.insert(RESTORE.into(), template.archive.uid.clone());
-    if let Some(log_label) = log_label {
+    if let Some(log_label) = &records.log_directories {
         labels.insert(RESTART_LOG_DIR.into(), log_label.to_owned());
+    }
+    if !records.log_mounts.is_empty() {
+        labels.insert(
+            LOG_MOUNTS_LABEL.into(),
+            encode_log_mounts(&records.log_mounts),
+        );
     }
     let (networking_config, network_mode) = if archive.network_mode == "host" {
         (None, "host".to_string())

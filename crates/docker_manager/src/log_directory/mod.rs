@@ -30,10 +30,17 @@
 //! 清单；都没有才删。标记在，这之后才登记它的创建方就会等这次删除结束，最多 10 秒。见
 //! [`pending`]。
 //!
+//! # 哪些挂载是 RCoder 建的
+//!
+//! 创建容器时独占新建了目录的挂载，记在容器的 label 上（[`record`]）。之后重启这个容器时，
+//! 只有记录里的挂载才换成新目录。名字像不像日志目录不算数：带数据的目录也可以叫
+//! `<什么>-<时间戳>`。
+//!
 //! 新建目录落在日志根下面更深处时，要刷新上一级候选的修改时间，见
 //! [`refresh_candidate_ancestor`]。
 
 mod pending;
+mod record;
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -43,12 +50,13 @@ use tracing::warn;
 /// 同名目录已存在时，名字最多试到 `<名字>-16`
 pub(crate) const NAME_ATTEMPTS: u32 = 16;
 
-pub use pending::{DirectoryBeingReclaimed, PendingBinds};
 #[cfg(test)]
 pub(crate) use pending::pending_bind_sources;
+pub use pending::{DirectoryBeingReclaimed, PendingBinds};
 pub(crate) use pending::{
     mark_reclaim, reclaim_marks, reclaim_released, registry_view, unresolved_sources,
 };
+pub(crate) use record::{LOG_MOUNTS_LABEL, LogMountRecord, decode_log_mounts, encode_log_mounts};
 
 /// 仅供其它 crate 的测试使用：登记一条正在准备挂载的宿主机路径，守卫 drop 时注销。需要启用
 /// `test-support` feature，生产构建里不存在。
@@ -80,21 +88,6 @@ pub(crate) fn replacement_log_directory_name(
 
 fn is_timestamp(text: &str) -> bool {
     text.len() == 14 && text.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-/// 这个名字是不是给某个容器一次性建的日志目录：`<容器名>-<UTC 时间>`，时间之后可能还跟着
-/// 一个重试序号（`-2` 到 `-16`，见 [`NAME_ATTEMPTS`]）。
-///
-/// 认的是**目录名**，不是路径：归档里没有挂载表，认不出这条 bind 是干什么用的，名字是唯一
-/// 还留着的证据。名字里带重试序号的也一样认——那说明首选名字被占过，是新建的目录
-pub(crate) fn is_log_directory_name(name: &str) -> bool {
-    match name.rsplit_once('-') {
-        Some((rest, last)) if (2..=16).contains(&last.parse::<u32>().unwrap_or(0)) => {
-            is_log_directory_name(rest)
-        }
-        Some((_, timestamp)) => is_timestamp(timestamp),
-        None => false,
-    }
 }
 
 /// 在 `parent` 下新建一个目录，名字优先用 `preferred`，返回新建目录的路径。

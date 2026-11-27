@@ -6,18 +6,19 @@
 //!
 //! # 哪些挂载换
 //!
-//! 先看**角色**——这条挂载是不是给这个容器一次性建的日志目录，再看路径：
+//! 先看**角色**——这条挂载是不是 RCoder 为这个容器独占新建的日志目录，再看路径：
 //!
-//! - **角色**（[`is_log_mount`]）：挂载点就是归档记的 `CONTAINER_LOGS_DIR`、或者带
-//!   `container-logs`；源的文件名就是归档记的 `CONTAINER_LOG_NAME`；源的文件名是日志目录名
-//!   （`<容器名>-<时间戳>`，见 `crate::log_directory::is_log_directory_name`）。挂载点落在
-//!   `/home/user` 整棵里的不是。
+//! - **角色**（[`is_log_mount`]）：归档带着原容器的日志挂载记录（容器 label
+//!   `rcoder.io/log-mounts`，创建容器时写的，每条是挂载点和 RCoder 新建的那个目录），挂载点和源
+//!   都对得上的才算。升级之前建的容器没有这份记录，只认创建时写进环境变量的那两个值：挂载点
+//!   就是 `CONTAINER_LOGS_DIR`，或者源的文件名就是 `CONTAINER_LOG_NAME`。挂载点落在 `/home/user`
+//!   整棵里的不是（持久数据）。
 //! - **路径**：源在可回收日志根下面（`host_path_space::LogDomain`，用的是清理器那个路径
 //!   空间），或者判不出来。
 //!
-//! 两条都满足才换。角色是主判据：日志根的配置一旦盖住别的东西（自定义数据目录、旧容器、
-//! 改过日志根的部署），只按路径挑会把一份有数据的目录换成空的新目录，数据就丢了。归档里
-//! 只有 bind 字符串和环境变量，认角色靠的就是这些。
+//! 两条都满足才换。角色是主判据：日志根的配置一旦盖住别的东西（自定义数据目录），只按路径挑
+//! 会把一份有数据的目录换成空的新目录，数据就丢了。名字像不像日志目录、挂载点怎么拼写都**不是
+//! 证据**：带数据的目录也可以叫 `<什么>-<时间戳>`。
 //!
 //! # 判不出来的时候
 //!
@@ -30,8 +31,9 @@
 //!
 //! # 不是日志挂载的
 //!
-//! 永不换源，原样重放并登记。源确定落在日志根里的记 error：那是配置错误（数据目录被日志根
-//! 盖住了），builder 停够保留期之后清理器会回收它。拒绝恢复救不了这份数据，恢复照常。
+//! 永不换源，原样重放并登记——归档没有记录、环境变量也对不上的 bind 也算这一类：来源不可信，
+//! 就当它可能是数据，保留原 bind。源确定落在日志根里的记 error：那是配置错误（数据目录被
+//! 日志根盖住了），builder 停够保留期之后清理器会回收它。拒绝恢复救不了这份数据，恢复照常。
 //!
 //! 换源记在替代容器的 label 上，续做和引擎都从那里读，见 `log_label`。
 
@@ -42,7 +44,7 @@ use container_runtime_api::ContainerRuntimeResult as Result;
 use shared_types::{AppResourceIdentity, AppResourceKind, BuilderRestartTemplate};
 
 use super::{Archive, DockerRuntime, conflict};
-use crate::log_directory::{DirectoryBeingReclaimed, PendingBinds, is_log_directory_name};
+use crate::log_directory::{DirectoryBeingReclaimed, LogMountRecord, PendingBinds};
 use crate::runtime::docker_runtime::host_path_space::{
     HostPathSpace, LogDomainAdmission, LogDomainVerdict, bind_source, create_host_directory,
 };
@@ -95,8 +97,8 @@ pub(super) struct LogBinds<'a> {
 
 /// 定下归档里每条 bind 怎么处置：哪些换成新目录，哪些原样重放但要登记。
 ///
-/// 源在日志根下、却没有挂载见证（或者见证和 bind 对不上）的 bind 改不了它，原样重放又可能
-/// 绑到旧目录，遇到就拒绝。
+/// 日志挂载的源在日志根下、却没有挂载见证（或者见证和 bind 对不上）：改不了它，原样重放又会
+/// 绑到旧目录，拒绝。来源不可信的 bind 不在这个规矩里——它原样重放、登记，本来就是对的。
 pub(super) async fn plan<'a>(
     template: &'a BuilderRestartTemplate,
     archive: &Archive,
@@ -139,8 +141,9 @@ pub(super) async fn plan<'a>(
             continue;
         }
         let required = verdict == LogDomainVerdict::Inside;
-        // 是日志挂载就尽量换，不看判定结果：日志目录是一次性的，不该复用，旧的那个可能早已过期，
-        // 清理器正在回收。源确定在日志根外时清理器碰不到它，但换了也没有代价
+        // 是日志挂载就换，不看判定结果：日志目录是一次性的，不该复用，旧的那个可能早已过期，
+        // 清理器正在回收。源确定在日志根外时清理器碰不到它，旧目录原样留着，换的代价只是容器
+        // 里看不到上一次的日志
         let swap = required || admission.space().is_some();
         if !swap {
             continue;
@@ -193,9 +196,9 @@ pub(super) async fn plan<'a>(
         }
         match admission.classify(bind, source).await {
             LogDomainVerdict::Inside => {
-                // 没有挂载见证，认不出挂载点，只能看源的文件名。像日志目录的是日志挂载：
+                // 没有挂载见证，认不出挂载点，只能按源认。记录里就有这个源目录的是日志挂载：
                 // 换源要改 bind 字符串，没有挂载点就写不回去，拒绝
-                if is_archived_log_source(source, archive) {
+                if is_recorded_log_source(source, archive) {
                     return Err(conflict(format!(
                         "Restart bind {bind} lies under the reclaimable log root but has no mount witness"
                     )));
@@ -214,39 +217,60 @@ pub(super) async fn plan<'a>(
     Ok(binds)
 }
 
-/// 这条挂载是不是给这个容器一次性建的日志目录（角色）。
+/// 这条挂载是不是 RCoder 为这个容器独占新建的日志目录（角色）。
 ///
-/// 认角色不认路径：日志根的配置能把任何东西放到它下面（自定义数据目录、改过日志根之前的旧
-/// 容器），只按路径挑换源对象会把有数据的目录换成空目录。归档里没有挂载表，能用的证据是
-/// 挂载点、源的文件名，和创建时写进环境变量的那两个（`agent_container_starter::mounts` 就是
-/// 按 `CONTAINER_LOGS_DIR` / `CONTAINER_LOG_NAME` 记的）。
+/// 只认创建时的记录，见模块说明：
 ///
-/// 最后一条不看归档：源的文件名本身就是日志目录名（`<容器名>-<时间戳>`）。认得出名字的
-/// 旧归档也按日志挂载处理
+/// - 归档带着日志挂载记录：挂载点和源都对得上才算。源和记录不一样，说明记录之外有人动过这条
+///   bind，不算；
+/// - 归档没有记录（升级之前建的容器）：只认创建时写进环境变量的那两个值——`CONTAINER_LOGS_DIR`
+///   就是这个挂载点，或者 `CONTAINER_LOG_NAME` 就是这个源目录的名字。
+///
+/// 目录名的格式、挂载点的拼写都不是证据：带数据的目录也可以叫 `<什么>-<时间戳>`
 pub(super) fn is_log_mount(target: &str, source: &str, archive: &Archive) -> bool {
     if shared_types::is_builder_persistent_data_mount(target) {
         return false;
     }
-    archive.log_target() == Some(target)
-        || target.contains("container-logs")
-        || archive.env_value(CONTAINER_LOG_NAME_ENV).is_some_and(|name| {
-            file_name(source).is_some_and(|source| source == name)
-        })
-        || file_name(source).is_some_and(is_log_directory_name)
+    match archive.log_mounts() {
+        Some(record) => record
+            .iter()
+            .any(|mount| mount.target == target && mount.source == source),
+        None => archive.log_target() == Some(target) || archive.names_log_directory(source),
+    }
 }
 
 fn file_name(path: &str) -> Option<&str> {
-    Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
+    Path::new(path).file_name().and_then(|name| name.to_str())
 }
 
-/// 只看源的文件名认角色：没有挂载点的 bind（归档里有、模板的卷里没有）只能用这个
-fn is_archived_log_source(source: &str, archive: &Archive) -> bool {
-    archive
-        .env_value(CONTAINER_LOG_NAME_ENV)
-        .is_some_and(|name| file_name(source) == Some(name))
-        || file_name(source).is_some_and(is_log_directory_name)
+/// 归档里没有挂载见证的 bind（归档里有、模板的卷里没有）没有挂载点可用，只能按源认：记录里
+/// 就有这个源目录的，是日志挂载
+fn is_recorded_log_source(source: &str, archive: &Archive) -> bool {
+    match archive.log_mounts() {
+        Some(record) => record.iter().any(|mount| mount.source == source),
+        None => archive.names_log_directory(source),
+    }
+}
+
+/// 替代容器的日志挂载记录：归档记录里没换过源的照抄，换过源的记新目录——它们是 RCoder 这一次
+/// 独占新建的。归档没有记录的（升级之前建的容器）只有换过源的这些
+pub(super) fn replacement_log_mounts(
+    archive: &Archive,
+    fresh: &FreshLogDirectories,
+) -> Vec<LogMountRecord> {
+    let mut records: Vec<LogMountRecord> = archive
+        .log_mounts()
+        .unwrap_or_default()
+        .iter()
+        .filter(|record| !fresh.sources.contains_key(&record.target))
+        .cloned()
+        .collect();
+    records.extend(fresh.sources.iter().map(|(target, source)| LogMountRecord {
+        target: target.clone(),
+        source: source.clone(),
+    }));
+    records.sort_by(|a, b| a.target.cmp(&b.target));
+    records
 }
 
 /// 这次恢复给替代容器新建的日志目录
@@ -422,6 +446,17 @@ impl Archive {
         self.env
             .iter()
             .find_map(|entry| entry.strip_prefix(&format!("{name}=")))
+    }
+
+    /// 原容器创建时的日志挂载记录。升级之前建的容器没有
+    pub(super) fn log_mounts(&self) -> Option<&[LogMountRecord]> {
+        self.log_mounts.as_deref()
+    }
+
+    /// 归档的 `CONTAINER_LOG_NAME` 就是这个源目录的名字。空值不算
+    fn names_log_directory(&self, source: &str) -> bool {
+        self.env_value(CONTAINER_LOG_NAME_ENV)
+            .is_some_and(|name| !name.is_empty() && file_name(source) == Some(name))
     }
 }
 

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
+mod record;
 mod unclassified;
 
 use crate::DockerError;

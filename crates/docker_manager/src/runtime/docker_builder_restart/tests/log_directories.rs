@@ -1,11 +1,15 @@
 //! 替代 builder 的日志目录：哪些 bind 换成新目录、label 怎么记。
 //!
-//! 这里放夹具和换目录的用例。哪些挂载换、换源记录怎么核（`roles`）、登记与创建结果
-//! （`claims`）、重启协议（`replacement`）各有自己的文件。
+//! 这里放夹具和换目录的用例。哪些挂载换、换源记录怎么核（`roles`），数据挂载（`data_mounts`），
+//! 升级之前建的容器的归档（`legacy`），归档怎么带下日志挂载记录（`record`），登记与创建结果
+//! （`claims`），重启协议（`replacement`）各有自己的文件。
 
 use super::*;
 
 mod claims;
+mod data_mounts;
+mod legacy;
+mod record;
 mod replacement;
 mod roles;
 
@@ -62,6 +66,8 @@ impl LoggedRestart {
             format!("CONTAINER_LOG_NAME={old_name}"),
             "PATH=/usr/bin".into(),
         ];
+        // 创建容器时记在容器 label 上的日志挂载记录，归档带着它
+        let mut records = vec![log_mount(LOG_TARGET, &old_directory)];
         if audit {
             let audit_name = format!("{container}-audit-20251026080000");
             let audit_directory = host_root.join(&audit_name);
@@ -70,9 +76,11 @@ impl LoggedRestart {
             volumes.push(host_path_volume(AUDIT_TARGET, &audit_directory));
             binds.push(format!("{audit_directory}:{AUDIT_TARGET}"));
             env.push(format!("AUDIT_LOG_NAME={audit_name}"));
+            records.push(log_mount(AUDIT_TARGET, &audit_directory));
         }
         let template = template_for(volumes);
-        let archive = archive_for(&template, binds, env);
+        let mut archive = archive_for(&template, binds, env);
+        archive.log_mounts = Some(records);
         Self {
             root,
             workspace,
@@ -134,6 +142,17 @@ impl LoggedRestart {
         for bind in &mut self.archive.binds {
             if bind.starts_with(&archived) {
                 *bind = format!("{}:{LOG_TARGET}:rw,z", self.old_directory);
+            }
+        }
+        let moved = self.old_directory.clone();
+        self.re_record(LOG_TARGET, &moved);
+    }
+
+    /// 日志挂载记录里 `target` 的源换成 `source`：测试挪动了目录之后，记录要跟着改
+    fn re_record(&mut self, target: &str, source: &str) {
+        for record in self.archive.log_mounts.iter_mut().flatten() {
+            if record.target == target {
+                record.source = source.to_owned();
             }
         }
     }
@@ -214,6 +233,14 @@ impl LoggedRestart {
     }
 }
 
+/// 创建容器时记下的一条日志挂载（容器 label `rcoder.io/log-mounts`）
+fn log_mount(target: &str, source: &str) -> LogMountRecord {
+    LogMountRecord {
+        target: target.to_owned(),
+        source: source.to_owned(),
+    }
+}
+
 fn new_log_directory(restart: &LoggedRestart, name: &str) -> String {
     restart
         .host_root()
@@ -282,6 +309,14 @@ async fn the_replacement_gets_a_new_log_directory() {
             .clone(),
         "a resumed restore learns the directory from this label"
     );
+    // 替代容器带上自己的日志挂载记录：换过源的记新目录。下次重启它，靠这份记录认日志挂载
+    assert_eq!(
+        body["Labels"][LOG_MOUNTS_LABEL]
+            .as_str()
+            .and_then(|label| serde_json::from_str::<Value>(label).ok()),
+        Some(json!([{"target": LOG_TARGET, "source": new_directory}])),
+        "the replacement records the log mounts RCoder created for it"
+    );
     // 新目录是 RCoder 经自己的挂载视图建的
     assert!(restart.visible_root().join(&name).is_dir());
     // 旧目录原样留着，留给日志清理器
@@ -321,10 +356,10 @@ async fn a_missing_old_log_directory_does_not_block_the_restart() {
     );
 }
 
-/// 旧版本的归档：环境变量里是带变量的模板，和实际挂载点对不上。识别日志挂载看的是源路径，
-/// 不靠环境变量，照样换成新目录。
+/// 归档带着日志挂载记录：环境变量里是带变量的模板、和实际挂载点对不上也不要紧，记录是
+/// 创建的时候写的，比环境变量可靠。
 #[tokio::test]
-async fn a_log_mount_is_recognised_by_its_source_even_when_the_env_does_not_match() {
+async fn a_recorded_log_mount_is_recognised_even_when_the_env_does_not_match() {
     let restart = LoggedRestart::new();
     let mut archive = restart.archive.clone();
     archive.env[0] = "CONTAINER_LOGS_DIR=/app/container-logs/{timestamp}".into();
@@ -391,15 +426,18 @@ async fn every_log_mount_into_the_log_root_gets_its_own_new_directory() {
     );
 }
 
-/// 源落在日志根下、却没有挂载见证的 bind：改不了它，原样重放又可能绑到旧目录，拒绝。
+/// 记录里的日志挂载在归档里却没有挂载见证：改不了它，原样重放又可能绑到旧目录，拒绝。
 #[tokio::test]
 async fn a_bind_into_the_log_root_without_a_mount_witness_is_refused() {
     let restart = LoggedRestart::new();
     let mut archive = restart.archive.clone();
-    archive.binds.push(format!(
-        "{}/stray-20251026080000:/app/stray",
-        restart.host_root().display()
-    ));
+    let stray = format!("{}/stray-20251026080000", restart.host_root().display());
+    archive.binds.push(format!("{stray}:/app/stray"));
+    archive
+        .log_mounts
+        .as_mut()
+        .unwrap()
+        .push(log_mount("/app/stray", &stray));
     let daemon = scripted(absent_original()).await;
 
     let result = restart.restore_archive(&daemon, archive).await;

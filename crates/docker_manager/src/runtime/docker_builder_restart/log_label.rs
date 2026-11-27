@@ -31,6 +31,8 @@ use super::{Archive, DockerRuntime, RESTORE, conflict, inspect_absent};
 /// 替代容器拿到的日志目录（挂载点 → 宿主机路径的 JSON），记在它的 label 上
 pub(super) const RESTART_LOG_DIR: &str = "rcoder.io/restart-log-dir";
 
+pub(super) use crate::log_directory::LOG_MOUNTS_LABEL;
+
 /// 上一次中断前建好的替代容器
 pub(super) struct ResumedReplacement {
     /// 替代容器的 Docker ID。最终核验必须是同一个容器

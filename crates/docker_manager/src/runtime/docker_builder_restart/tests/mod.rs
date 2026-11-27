@@ -158,6 +158,7 @@ fn archive_for(template: &BuilderRestartTemplate, binds: Vec<String>, env: Vec<S
         nano_cpus: None,
         cpu_shares: None,
         cpuset_cpus: None,
+        log_mounts: None,
     }
 }
 
@@ -312,4 +313,26 @@ async fn a_missing_bind_source_conflicts_before_anything_is_created() {
         "{result:?}"
     );
     daemon.assert_followed(2);
+}
+
+/// 归档把原容器 label 上的日志挂载记录带下来。没有这个 label（升级之前建的容器）、或者它读不出来，
+/// 都按没有处理：换源只认记录，没有记录一条都不换
+#[test]
+fn the_archive_carries_the_log_mount_record_of_the_original() {
+    let records = vec![LogMountRecord {
+        target: LOG_TARGET.into(),
+        source: "/srv/logs/container/rcoder-app-builder-265-20261029035324".into(),
+    }];
+    let labelled = HashMap::from([(
+        LOG_MOUNTS_LABEL.to_owned(),
+        encode_log_mounts(&records),
+    )]);
+    assert_eq!(archived_log_mounts(Some(&labelled)), Some(records));
+
+    let other_labels = HashMap::from([("service-type".to_owned(), "userapp-builder".to_owned())]);
+    assert_eq!(archived_log_mounts(Some(&other_labels)), None);
+    assert_eq!(archived_log_mounts(None), None);
+
+    let broken = HashMap::from([(LOG_MOUNTS_LABEL.to_owned(), "not a record".to_owned())]);
+    assert_eq!(archived_log_mounts(Some(&broken)), None);
 }
