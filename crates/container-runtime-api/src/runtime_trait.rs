@@ -1054,6 +1054,25 @@ pub trait WorkspaceRuntime: Send + Sync {
         ))
     }
 
+    /// 补迁：往**已迁移**用户的 per-agent 卷上，从共享卷只补目标上没有的文件
+    /// （Job 载体同同步：src RO + dst RW；`rclone copy --ignore-existing`，不覆盖、不删除）。
+    ///
+    /// 范围与模式见 [`shared_types::WorkspaceBackfill`]（调用方须已校验，这里是纵深防御）。
+    /// Job 补完后对自己拷过的范围做一遍软链完整性校验，仍有"源上能解析、目标上悬空"
+    /// 的软链即 Job 失败。Job 失败/超时返回 Err（带 Job 日志尾部：空间不够、坏软链的
+    /// 清单都只在那里）。Docker: 不支持（宿主机无 PVC 双卷形态）。
+    async fn backfill_workspace(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _backfill: &shared_types::WorkspaceBackfill,
+        _src_pvc: &str,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceBackfillReport> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "workspace backfill is unsupported by this runtime".to_string(),
+        ))
+    }
+
     /// 迁移 Job 的前置配置校验（镜像等）——**无 I/O、无副作用**。
     ///
     /// 编排入口在产生任何副作用（建 PVC、停 agent）之前调用：配置问题若拖到

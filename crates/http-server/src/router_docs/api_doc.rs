@@ -11,6 +11,7 @@ use crate::handler;
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        handler::migration_api::backfill,
         handler::health_check,
         handler::version_check,
         handler::handle_chat,
@@ -128,6 +129,8 @@ use crate::handler;
     ),
     components(
         schemas(
+            handler::migration_api::BackfillBody,
+            handler::migration_api::BackfillResponse,
             shared_types::ErrorDetail,
             shared_types::OperationInProgressData,
             // userApp 转发层（PG 账号/库管理；create-workspace 为内部接口不入文档）
@@ -293,6 +296,7 @@ use crate::handler;
         (name = "Userapp · 双态 · 数据库", description = "dev/prod 双态（路径 {app_stage} 段分派）：应用 PostgreSQL 改密/建库（凭据对齐内嵌 start 部署链）"),
         (name = "Userapp · 双态 · 生命周期", description = "dev/prod 双态（路径 {app_stage} 段分派）：健康/统计/事件、回收策略与删除"),
         (name = "Userapp · 访问入口", description = "流量代理（/api/v1/userapp/proxy/app/{dev,prod}，前端切换只改 dev→prod 一段）与终端代理路由速查表"),
+        (name = "migration", description = "per-agent workspace 迁移编排（运维/测试用）：受 RCODER_MIGRATION_TEST_USERS 白名单约束；本页只列补迁"),
         (name = "computer", description = "Computer Agent 桌面、聊天与容器内 PG 管理接口；chat 与 agent 族（status/stop/cancel/notify-resolved/cache/clean）支持 service_type=userapp + app_id 分派（仅 dev 阶段）"),
         (name = "pod", description = "Pod 容器管理接口（监控/保活/重启；支持 service_type=userapp 分派 dev/prod 容器）"),
         (name = "proxy", description = "Pingora 反向代理接口，支持端口路由和负载均衡"),

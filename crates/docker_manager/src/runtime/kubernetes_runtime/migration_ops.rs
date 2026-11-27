@@ -33,6 +33,9 @@ use shared_types::{ServiceType, WorkspaceSyncMode};
 
 use super::*;
 
+/// 补迁 Job 失败时带进错误信息的日志行数。
+const BACKFILL_FAILURE_LOG_LINES: usize = 40;
+
 /// Job 等待上限（4h, 与迁移脚本 activeDeadlineSeconds 对齐）。
 const JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14400);
 
@@ -145,6 +148,144 @@ impl MigrationJobPlan {
     }
 }
 
+/// 补迁 Job 的执行参数（纯数据, 供单测构造/断言）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackfillJobPlan {
+    pub job_name: String,
+    pub namespace: String,
+    pub image: String,
+    pub download_rclone: bool,
+    pub src_pvc: String,
+    pub dst_pvc: String,
+    pub src_subpath: String,
+    /// 容器里源用户目录与目标卷的路径（Job 里是 `/src/<user>` 与 `/dst`）。
+    pub src_dir: String,
+    pub dst_dir: String,
+    /// 过滤规则（与同步 Job 同一份词表）。
+    pub filters: Vec<String>,
+    pub backfill: shared_types::WorkspaceBackfill,
+}
+
+/// 补迁脚本与软链校验脚本：与 k8s/migration 的 `backfill.sh`、`toolchain-guard.sh` 是同一份文件
+/// （逐字拷贝；那边是 job 模式脚本渲染进 Job，这边是补迁接口渲染进 Job——改了一边要同步
+/// 另一边）。整段渲染进 Job, 所以 Job 只依赖镜像里有 rclone 和 bash, 不依赖镜像的版本。
+const BACKFILL_SCRIPT: &str = include_str!("migration_scripts/backfill.sh");
+const LINK_GUARD_SCRIPT: &str = include_str!("migration_scripts/toolchain-guard.sh");
+
+/// 脚本与日志之间的标记（补迁脚本的 stdout；本模块从 Job 日志里读回来）。
+const BACKFILL_COPIED_MARK: &str = "[backfill] copied: ";
+const BACKFILL_SKIPPED_MARK: &str = "[backfill] skipped: ";
+
+/// 脚本内容的边界：整段放进引号 heredoc, 所以必须以换行结尾、且不能出现 heredoc 的结束标记。
+const SCRIPT_HEREDOC_END: &str = "RCODER_MIGRATION_SCRIPT";
+
+/// Job 名：`migrate-{user_id 下划线→连字符}-backfill`（合法性同 [`migration_job_name`]）。
+fn backfill_job_name(identifier: &str) -> String {
+    format!("migrate-{}-backfill", identifier.replace('_', "-"))
+}
+
+impl BackfillJobPlan {
+    /// 传给补迁脚本的参数：数组字面量的元素列表（约定同 [`MigrationJobPlan::rclone_args`]——
+    /// 每个数据值单引号包裹, `--only` 与它的模式是两个元素）。
+    /// 源与目标以 `/src/<user>`、`/dst` 为根：过滤规则是相对用户目录写的, 换根就对不上。
+    pub fn backfill_args(&self) -> String {
+        let quote = shared_types::shell::single_quote;
+        let mut args = vec![quote(&self.src_dir), quote(&self.dst_dir)];
+        args.extend(self.filters.iter().map(|filter| quote(filter)));
+        args.push(quote("--"));
+        for pattern in &self.backfill.only {
+            args.push(quote("--only"));
+            args.push(quote(pattern));
+        }
+        args.extend(self.backfill.paths.iter().map(|path| quote(path)));
+        args.join(" ")
+    }
+}
+
+/// 补迁 Job 的容器内脚本（两段脚本以引号 heredoc 落成文件再执行, 内容一字不改）。
+///
+/// 1. 跑补迁脚本, 输出同时进日志（`tee`）；
+/// 2. 补迁没拷成功（含目标卷空间不够）→ Job 以补迁脚本的退出码结束；
+/// 3. 拷成功 → 从日志里取出刚拷过的范围, 交给软链校验脚本核对：仍有"源上能解析、
+///    目标上悬空"的软链, Job 就失败——补完了还坏, 就是没补成。
+///
+/// 临时文件都在 `mktemp -d` 的目录里, 退出时删掉（校验脚本不用 `exec` 交棒, 就是为了让
+/// 清理一定跑到）。
+fn backfill_job_script(plan: &BackfillJobPlan) -> String {
+    format!(
+        r#"{prelude}rclone version | sed -n 1p
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+cat >"$WORK/backfill.sh" <<'{heredoc_end}'
+{backfill}{heredoc_end}
+cat >"$WORK/toolchain-guard.sh" <<'{heredoc_end}'
+{guard}{heredoc_end}
+ARGS=({args})
+printf '[migrate] exec:'; printf ' %s' "${{ARGS[@]}}"; printf '\n'
+set +e
+bash "$WORK/backfill.sh" "${{ARGS[@]}}" 2>&1 | tee "$WORK/backfill.log"
+rc=${{PIPESTATUS[0]}}
+set -e
+if [ "$rc" -ne 0 ]; then
+    echo "[migrate] backfill did not finish (exit $rc)" >&2
+    exit "$rc"
+fi
+SCOPES=()
+while IFS= read -r line; do
+    case "$line" in
+        '{copied}'*) SCOPES+=("${{line#'{copied}'}}") ;;
+    esac
+done <"$WORK/backfill.log"
+if [ "${{#SCOPES[@]}}" -gt 0 ]; then
+    printf '[migrate] verify links under:'; printf ' %s' "${{SCOPES[@]}}"; printf '\n'
+    bash "$WORK/toolchain-guard.sh" {source} {destination} "${{SCOPES[@]}}"
+    exit $?
+fi
+"#,
+        prelude = job_prelude(plan.download_rclone),
+        heredoc_end = SCRIPT_HEREDOC_END,
+        backfill = BACKFILL_SCRIPT,
+        guard = LINK_GUARD_SCRIPT,
+        args = plan.backfill_args(),
+        copied = BACKFILL_COPIED_MARK,
+        source = shared_types::shell::single_quote(&plan.src_dir),
+        destination = shared_types::shell::single_quote(&plan.dst_dir),
+    )
+}
+
+fn build_backfill_job(plan: &BackfillJobPlan) -> Job {
+    build_migration_job(&MigrationJobPod {
+        job_name: plan.job_name.clone(),
+        namespace: plan.namespace.clone(),
+        image: plan.image.clone(),
+        user_id: plan.src_subpath.clone(),
+        src_pvc: plan.src_pvc.clone(),
+        dst_pvc: plan.dst_pvc.clone(),
+        role: "backfill",
+        script: backfill_job_script(plan),
+    })
+}
+
+/// 从 Job 日志里读出补迁脚本的报告（它每个范围报一行标记）。
+fn parse_backfill_report(log: &str) -> shared_types::WorkspaceBackfillReport {
+    let mut report = shared_types::WorkspaceBackfillReport::default();
+    for line in log.lines() {
+        if let Some(path) = line.strip_prefix(BACKFILL_COPIED_MARK) {
+            report.copied.push(path.trim_end().to_string());
+        } else if let Some(path) = line.strip_prefix(BACKFILL_SKIPPED_MARK) {
+            report.skipped.push(path.trim_end().to_string());
+        }
+    }
+    report
+}
+
+/// 日志的最后几行（补进错误信息, 让调用方看得到 Job 里报的原因）。
+fn log_tail(log: &str, lines: usize) -> String {
+    let all: Vec<&str> = log.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    all[start..].join("\n")
+}
+
 /// src 子路径（= user_id）白名单校验，规则取全仓单一事实源
 /// [`shared_types::validate_identifier`]（file-server 解析 computer 路径时
 /// 用的就是它，合法用户不会被这里新拦一道）。
@@ -227,42 +368,44 @@ fn resolve_migration_image_from_env() -> ContainerRuntimeResult<(String, bool)> 
 /// 是一个 argv，不存在第二次 shell 解析。`set -f` 保留为纵深防御（数组赋值
 /// 与带引号的 `"${ARGS[@]}"` 展开本就不做 glob）。
 fn job_script(plan: &MigrationJobPlan) -> String {
-    let download = if plan.download_rclone {
-        r#"if ! command -v rclone >/dev/null 2>&1; then
-            echo "[migrate] rclone missing in image, downloading..."
-            curl -fsSL --max-time 180 -o /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
-            unzip -oq /tmp/rclone.zip -d /tmp/rc
-            RC_BIN=$(find /tmp/rc -maxdepth 2 -name rclone -type f | head -1)
-            install -m 0755 "$RC_BIN" /usr/local/bin/rclone
-        fi
-        "#
-    } else {
-        ""
-    };
     format!(
-        r#"set -euo pipefail
-set -f
-{download}rclone version | head -1
+        r#"{prelude}rclone version | sed -n 1p
 ARGS=({args})
 printf '[migrate] exec:'; printf ' %s' "${{ARGS[@]}}"; printf '\n'
 exec rclone "${{ARGS[@]}}""#,
-        download = download,
+        prelude = job_prelude(plan.download_rclone),
         args = plan.rclone_args(),
     )
 }
 
-fn build_job(plan: &MigrationJobPlan) -> Job {
+/// 迁移 Job 的 Pod 形态（同步与补迁共用）：同一份加固配置、同一对卷
+/// （src 共享卷只读 + dst per-agent 卷可写）。容器里执行 `script`（`/bin/bash -c`）。
+#[derive(Debug, Clone)]
+struct MigrationJobPod {
+    job_name: String,
+    namespace: String,
+    image: String,
+    /// Job 的 `rcoder.io/workspace-migration` 标签值（= user_id，运维识别用）。
+    user_id: String,
+    src_pvc: String,
+    dst_pvc: String,
+    /// 容器名（`kubectl logs` 里看到的角色）。
+    role: &'static str,
+    script: String,
+}
+
+fn build_migration_job(job: &MigrationJobPod) -> Job {
     let labels = [
         (
             shared_types::WORKSPACE_MIGRATION_JOB_LABEL.to_string(),
-            plan.src_subpath.clone(),
+            job.user_id.clone(),
         ),
         ("app".to_string(), "rcoder-workspace-migration".to_string()),
     ];
     Job {
         metadata: ObjectMeta {
-            name: Some(plan.job_name.clone()),
-            namespace: Some(plan.namespace.clone()),
+            name: Some(job.job_name.clone()),
+            namespace: Some(job.namespace.clone()),
             labels: Some(labels.iter().cloned().collect()),
             ..Default::default()
         },
@@ -284,10 +427,10 @@ fn build_job(plan: &MigrationJobPlan) -> Job {
                         ..Default::default()
                     }),
                     containers: vec![Container {
-                        name: "sync".to_string(),
-                        image: Some(plan.image.clone()),
+                        name: job.role.to_string(),
+                        image: Some(job.image.clone()),
                         command: Some(vec!["/bin/bash".to_string(), "-c".to_string()]),
-                        args: Some(vec![job_script(plan)]),
+                        args: Some(vec![job.script.clone()]),
                         env: Some(vec![EnvVar {
                             name: "RUST_LOG".to_string(),
                             value: Some("error".to_string()),
@@ -313,7 +456,7 @@ fn build_job(plan: &MigrationJobPlan) -> Job {
                         Volume {
                             name: "src".to_string(),
                             persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                                claim_name: plan.src_pvc.clone(),
+                                claim_name: job.src_pvc.clone(),
                                 read_only: Some(true),
                             }),
                             ..Default::default()
@@ -321,7 +464,7 @@ fn build_job(plan: &MigrationJobPlan) -> Job {
                         Volume {
                             name: "dst".to_string(),
                             persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                                claim_name: plan.dst_pvc.clone(),
+                                claim_name: job.dst_pvc.clone(),
                                 read_only: Some(false),
                             }),
                             ..Default::default()
@@ -334,6 +477,40 @@ fn build_job(plan: &MigrationJobPlan) -> Job {
         }),
         ..Default::default()
     }
+}
+
+fn build_job(plan: &MigrationJobPlan) -> Job {
+    build_migration_job(&MigrationJobPod {
+        job_name: plan.job_name.clone(),
+        namespace: plan.namespace.clone(),
+        image: plan.image.clone(),
+        user_id: plan.src_subpath.clone(),
+        src_pvc: plan.src_pvc.clone(),
+        dst_pvc: plan.dst_pvc.clone(),
+        role: "sync",
+        script: job_script(plan),
+    })
+}
+
+/// Job 脚本的公共开头：`set -euo pipefail`、关 glob、镜像里没有 rclone 时下载。
+fn job_prelude(download_rclone: bool) -> String {
+    let download = if download_rclone {
+        r#"if ! command -v rclone >/dev/null 2>&1; then
+            echo "[migrate] rclone missing in image, downloading..."
+            curl -fsSL --max-time 180 -o /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
+            unzip -oq /tmp/rclone.zip -d /tmp/rc
+            RC_BIN=$(find /tmp/rc -maxdepth 2 -name rclone -type f | head -1)
+            install -m 0755 "$RC_BIN" /usr/local/bin/rclone
+        fi
+        "#
+    } else {
+        ""
+    };
+    format!(
+        "set -euo pipefail
+set -f
+{download}"
+    )
 }
 
 /// Job 的 Pod 里有没有卡在"起不来"状态的容器；有则返回可读原因。
@@ -431,6 +608,123 @@ impl StuckObservation {
             }
         }
     }
+}
+
+/// 等迁移 Job 跑完：成功返回 `Ok(())`，失败返回原因（`failed=3, active=0`、`timeout`、
+/// Pod 起不来的原因…）。不删 Job——调用方取完日志再删。
+async fn wait_for_migration_job(
+    jobs: &Api<Job>,
+    pods: &Api<Pod>,
+    job_name: &str,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + JOB_WAIT_TIMEOUT;
+    let selector = format!("job-name={job_name}");
+    let mut stuck = StuckObservation::default();
+    let mut next_pod_check = std::time::Instant::now() + POD_CHECK_DELAY;
+    let mut get_errors = GetErrorBudget::default();
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err("timeout".to_string());
+        }
+        match jobs.get(job_name).await {
+            Ok(job) => {
+                get_errors.recovered();
+                let status = job.status.as_ref();
+                if status.and_then(|s| s.succeeded).unwrap_or(0) >= 1 {
+                    return Ok(());
+                }
+                // Failed 条件（backoffLimit 耗尽；不依赖具体的重试次数），或
+                // 失败计数耗尽且没有在跑的 Pod
+                let failed = status.and_then(|s| s.failed).unwrap_or(0);
+                let active = status.and_then(|s| s.active).unwrap_or(0);
+                let failed_condition =
+                    status
+                        .and_then(|s| s.conditions.as_ref())
+                        .is_some_and(|conditions| {
+                            conditions
+                                .iter()
+                                .any(|c| c.type_ == "Failed" && c.status == "True")
+                        });
+                if failed_condition || (failed >= 3 && active == 0) {
+                    return Err(format!("failed={failed}, active={active}"));
+                }
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                return Err(format!("job is gone: {}", error.message));
+            }
+            Err(e) => {
+                // 瞬时读失败: 这一轮状态未知, 跳过; 连续失败太久才放弃
+                if get_errors.exhausted(std::time::Instant::now(), JOB_GET_ERROR_TOLERANCE) {
+                    return Err(format!(
+                        "reading the job status kept failing for at least {JOB_GET_ERROR_TOLERANCE:?}: {e}"
+                    ));
+                }
+                tracing::debug!(
+                    job = %job_name,
+                    error = %e,
+                    "migration job status read failed; will retry"
+                );
+            }
+        }
+        // Pod 起不来时（拉不到镜像、容器创建失败）Job 的 active 恒为 1、failed
+        // 恒为 0——上面的判据要等到 activeDeadlineSeconds（4h）才成立，而这期间
+        // 用户的 agent 停着，写门禁与该用户的编排锁都被占着。这类等待态
+        // 不会自愈，确认后立即失败：调用方拿到原因，按各自的语义收尾。
+        if std::time::Instant::now() >= next_pod_check {
+            next_pod_check = std::time::Instant::now() + POD_CHECK_EVERY;
+            let now = std::time::Instant::now();
+            match pods.list(&ListParams::default().labels(&selector)).await {
+                Ok(list) => {
+                    let blockage = pod_blockage(list.items.iter());
+                    if stuck.confirmed(blockage, now, POD_STUCK_FOR) {
+                        return Err(blocked_container(list.items.iter())
+                            .unwrap_or_else(|| "pod is not starting".to_string()));
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        job = %job_name,
+                        error = %e,
+                        "migration job pod status check failed"
+                    );
+                    // 这次没观测到：按"没有异常"处理，重新计数
+                    stuck.confirmed(PodBlockage::None, now, POD_STUCK_FOR);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
+/// Job 的 Pod 日志（拼在一起）。只用来给结果补充原因：取不到就当没有, 不改变主结果。
+async fn job_log(pods: &Api<Pod>, job_name: &str) -> String {
+    use kube::api::LogParams;
+    let selector = format!("job-name={job_name}");
+    let list = match pods.list(&ListParams::default().labels(&selector)).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::debug!(job = %job_name, error = %e, "migration job pod list failed");
+            return String::new();
+        }
+    };
+    let mut log = String::new();
+    for pod in &list.items {
+        let Some(name) = pod.metadata.name.as_deref() else {
+            continue;
+        };
+        match pods.logs(name, &LogParams::default()).await {
+            Ok(text) => {
+                log.push_str(&text);
+                if !text.ends_with('\n') {
+                    log.push('\n');
+                }
+            }
+            Err(e) => {
+                tracing::debug!(pod = name, error = %e, "migration job log read failed");
+            }
+        }
+    }
+    log
 }
 
 impl KubernetesRuntime {
@@ -538,85 +832,8 @@ impl KubernetesRuntime {
             .map_err(|e| ContainerRuntimeError::K8sError(format!("create migration Job: {e}")))?;
         // 等完成: 轮询 condition=Complete / succeeded>=1（不依赖 wait 子命令,
         // 超时即失败——Job 的 activeDeadlineSeconds 会兜底杀掉 rclone）
-        let deadline = std::time::Instant::now() + JOB_WAIT_TIMEOUT;
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
-        let selector = format!("job-name={}", plan.job_name);
-        let mut stuck = StuckObservation::default();
-        let mut next_pod_check = std::time::Instant::now() + POD_CHECK_DELAY;
-        let mut get_errors = GetErrorBudget::default();
-        let outcome = loop {
-            if std::time::Instant::now() > deadline {
-                break Err("timeout".to_string());
-            }
-            match jobs.get(&plan.job_name).await {
-                Ok(job) => {
-                    get_errors.recovered();
-                    let status = job.status.as_ref();
-                    if status.and_then(|s| s.succeeded).unwrap_or(0) >= 1 {
-                        break Ok(());
-                    }
-                    // Failed 条件（backoffLimit 耗尽；不依赖具体的重试次数），或
-                    // 失败计数耗尽且没有在跑的 Pod
-                    let failed = status.and_then(|s| s.failed).unwrap_or(0);
-                    let active = status.and_then(|s| s.active).unwrap_or(0);
-                    let failed_condition =
-                        status
-                            .and_then(|s| s.conditions.as_ref())
-                            .is_some_and(|conditions| {
-                                conditions
-                                    .iter()
-                                    .any(|c| c.type_ == "Failed" && c.status == "True")
-                            });
-                    if failed_condition || (failed >= 3 && active == 0) {
-                        break Err(format!("failed={failed}, active={active}"));
-                    }
-                }
-                Err(kube::Error::Api(error)) if error.code == 404 => {
-                    break Err(format!("job is gone: {}", error.message));
-                }
-                Err(e) => {
-                    // 瞬时读失败: 这一轮状态未知, 跳过; 连续失败太久才放弃
-                    if get_errors.exhausted(std::time::Instant::now(), JOB_GET_ERROR_TOLERANCE) {
-                        break Err(format!(
-                            "reading the job status kept failing for at least {JOB_GET_ERROR_TOLERANCE:?}: {e}"
-                        ));
-                    }
-                    tracing::debug!(
-                        job = %plan.job_name,
-                        error = %e,
-                        "migration sync job status read failed; will retry"
-                    );
-                }
-            }
-            // Pod 起不来时（拉不到镜像、容器创建失败）Job 的 active 恒为 1、failed
-            // 恒为 0——上面的判据要等到 activeDeadlineSeconds（4h）才成立，而这期间
-            // cutover 的 agent 停着，写门禁与该用户的编排锁都被占着。这类等待态
-            // 不会自愈，确认后立即失败：调用方拿到原因，用户的下一个请求会把
-            // agent 重建回共享卷。
-            if std::time::Instant::now() >= next_pod_check {
-                next_pod_check = std::time::Instant::now() + POD_CHECK_EVERY;
-                let now = std::time::Instant::now();
-                match pods.list(&ListParams::default().labels(&selector)).await {
-                    Ok(list) => {
-                        let blockage = pod_blockage(list.items.iter());
-                        if stuck.confirmed(blockage, now, POD_STUCK_FOR) {
-                            break Err(blocked_container(list.items.iter())
-                                .unwrap_or_else(|| "pod is not starting".to_string()));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            job = %plan.job_name,
-                            error = %e,
-                            "migration sync job pod status check failed"
-                        );
-                        // 这次没观测到：按"没有异常"处理，重新计数
-                        stuck.confirmed(PodBlockage::None, now, POD_STUCK_FOR);
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        };
+        let outcome = wait_for_migration_job(&jobs, &pods, &plan.job_name).await;
         if let Err(reason) = outcome {
             let tail = jobs
                 .get(&plan.job_name)
@@ -650,6 +867,80 @@ impl KubernetesRuntime {
             );
         }
         Ok(())
+    }
+
+    /// 起补迁 Job（只补缺失的拷贝 + 软链校验）, 等完成, 从日志里取回报告。
+    ///
+    /// 成败都先把 Job 的日志取走再删 Job：补迁失败的典型原因是目标卷空间不够、补完仍有
+    /// 坏软链, 原因只在脚本自己的输出里——只给 Job 的 conditions 调用方什么也看不出。
+    pub(crate) async fn run_workspace_backfill_inner(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        backfill: &shared_types::WorkspaceBackfill,
+        src_pvc: &str,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceBackfillReport> {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        // 纯检查排在任何 I/O 之前（纵深防御：编排入口已先做过一遍）。
+        validate_migration_identifier(identifier)?;
+        if let Err(reason) = backfill.validate() {
+            return Err(ContainerRuntimeError::ConfigurationError(format!(
+                "cannot backfill the workspace of '{identifier}': {reason}"
+            )));
+        }
+        let (final_image, download_rclone) = resolve_migration_image_from_env()?;
+        let dst_pvc = self.workspace_pvc_name(identifier, service_type)?;
+        if self
+            .pvcs()
+            .get_opt(&dst_pvc)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("get PVC '{dst_pvc}': {e}")))?
+            .is_none()
+        {
+            return Err(ContainerRuntimeError::ContainerNotFound(format!(
+                "destination PVC '{dst_pvc}' not found; run phase-a first"
+            )));
+        }
+        let plan = BackfillJobPlan {
+            job_name: backfill_job_name(identifier),
+            namespace: self.namespace.clone(),
+            image: final_image,
+            download_rclone,
+            src_pvc: src_pvc.to_string(),
+            dst_pvc,
+            src_subpath: identifier.to_string(),
+            src_dir: format!("/src/{identifier}"),
+            dst_dir: "/dst".to_string(),
+            filters: shared_types::WORKSPACE_MIGRATION_FILTERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            backfill: backfill.clone(),
+        };
+        let jobs: Api<Job> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        drop(jobs.delete(&plan.job_name, &job_delete_params()).await);
+        jobs.create(&PostParams::default(), &build_backfill_job(&plan))
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("create backfill Job: {e}")))?;
+        let outcome = wait_for_migration_job(&jobs, &pods, &plan.job_name).await;
+        let log = job_log(&pods, &plan.job_name).await;
+        // 清理 best-effort：删除失败不改变主结果，但必须可观测。
+        if let Err(e) = jobs.delete(&plan.job_name, &job_delete_params()).await {
+            tracing::warn!(
+                job = %plan.job_name,
+                error = %e,
+                "backfill job cleanup delete failed"
+            );
+        }
+        if let Err(reason) = outcome {
+            return Err(ContainerRuntimeError::K8sError(format!(
+                "workspace backfill job '{}' did not succeed ({reason})\n{}",
+                plan.job_name,
+                log_tail(&log, BACKFILL_FAILURE_LOG_LINES)
+            )));
+        }
+        Ok(parse_backfill_report(&log))
     }
 }
 

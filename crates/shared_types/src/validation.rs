@@ -132,6 +132,87 @@ pub fn validate_migration_user_id(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ── 补迁（backfill）的范围与模式 ──
+//
+// 补迁 Job 的脚本参数逐个来自请求（见 `docker_manager` 的 `BackfillJobPlan`）：
+// 范围作为字面量拼进 rclone 的放行规则，模式本来就是 rclone 通配。形态不对的值不能等到
+// 停完 agent、Job 跑起来才暴露。
+
+/// 一次补迁请求最多给这么多范围 / 模式（Fail Fast）。
+pub const WORKSPACE_BACKFILL_MAX_PATHS: usize = 64;
+pub const WORKSPACE_BACKFILL_MAX_ONLY_PATTERNS: usize = 16;
+const WORKSPACE_BACKFILL_PATH_MAX_LEN: usize = 512;
+const WORKSPACE_BACKFILL_ONLY_MAX_LEN: usize = 256;
+
+const BACKFILL_PATHS: &str = "paths";
+const BACKFILL_ONLY: &str = "only-patterns";
+
+/// 补迁的范围（相对用户目录）。文案默认英文。
+///
+/// 两种通配写法原样放行：`.`（整棵树）、`*`（顶层非点开头的目录里源与目标都有的）。
+/// 其余必须是干净的相对路径——它作为字面量拼进 rclone 的放行规则：以 `/` 开头或带 `..`
+/// 是越出用户目录，空的、`.`、`..` 路径段让规则对不上，`*`、`?`、`[`、反斜杠会被 rclone
+/// 当通配或转义解释。
+pub fn validate_workspace_backfill_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.len() > WORKSPACE_BACKFILL_PATH_MAX_LEN {
+        return Err(format!(
+            "{BACKFILL_PATHS} entries must be 1-{WORKSPACE_BACKFILL_PATH_MAX_LEN} characters long, got {path:?}"
+        ));
+    }
+    if path == "." || path == "*" {
+        return Ok(());
+    }
+    if path.starts_with('/') {
+        return Err(format!(
+            "{BACKFILL_PATHS} entries must be relative to the user's home directory, got {path:?}"
+        ));
+    }
+    if path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(format!(
+            "{BACKFILL_PATHS} entries must not contain empty, \".\" or \"..\" segments, got {path:?}"
+        ));
+    }
+    if let Some(bad) = path
+        .chars()
+        .find(|c| matches!(c, '*' | '?' | '[' | '\\') || c.is_control())
+    {
+        return Err(format!(
+            "{BACKFILL_PATHS} entries must not contain {bad:?} (only \"*\" alone is a wildcard), got {path:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// 补迁的 `--only` 模式：相对范围之下任意层级的 rclone 通配（如 `node_modules/**`）。
+pub fn validate_workspace_backfill_only_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() || pattern.len() > WORKSPACE_BACKFILL_ONLY_MAX_LEN {
+        return Err(format!(
+            "{BACKFILL_ONLY} entries must be 1-{WORKSPACE_BACKFILL_ONLY_MAX_LEN} characters long, got {pattern:?}"
+        ));
+    }
+    if pattern.starts_with('/') {
+        return Err(format!(
+            "{BACKFILL_ONLY} entries are matched at any depth below the scope, so they must not start with '/', got {pattern:?}"
+        ));
+    }
+    if pattern
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(format!(
+            "{BACKFILL_ONLY} entries must not contain empty, \".\" or \"..\" segments, got {pattern:?}"
+        ));
+    }
+    if let Some(bad) = pattern.chars().find(|c| *c == '\\' || c.is_control()) {
+        return Err(format!(
+            "{BACKFILL_ONLY} entries must not contain {bad:?}, got {pattern:?}"
+        ));
+    }
+    Ok(())
+}
 // ── 多平台绝对路径规范化（自 file-server workspace.rs 提取，单一事实源）──────
 //
 // 首个消费方为 file-server 的项目绑定目录 workspaceDir（TS nuwax-file-server
@@ -698,6 +779,108 @@ mod tests {
                 "{st:?}: {err}"
             );
         }
+    }
+    /// 反例：补迁的范围作为字面量拼进 rclone 的放行规则，带 `..` 或以 `/` 开头就是越出用户
+    /// 目录；这些值不能等到停完 agent、Job 跑起来才暴露。
+    #[test]
+    fn backfill_paths_are_clean_relative_paths_or_the_two_wildcards() {
+        for ok in [
+            ".",
+            "*",
+            ".local/share/pnpm",
+            "proj-a",
+            "我的 目录/x",
+            &"a".repeat(WORKSPACE_BACKFILL_PATH_MAX_LEN),
+        ] {
+            assert!(
+                validate_workspace_backfill_path(ok).is_ok(),
+                "{ok:?} 应通过"
+            );
+        }
+        let long = "a".repeat(WORKSPACE_BACKFILL_PATH_MAX_LEN + 1);
+        for bad in [
+            "",
+            "/etc",
+            "../other-user",
+            "a/../../b",
+            "./proj",
+            "proj/",
+            "proj//x",
+            "proj/*/x",
+            "proj?",
+            "proj[1]",
+            "a\\b",
+            "a\nb",
+            long.as_str(),
+        ] {
+            let Err(reason) = validate_workspace_backfill_path(bad) else {
+                panic!("{bad:?} 必须被拒")
+            };
+            assert!(reason.contains("paths"), "{bad:?}: {reason}");
+            assert!(
+                !reason.contains('\n'),
+                "多行输入不能把错误撑成多行: {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_only_patterns_are_relative_rclone_globs() {
+        for ok in ["node_modules/**", "dist/**", "core.[0-9]*", "**/vendor"] {
+            assert!(
+                validate_workspace_backfill_only_pattern(ok).is_ok(),
+                "{ok:?} 应通过"
+            );
+        }
+        for bad in [
+            "",
+            "/node_modules/**",
+            "../x/**",
+            "./x",
+            "x//y",
+            "a\\b",
+            "a\u{0}b",
+        ] {
+            let Err(reason) = validate_workspace_backfill_only_pattern(bad) else {
+                panic!("{bad:?} 必须被拒")
+            };
+            assert!(reason.contains("only-patterns"), "{bad:?}: {reason}");
+        }
+    }
+
+    #[test]
+    fn backfill_request_caps_how_many_paths_and_patterns_it_carries() {
+        let mut request = crate::WorkspaceBackfill::default();
+        assert!(
+            request.validate().is_ok(),
+            "缺省范围（顶层点目录）是合法请求"
+        );
+
+        request.paths = vec!["proj".to_string(); WORKSPACE_BACKFILL_MAX_PATHS];
+        request.only = vec!["node_modules/**".to_string(); WORKSPACE_BACKFILL_MAX_ONLY_PATTERNS];
+        assert!(request.validate().is_ok(), "恰好到上限要通过");
+
+        request.paths.push("proj".to_string());
+        let reason = request.validate().unwrap_err();
+        assert_eq!(
+            reason,
+            format!(
+                "backfill accepts at most {} paths, got {}",
+                WORKSPACE_BACKFILL_MAX_PATHS,
+                WORKSPACE_BACKFILL_MAX_PATHS + 1
+            )
+        );
+        request.paths.pop();
+        request.only.push("dist/**".to_string());
+        let reason = request.validate().unwrap_err();
+        assert_eq!(
+            reason,
+            format!(
+                "backfill accepts at most {} only-patterns, got {}",
+                WORKSPACE_BACKFILL_MAX_ONLY_PATTERNS,
+                WORKSPACE_BACKFILL_MAX_ONLY_PATTERNS + 1
+            )
+        );
     }
 }
 

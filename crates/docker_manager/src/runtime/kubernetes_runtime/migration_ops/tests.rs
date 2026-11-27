@@ -24,9 +24,7 @@ fn plan(mode: WorkspaceSyncMode) -> MigrationJobPlan {
 #[test]
 fn full_mode_args_carry_bwlimit_and_filters() {
     let args = plan(WorkspaceSyncMode::Full).rclone_args();
-    assert!(
-        args.starts_with("sync '/src/u_1' /dst --links --metadata --create-empty-src-dirs")
-    );
+    assert!(args.starts_with("sync '/src/u_1' /dst --links --metadata --create-empty-src-dirs"));
     assert!(args.contains("--bwlimit '150M'"));
     assert!(args.contains("--filter '- .cache/' --filter '- .npm/_npx/'"));
 }
@@ -253,8 +251,7 @@ fn job_script_delivers_each_argument_as_one_argv_element() {
 #[cfg(unix)]
 #[test]
 fn job_script_passes_the_filter_vocabulary_in_order() {
-    let Some((argv, stdout)) = argv_delivered_by_job_script(&plan(WorkspaceSyncMode::Full))
-    else {
+    let Some((argv, stdout)) = argv_delivered_by_job_script(&plan(WorkspaceSyncMode::Full)) else {
         eprintln!("skipping: bash not found");
         return;
     };
@@ -556,3 +553,138 @@ fn job_spec_mounts_src_readonly() {
             .any(|c| c.name == "sync" && c.image.is_some())
     );
 }
+
+// ---- 补迁 Job ----
+
+fn backfill_plan() -> BackfillJobPlan {
+    BackfillJobPlan {
+        job_name: backfill_job_name("u_1"),
+        namespace: "ns".into(),
+        image: "img".into(),
+        download_rclone: false,
+        src_pvc: "shared".into(),
+        dst_pvc: "dst".into(),
+        src_subpath: "u_1".into(),
+        src_dir: "/src/u_1".into(),
+        dst_dir: "/dst".into(),
+        filters: shared_types::WORKSPACE_MIGRATION_FILTERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        backfill: shared_types::WorkspaceBackfill::default(),
+    }
+}
+
+#[test]
+fn backfill_args_carry_source_destination_filters_then_only_patterns_then_paths() {
+    let mut p = backfill_plan();
+    p.backfill = shared_types::WorkspaceBackfill {
+        paths: vec!["*".into(), "it's/proj node_modules".into()],
+        only: vec!["node_modules/**".into(), "dist/**".into()],
+    };
+    assert_eq!(
+        p.backfill_args(),
+        "'/src/u_1' '/dst' '- .cache/' '- .npm/_npx/' '--' \
+         '--only' 'node_modules/**' '--only' 'dist/**' '*' 'it'\\''s/proj node_modules'"
+    );
+    assert_eq!(
+        backfill_job_name("u_1"),
+        "migrate-u-1-backfill",
+        "Job 名里下划线换连字符, 与同步 Job 同一条规则"
+    );
+}
+
+/// 整段脚本放进引号 heredoc：内容必须以换行结尾（结束标记才独占一行）、且不能自己
+/// 含有结束标记——任何一条不成立, 落成文件的脚本就会被截断。
+#[test]
+fn embedded_scripts_fit_the_heredoc_that_carries_them() {
+    for script in [BACKFILL_SCRIPT, LINK_GUARD_SCRIPT] {
+        assert!(script.ends_with('\n'), "脚本必须以换行结尾");
+        assert!(
+            !script
+                .lines()
+                .any(|line| line.trim_end() == SCRIPT_HEREDOC_END),
+            "脚本内容不能出现 heredoc 的结束标记"
+        );
+    }
+}
+
+/// `rclone version | head -1` 在 pipefail 下有竞态：head 读完第一行就退出，rclone 余下的输出
+/// 撞上 SIGPIPE，整个 Job 以 141 失败——那时它还什么都没做（拿真实 rclone 跑渲染出来的 Job
+/// 时复现：5 次里 2 次）。sed 把输入读完，没有这个竞态。同步、补迁两种 Job 都走这一行。
+#[test]
+fn job_scripts_do_not_pipe_rclone_version_into_head() {
+    for script in [
+        job_script(&plan(WorkspaceSyncMode::Full)),
+        backfill_job_script(&backfill_plan()),
+    ] {
+        assert!(script.contains("rclone version | sed -n 1p\n"), "{script}");
+        assert!(!script.contains("rclone version | head"), "{script}");
+    }
+}
+
+#[test]
+fn backfill_report_is_read_from_the_markers_in_the_job_log() {
+    let log = "rclone v1.76.0\n\
+               [backfill] copy: .local\n\
+               Transferred: 0 B / 0 B, --, -, 0 files, 0\n\
+               [backfill] copied: .local\n\
+               [backfill] copied: proj\n\
+               [backfill] skipped: .nope\n\
+               [verify] 软链完整性：核对软链 3 条，损坏 0 处\n";
+    let report = parse_backfill_report(log);
+    assert_eq!(report.copied, [".local", "proj"]);
+    assert_eq!(report.skipped, [".nope"]);
+    // rclone 的进度行、`copy:` 的开头行都不是报告
+    let empty = Vec::<String>::new();
+    assert_eq!(
+        parse_backfill_report("[backfill] copied-x: .local").copied,
+        empty
+    );
+    assert_eq!(log_tail("a\nb\nc\nd", 2), "c\nd");
+    assert_eq!(log_tail("a\nb", 40), "a\nb");
+    assert_eq!(log_tail("", 40), "");
+}
+
+#[test]
+fn backfill_job_has_the_same_hardening_and_volumes_as_the_sync_job() {
+    let p = backfill_plan();
+    let job = build_backfill_job(&p);
+    let pod = job.spec.unwrap().template.spec.unwrap();
+    assert_eq!(job.metadata.name.unwrap(), "migrate-u-1-backfill");
+    assert_eq!(pod.automount_service_account_token, Some(false));
+    assert!(
+        pod.security_context.is_some(),
+        "seccomp 收敛到 RuntimeDefault"
+    );
+    let container = &pod.containers[0];
+    assert_eq!(container.name, "backfill");
+    let mounts = container.volume_mounts.as_deref().unwrap();
+    assert_eq!(mounts[0].mount_path, "/src");
+    assert_eq!(mounts[0].read_only, Some(true));
+    assert_eq!(mounts[1].mount_path, "/dst");
+    assert_eq!(mounts[1].read_only, Some(false));
+    let volumes = pod.volumes.as_deref().unwrap();
+    assert_eq!(
+        volumes[0]
+            .persistent_volume_claim
+            .as_ref()
+            .unwrap()
+            .claim_name,
+        "shared"
+    );
+    assert_eq!(
+        volumes[1]
+            .persistent_volume_claim
+            .as_ref()
+            .unwrap()
+            .claim_name,
+        "dst"
+    );
+}
+
+/// 端到端：生成的 Job 脚本在**真实 bash** 下执行, 只有 rclone 是桩（记下 argv、按给定
+/// 退出码退出）。其余都是真的：Job 脚本 → 渲染进去的 backfill.sh → 桩 rclone →
+/// 渲染进去的 toolchain-guard.sh。没有 bash 的环境跳过。
+#[cfg(unix)]
+mod end_to_end;

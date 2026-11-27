@@ -14,6 +14,7 @@
 //! - `POST /api/migration/{user_id}/cutover`           停 agent → 增量 → 翻标记 → 恢复 agent
 //! - `POST /api/migration/{user_id}/rollback`          翻回共享卷 → 恢复 agent
 //! - `POST /api/migration/{user_id}/migration-state`   只翻标记（body `{state}`；排障用）
+//! - `POST /api/migration/{user_id}/backfill`           给已迁移用户的卷补缺失的文件（body `{paths, only}`）
 //!
 //! 编排（原子完成；失败语义与已知窗口见 k8s/migration README §10）在
 //! `computer_forward::orchestrate`：
@@ -21,6 +22,7 @@
 //! phase-a: ensure PVC → sync(Full)                                  → NotMigrated
 //! cutover: stop agent → 等 detach → sync(Incremental) → set Migrated → 恢复 agent
 //! rollback: stop agent → set NotMigrated → 恢复 agent（共享卷）
+//! backfill: stop agent → 等 detach → 只补缺失的拷贝 + 软链校验 → 恢复 agent（标记不变）
 //! ```
 //! 判据层（转发路由 + agent 卷选择）以 `migrated` 标记为唯一开关——
 //! phase-a 后标记未翻，用户照常走共享卷，预同步期双份共存不裂。
@@ -57,7 +59,7 @@ fn user_allowed(allowed: &HashSet<String>, user_id: &str) -> bool {
     allowed.contains(user_id) || allowed.contains(ALLOW_ALL)
 }
 
-/// 入口准入（五个端点共用，先便宜后贵）。返回 `Err(响应)` = 请求被拒。
+/// 入口准入（六个端点共用，先便宜后贵）。返回 `Err(响应)` = 请求被拒。
 ///
 /// 1. `user_id` 形态：全仓统一的标识符白名单（与 file-server 解析路径、迁移
 ///    Job 的源路径校验是同一份规则），外加迁移 Job 的命名限制（见
@@ -328,6 +330,98 @@ pub async fn rollback(
     }
 }
 
+/// `POST /api/migration/{user_id}/backfill` 的请求体（两段都可省，省略即空数组）。
+#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct BackfillBody {
+    /// 范围：用户目录下的相对路径，或两种通配写法——`.`（整棵树，切换后删掉的东西都会回来）、
+    /// `*`（顶层非点开头的目录=项目，只取源与目标都有的）。空数组 = 顶层点目录里源与目标
+    /// 都有的（pnpm 的版本切换目录与全局包、编辑器扩展…）。最多 64 个。
+    pub paths: Vec<String>,
+    /// 只补匹配这些模式的条目（相对范围之下任意层级，如 `node_modules/**`）。空数组 = 范围之内全部。
+    /// 最多 16 个。
+    pub only: Vec<String>,
+}
+
+/// `200` 的响应体。
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct BackfillResponse {
+    pub user_id: String,
+    pub action: String,
+    /// 补迁不翻标记：恒为 `migrated`。
+    pub migration_state: String,
+    /// 步骤轨迹（排障用）。
+    pub steps: Vec<String>,
+    /// 拷过的范围（相对用户目录）。
+    pub copied: Vec<String>,
+    /// 共享卷上没有、跳过的范围。
+    pub skipped: Vec<String>,
+}
+
+/// 请求体 → 补迁请求：解析 + 校验（纯函数，供单测）。解析错误只带 serde 给的位置与原因，不回显
+/// 请求体；校验错误带上出问题的那一项。文案都是单行（它原样就是 400 的响应体）。
+fn parse_backfill_body(body: &[u8]) -> Result<shared_types::WorkspaceBackfill, String> {
+    let body: BackfillBody = serde_json::from_slice(body)
+        .map_err(|err| format!("invalid body ({err}): expected {{\"paths\":[…],\"only\":[…]}}"))?;
+    let request = shared_types::WorkspaceBackfill {
+        paths: body.paths,
+        only: body.only,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+/// 补迁：给已迁移用户的卷补缺失的文件
+///
+/// 停 agent → 等卷卸载 → 从共享卷只补目标卷上没有的文件（不覆盖、不删除）→ 对刚补过的
+/// 范围做软链完整性校验 → 恢复 agent。不翻迁移标记。
+#[utoipa::path(
+    post,
+    path = "/api/migration/{user_id}/backfill",
+    tag = "migration",
+    operation_id = "migration_backfill",
+    params(("user_id" = String, Path, description = "已迁移到 per-agent RBD 卷的 user_id")),
+    request_body = BackfillBody,
+    responses(
+        (status = 200, description = "补迁完成", body = BackfillResponse),
+        (status = 400, description = "user_id 拼不出合法的迁移 Job 名，或请求体不合法：范围不是干净的相对路径、带了 `..`、数量超限…", body = String),
+        (status = 403, description = "user_id 不在 RCODER_MIGRATION_TEST_USERS 白名单里", body = String),
+        (status = 404, description = "该用户还没有 per-agent 卷（没跑过 phase-a）", body = String),
+        (status = 409, description = "该用户未迁移（先跑 phase-a + cutover）", body = String),
+        (status = 500, description = "Job 失败或超时：目标卷空间不够、补完仍有坏软链…原因带在返回里；目标卷上已有的文件没被动过，扩容/排障后重跑即可（幂等）", body = String),
+        (status = 503, description = "同一用户的另一次编排还在收尾、agent 正在启动、在途写没排空、或读 Job 状态持续失败：稍后重试", body = String),
+        (status = 501, description = "不是 Kubernetes 运行时", body = String),
+    )
+)]
+pub async fn backfill(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(user_id): Path<String>,
+    // 不用 `Json<T>` 提取器：原因同 set_state——准入先于请求体解析。
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(response) = ensure_allowed(&user_id) {
+        return *response;
+    }
+    let request = match parse_backfill_body(&body) {
+        Ok(request) => request,
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+    };
+    let src_pvc = migration_src_pvc();
+    match crate::computer_forward::orchestrate::backfill(&state, &user_id, &src_pvc, &request).await
+    {
+        Ok(outcome) => Json(BackfillResponse {
+            user_id: outcome.migration.user_id,
+            action: outcome.migration.action.to_string(),
+            migration_state: "migrated".to_string(),
+            steps: outcome.migration.steps,
+            copied: outcome.report.copied,
+            skipped: outcome.report.skipped,
+        })
+        .into_response(),
+        Err(error) => (status_for(&error), format!("backfill failed: {error}")).into_response(),
+    }
+}
+
 /// 源共享 PVC 名（env `RCODER_MIGRATION_SRC_PVC`; 缺省回退 computer 共享卷名）。
 fn migration_src_pvc() -> String {
     std::env::var("RCODER_MIGRATION_SRC_PVC")
@@ -360,6 +454,85 @@ pub fn routes() -> axum::Router<std::sync::Arc<AppState>> {
             "/api/migration/{user_id}/rollback",
             axum::routing::post(rollback),
         )
+        .route(
+            "/api/migration/{user_id}/backfill",
+            axum::routing::post(backfill),
+        )
+}
+
+#[cfg(test)]
+mod backfill_body_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_body_is_the_default_scope() {
+        assert_eq!(parse_backfill_body(b"{}"), Ok(Default::default()));
+        assert_eq!(
+            parse_backfill_body(br#"{"paths":["*"],"only":["node_modules/**","dist/**"]}"#),
+            Ok(shared_types::WorkspaceBackfill {
+                paths: vec!["*".to_string()],
+                only: vec!["node_modules/**".to_string(), "dist/**".to_string()],
+            })
+        );
+    }
+
+    /// 反例：范围会作为字面量拼进 rclone 的放行规则——带 `..`、以 `/` 开头的值必须在入口就
+    /// 400, 不能等到停完 agent 才暴露。
+    #[test]
+    fn escaping_or_malformed_scopes_are_rejected_before_any_side_effect() {
+        for body in [
+            r#"{"paths":["../other-user"]}"#,
+            r#"{"paths":["/etc"]}"#,
+            r#"{"paths":["proj/*/x"]}"#,
+            r#"{"only":["../x/**"]}"#,
+            // 写错的字段名（path / onlys）不能被当成"没给"静默放过
+            r#"{"path":[".local"]}"#,
+            r#"{"onlys":["dist/**"]}"#,
+            r#"{"paths":".local"}"#,
+            "not json",
+            "",
+        ] {
+            let Err(reason) = parse_backfill_body(body.as_bytes()) else {
+                panic!("{body:?} 必须被拒")
+            };
+            assert!(!reason.contains('\n'), "{body:?}: {reason}");
+        }
+    }
+
+    #[test]
+    fn too_many_scopes_or_patterns_are_rejected() {
+        let paths = vec!["proj"; shared_types::validation::WORKSPACE_BACKFILL_MAX_PATHS + 1];
+        let body = serde_json::json!({ "paths": paths }).to_string();
+        let reason = parse_backfill_body(body.as_bytes()).unwrap_err();
+        assert!(reason.contains("at most 64 paths"), "{reason}");
+    }
+
+    #[test]
+    fn backfill_is_in_the_openapi_document() {
+        let document = <crate::router_docs::ApiDoc as utoipa::OpenApi>::openapi();
+        let operation = document
+            .paths
+            .paths
+            .get("/api/migration/{user_id}/backfill")
+            .and_then(|path| path.post.as_ref())
+            .expect("补迁端点要登记进主文档");
+        assert_eq!(
+            operation.operation_id.as_deref(),
+            Some("migration_backfill")
+        );
+        assert_eq!(operation.tags, Some(vec!["migration".to_string()]));
+        let utoipa::openapi::RefOr::T(request) = operation.request_body.as_ref().expect("有请求体")
+        else {
+            panic!("请求体不该是引用");
+        };
+        let utoipa::openapi::RefOr::T(content) = &request.content["application/json"] else {
+            panic!("application/json 的内容不该是引用");
+        };
+        assert!(
+            matches!(content.schema, Some(utoipa::openapi::RefOr::Ref(_))),
+            "请求体引用 BackfillBody schema"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +655,7 @@ mod guard_route_tests {
         ("POST", "/api/migration/{u}/phase-a"),
         ("POST", "/api/migration/{u}/cutover"),
         ("POST", "/api/migration/{u}/rollback"),
+        ("POST", "/api/migration/{u}/backfill"),
     ];
 
     /// 够用的最小 [`AppState`]：守卫在任何状态被用到之前就把请求拒了；名单内的请求在
@@ -555,7 +729,12 @@ mod guard_route_tests {
     }
 
     /// 对五个端点各发一次请求，返回状态码（按 `ENDPOINTS` 的顺序）。
-    async fn statuses(router: &axum::Router, user: &str, body: &'static str) -> Vec<StatusCode> {
+    /// 对每个端点各发一次请求（请求体按端点由 `body` 给），返回状态码（按 `ENDPOINTS` 的顺序）。
+    async fn statuses(
+        router: &axum::Router,
+        user: &str,
+        body: fn(&str) -> &'static str,
+    ) -> Vec<StatusCode> {
         let mut statuses = Vec::with_capacity(ENDPOINTS.len());
         for (method, path) in ENDPOINTS {
             let uri = path.replace("{u}", user);
@@ -563,13 +742,28 @@ mod guard_route_tests {
                 .method(*method)
                 .uri(uri)
                 .header("content-type", "application/json")
-                .body(Body::from(body))
+                .body(Body::from(body(path)))
                 .unwrap();
             let response = router.clone().oneshot(request).await.unwrap();
             statuses.push(response.status());
             drop(to_bytes(response.into_body(), 64 * 1024).await.unwrap());
         }
         statuses
+    }
+
+    /// 各端点各自的合法请求体：migration-state 要 `{state}`；backfill 不认这个字段（未知字段
+    /// 是 400）, 它的合法请求体是 `{}`（缺省范围）；其余端点不读请求体。
+    fn valid_body(path: &str) -> &'static str {
+        if path.contains("migration-state") {
+            r#"{"state":"migrated"}"#
+        } else {
+            "{}"
+        }
+    }
+
+    /// 对所有端点都不合法的请求体：migration-state 缺 `state`，backfill 的 `paths` 不是数组。
+    fn bad_body() -> &'static str {
+        r#"{"paths":".local"}"#
     }
 
     /// 每个场景对应的白名单 env 值。
@@ -613,13 +807,19 @@ mod guard_route_tests {
         let forbidden = StatusCode::FORBIDDEN;
         let bad_request = StatusCode::BAD_REQUEST;
 
-        let valid = r#"{"state":"migrated"}"#;
-        let outsider = statuses(&router, "outsider", valid).await;
-        let shaped = statuses(&router, "ABC123", valid).await;
-        let member = statuses(&router, "member-1", valid).await;
+        let outsider = statuses(&router, "outsider", valid_body).await;
+        let shaped = statuses(&router, "ABC123", valid_body).await;
+        let member = statuses(&router, "member-1", valid_body).await;
         // 请求体不合法也不能让名单外的调用方绕过 403（Json 提取器曾先于守卫运行）
-        let outsider_bad_body = statuses(&router, "outsider", "{}").await;
-        let member_bad_body = statuses(&router, "member-1", "{}").await;
+        let outsider_bad_body = statuses(&router, "outsider", |_| bad_body()).await;
+        let member_bad_body = statuses(&router, "member-1", |_| bad_body()).await;
+        // backfill 带正式的范围与模式：过了准入和请求体校验, 进到编排（非 K8s 构建停在 501）
+        let scoped = statuses(
+            &router,
+            "member-1",
+            |_| r#"{"paths":["*"],"only":["node_modules/**"]}"#,
+        )
+        .await;
         for (index, (method, path)) in ENDPOINTS.iter().enumerate() {
             let (outsider, shaped, member) = (outsider[index], shaped[index], member[index]);
             eprintln!(
@@ -637,10 +837,24 @@ mod guard_route_tests {
                         member_bad_body[index], forbidden,
                         "名单内 + 不合法请求体不该被白名单拒: {method} {path}"
                     );
-                    if path.contains("migration-state") && member != StatusCode::NOT_IMPLEMENTED {
+                    if member != StatusCode::NOT_IMPLEMENTED
+                        && (path.contains("migration-state") || path.contains("backfill"))
+                    {
                         assert_eq!(
                             member_bad_body[index], bad_request,
                             "过了准入之后不合法请求体是 400: {method} {path}"
+                        );
+                    }
+                    if path.contains("backfill") {
+                        assert_ne!(
+                            scoped[index], forbidden,
+                            "带了范围与模式的正式请求体不该被准入拒绝: {method} {path} → {}",
+                            scoped[index]
+                        );
+                        assert!(
+                            scoped[index] != bad_request,
+                            "正式请求体不该被请求体校验拒绝: {method} {path} → {}",
+                            scoped[index]
                         );
                     }
                     assert_eq!(shaped, bad_request, "id 拼不出合法 Job 名: {method} {path}");

@@ -150,6 +150,64 @@ impl WorkspaceSyncMode {
 /// `spawnSync …/bin/pnpm ENOENT`），项目也要靠它们才能直接跑起来。
 pub const WORKSPACE_MIGRATION_FILTERS: &[&str] = &["- .cache/", "- .npm/_npx/"];
 
+/// 补迁请求：往**已迁移**用户的 per-agent 卷上，从共享卷只补目标上没有的文件
+/// （`rclone copy --ignore-existing`——不覆盖、不删除；与 k8s/migration 的 backfill 同语义）。
+///
+/// 过滤规则与同步共用 [`WORKSPACE_MIGRATION_FILTERS`]，所以重跑幂等，也不会把缓存带回来。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceBackfill {
+    /// 范围：用户目录下的相对路径，或两种通配写法——[`WORKSPACE_BACKFILL_ALL`]（整棵树）、
+    /// [`WORKSPACE_BACKFILL_PROJECTS`]（顶层非点开头的目录=项目，只取源与目标都有的）。
+    /// 空 = 顶层点目录里源与目标都有的（工具链状态：pnpm 的版本切换目录与全局包、编辑器扩展…）。
+    pub paths: Vec<String>,
+    /// 只补匹配这些模式的条目（相对范围之下任意层级，如 `node_modules/**`）。空 = 范围之内全部。
+    pub only: Vec<String>,
+}
+
+/// 补迁范围的通配写法：整棵树。切换之后用户删掉的东西都会被补回来，只在明确要这样做时用。
+pub const WORKSPACE_BACKFILL_ALL: &str = ".";
+
+/// 补迁范围的通配写法：home 顶层非点开头的目录（项目）里源与目标都有的。
+/// 切换后用户删掉的项目不会复活。
+pub const WORKSPACE_BACKFILL_PROJECTS: &str = "*";
+
+impl WorkspaceBackfill {
+    /// 入口校验（纯函数，供 HTTP 层与运行时层各拦一次）：范围与模式的形态、数量上限。
+    /// 错误必须是确定性拒绝——调用方在任何副作用之前就把它拒掉。
+    pub fn validate(&self) -> Result<(), String> {
+        let paths = crate::validation::WORKSPACE_BACKFILL_MAX_PATHS;
+        if self.paths.len() > paths {
+            return Err(format!(
+                "backfill accepts at most {paths} paths, got {}",
+                self.paths.len()
+            ));
+        }
+        let patterns = crate::validation::WORKSPACE_BACKFILL_MAX_ONLY_PATTERNS;
+        if self.only.len() > patterns {
+            return Err(format!(
+                "backfill accepts at most {patterns} only-patterns, got {}",
+                self.only.len()
+            ));
+        }
+        for path in &self.paths {
+            crate::validation::validate_workspace_backfill_path(path)?;
+        }
+        for pattern in &self.only {
+            crate::validation::validate_workspace_backfill_only_pattern(pattern)?;
+        }
+        Ok(())
+    }
+}
+
+/// 补迁 Job 的结果（从 Job 日志里读出来的）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceBackfillReport {
+    /// 拷过的范围（相对用户目录）。
+    pub copied: Vec<String>,
+    /// 源上没有、跳过的范围。
+    pub skipped: Vec<String>,
+}
+
 /// 迁移同步 Job 的 label（运维识别/清理用）。
 pub const WORKSPACE_MIGRATION_JOB_LABEL: &str = "rcoder.io/workspace-migration";
 

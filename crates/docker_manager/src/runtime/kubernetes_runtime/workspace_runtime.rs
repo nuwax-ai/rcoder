@@ -281,6 +281,17 @@ impl WorkspaceRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn backfill_workspace(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        backfill: &shared_types::WorkspaceBackfill,
+        src_pvc: &str,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceBackfillReport> {
+        self.run_workspace_backfill_inner(identifier, service_type, backfill, src_pvc)
+            .await
+    }
+
     async fn check_workspace_migration_config(&self) -> ContainerRuntimeResult<()> {
         self.workspace_migration_config_check()
     }

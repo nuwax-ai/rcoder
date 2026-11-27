@@ -11,6 +11,8 @@
 //!              (在运行 → 重建挂 RBD; 闲置已停 → 保持停止;
 //!               切换期间在旧卷被唤醒 → 替换到 RBD)
 //! rollback: stop agent → set NotMigrated → 恢复 agent 切换前形态(共享卷)
+//! backfill: stop agent → 等 detach → 只补缺失的拷贝 + 软链校验
+//!           → 恢复 agent 切换前形态（标记不变）                      → Migrated
 //! ```
 //!
 //! 与外部脚本（k8s/migration）的关系: 脚本是**人工单次**工具; 本编排是
@@ -19,7 +21,8 @@
 
 use container_runtime_api::ContainerRuntimeError;
 use shared_types::{
-    ServiceResourceLimits, ServiceType, WorkspaceMigrationState, WorkspaceSyncMode,
+    ServiceResourceLimits, ServiceType, WorkspaceBackfill, WorkspaceMigrationState,
+    WorkspaceSyncMode,
 };
 
 use crate::app_state::AppState;
@@ -181,6 +184,13 @@ pub struct MigrationOutcome {
     pub steps: Vec<String>,
 }
 
+/// 补迁编排的结果：编排结果 + Job 的报告（拷过/跳过的范围）。
+#[derive(Debug, Clone)]
+pub struct BackfillOutcome {
+    pub migration: MigrationOutcome,
+    pub report: shared_types::WorkspaceBackfillReport,
+}
+
 /// phase-a: 确保 per-agent PVC 存在（**不翻标记**）+ 全量预同步（限速）。
 ///
 /// 用户 agent 不受影响（未 migrated → 卷选择/转发都仍走共享卷）。
@@ -255,6 +265,144 @@ pub async fn phase_a(
     })
 }
 
+/// 停 agent 之前的准备（cutover 与 backfill 共用）。
+struct StopPreparation {
+    /// 写门禁守卫：从停 agent 起该用户的文件写一律 503。守卫的 Drop 覆盖所有 `?` 失败路径
+    /// （失败即解除, 该用户恢复可写）；成功路径由 [`restore_agent_as_before`] 显式解除。
+    gate_guard: MigrationGateGuard,
+    /// 停之前 agent 在不在：收尾据此恢复原状。
+    agent_was_present: bool,
+    /// 切换前在运行 → 收尾要重建 → 限额配置必须存在（已在入口判过；这里留作重建时用）。
+    resource_limits: Option<ServiceResourceLimits>,
+}
+
+/// 停 agent 之前的准备：写门禁开 → 等在途写排空 → 采样 agent 形态 → 限额前置判定。
+///
+/// `operation` 只进文案与步骤轨迹（`cutover` / `backfill`）。调用方已持有编排锁、做完
+/// 各自的入口校验。
+async fn prepare_to_stop_agent(
+    state: &AppState,
+    user_id: &str,
+    operation: &str,
+    steps: &mut Vec<String>,
+) -> Result<StopPreparation, ContainerRuntimeError> {
+    // 写门禁开(终审 F1): 从停 agent 起该用户文件写一律 503。
+    //
+    // 撞门禁用 ConnectionError 而不是 Conflict：它会自行解除、调用方应当重试
+    // （HTTP 503，retryable）；Conflict 的语义是"确定性拒绝、重试无用"。
+    let gate_guard = MigrationGateGuard::acquire(user_id).ok_or_else(|| {
+        wrap(
+            "migration_gate",
+            ContainerRuntimeError::ConnectionError(format!(
+                "another migration orchestration for '{user_id}' is still settling; retry shortly"
+            )),
+        )
+    })?;
+
+    // 在途写排空(复审 P1): 门禁开启前已受理的写(长上传/慢盘)还在异步执行,
+    // 不等它们落盘就停 agent 会把这些写留在卷外 → 源/目标分叉。数据面此刻还活着
+    // (agent 未停), 10s 内排空是常态; 超时则中止（释放门禁, 用户恢复可写）, 下次重试。
+    let drain_timeout = std::time::Duration::from_secs(10);
+    let remaining = super::migration_gate::drain_user_writes(user_id, drain_timeout).await;
+    if remaining > 0 {
+        return Err(ContainerRuntimeError::ConnectionError(format!(
+            "{operation} aborted: {remaining} in-flight write(s) for '{user_id}' did not drain within {drain_timeout:?}"
+        )));
+    }
+    steps.push("in-flight writes drained".to_string());
+
+    // agent 形态采样：收尾据此恢复原状（夜间批量迁移空闲用户时，
+    // agent 本就被闲置回收，不为每个用户拉起）。
+    let agent_was_present = agent_present(state, user_id)
+        .await
+        .map_err(|e| wrap("agent_present_check", e))?;
+    // 停之前在运行 → 收尾要重建它 → 限额配置必须存在，且必须在停 agent
+    // **之前**判定（此刻没有任何残留）。
+    let resource_limits = computer_agent_resource_limits(state);
+    require_limits_when_rebuilding(user_id, agent_was_present, resource_limits.as_ref())?;
+    Ok(StopPreparation {
+        gate_guard,
+        agent_was_present,
+        resource_limits,
+    })
+}
+
+/// 防呆: 等 RBD 完全卸载（cutover 与 backfill 共用；fail-closed——查询出错立即中止, 不放行双挂）。
+async fn wait_volume_detached(
+    state: &AppState,
+    user_id: &str,
+) -> Result<(), ContainerRuntimeError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+    loop {
+        let attached = state
+            .runtime()
+            .workspace_volume_attached(user_id, &ServiceType::ComputerAgentRunner)
+            .await
+            .map_err(|e| wrap("volume_attached_check", e))?;
+        if !attached {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(ContainerRuntimeError::ConnectionError(format!(
+                "RBD volume for '{user_id}' still attached 150s after agent stop"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// 编排收尾（cutover 与 backfill 共用）：把 agent 恢复成停它之前的形态, 解除写门禁,
+/// 返回写进步骤轨迹的那一行。`present_now` = 此刻（卷上的事都做完之后）agent 在不在。
+///
+/// - 停之前不在 → 保持停止, 不为它拉起 agent；
+/// - 停之前在跑 → 重建（此刻标记对应的卷）；
+/// - 停之前不在、此刻却在 → 编排期间被别的副本唤醒过（ensure 幂等会原样复用它）,
+///   那一刻它挂的还不是现在该挂的卷, 先停再重建。
+///
+/// 重建前必须释放编排锁（原因见 [`rebuild_agent_on_current_volume`]）。收尾保持停止的
+/// 闲置用户不需要重建, 不受限额缺失影响。
+async fn restore_agent_as_before(
+    state: &AppState,
+    user_id: &str,
+    preparation: StopPreparation,
+    present_now: bool,
+    migration_lock: tokio::sync::OwnedMutexGuard<()>,
+    operation: &'static str,
+) -> Result<String, ContainerRuntimeError> {
+    let StopPreparation {
+        gate_guard,
+        agent_was_present,
+        resource_limits,
+    } = preparation;
+    let restore = AgentRestore::decide(agent_was_present, present_now);
+    if let AgentRestore::KeepStopped = restore {
+        drop(migration_lock);
+        gate_guard.release();
+        return Ok(format!(
+            "agent left stopped (not running before {operation})"
+        ));
+    }
+    if let AgentRestore::ReplaceWoken = restore {
+        state
+            .runtime()
+            .stop_container_by_identifier(user_id, &ServiceType::ComputerAgentRunner)
+            .await
+            .map_err(|e| wrap(&format!("stop_agent_woken_during_{operation}"), e))?;
+    }
+    // 重建前释放编排锁。限额在入口已对"停之前在运行"判过；这里兜住 ReplaceWoken——
+    // 编排期间被其他副本唤醒的 agent 已停, 同样必须重建。
+    drop(migration_lock);
+    let Some(resource_limits) = resource_limits else {
+        return Err(missing_resource_limits_error("restart agent"));
+    };
+    rebuild_agent_on_current_volume(state, user_id, resource_limits).await?;
+    gate_guard.release();
+    Ok(match restore {
+        AgentRestore::ReplaceWoken => format!("agent woken during {operation} replaced on RBD"),
+        _ => "agent restarted on RBD".to_string(),
+    })
+}
+
 /// cutover: 停 agent → 防呆等 detach → 增量 sync → 翻 Migrated → 起 agent。
 ///
 /// 顺序不可换: sync 前必须确认 RBD 无挂载（同节点双挂 = ext4 损坏）; 翻标记
@@ -303,43 +451,8 @@ pub async fn cutover(
     // 不能等到停 agent 之后才触发"——否则留下停机残留。
     require_migration_job_config(state).await?;
 
-    // 写门禁开(终审 F1): 从停 agent 起该用户文件写一律 503。guard 的 Drop
-    // 覆盖所有 `?` 失败路径(失败即解除, 该用户恢复可写——失败中间态下写
-    // 共享卷是安全方向: 标记未翻, 数据面本就仍在共享卷)。
-    //
-    // 撞门禁用 ConnectionError 而不是 Conflict：它会自行解除、调用方应当重试
-    // （HTTP 503，retryable）；Conflict 的语义是"确定性拒绝、重试无用"。
-    let _migration_gate_guard = MigrationGateGuard::acquire(user_id).ok_or_else(|| {
-        wrap(
-            "migration_gate",
-            ContainerRuntimeError::ConnectionError(format!(
-                "another migration orchestration for '{user_id}' is still settling; retry shortly"
-            )),
-        )
-    })?;
-
-    // 在途写排空(复审 P1): 门禁开启前已受理的写(长上传/慢盘)还在异步执行,
-    // 不等它们落盘就停 agent + 最终 sync 会把这些写留在旧卷 → 源/目标分叉。
-    // 数据面此刻仍活着(agent 未停), 10s 内排空是常态; 超时残留则中止切换
-    // (释放门禁, 用户可写共享卷语义完好), 下次重试 cutover。
-    let drain_timeout = std::time::Duration::from_secs(10);
-    let remaining = super::migration_gate::drain_user_writes(user_id, drain_timeout).await;
-    if remaining > 0 {
-        return Err(ContainerRuntimeError::ConnectionError(format!(
-            "cutover aborted: {remaining} in-flight write(s) for '{user_id}' did not drain within {drain_timeout:?}"
-        )));
-    }
-    steps.push("in-flight writes drained".to_string());
-
-    // 切换前 agent 形态采样：收尾据此恢复原状（夜间批量迁移空闲用户时，
-    // agent 本就被闲置回收，不为每个用户拉起）。
-    let agent_was_present = agent_present(state, user_id)
-        .await
-        .map_err(|e| wrap("agent_present_check", e))?;
-    // 切换前在运行 → 收尾要重建它 → 限额配置必须存在，且必须在停 agent
-    // **之前**判定（guard 随 Drop 解除，此刻没有任何残留）。
-    let resource_limits = computer_agent_resource_limits(state);
-    require_limits_when_rebuilding(user_id, agent_was_present, resource_limits.as_ref())?;
+    // 写门禁、排空在途写、采样 agent 形态、限额前置判定。
+    let preparation = prepare_to_stop_agent(state, user_id, "cutover", &mut steps).await?;
 
     // 1. 停 agent（删 STS → 卷卸载开始）
     state
@@ -349,24 +462,8 @@ pub async fn cutover(
         .map_err(|e| wrap("stop_agent", e))?;
     steps.push("agent stopped".to_string());
 
-    // 2. 防呆: 等 RBD 完全卸载（fail-closed——查询出错立即中止, 不放行双挂）
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
-    loop {
-        let attached = state
-            .runtime()
-            .workspace_volume_attached(user_id, &service_type)
-            .await
-            .map_err(|e| wrap("volume_attached_check", e))?;
-        if !attached {
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            return Err(ContainerRuntimeError::ConnectionError(format!(
-                "RBD volume for '{user_id}' still attached 150s after agent stop"
-            )));
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    }
+    // 2. 防呆: 等 RBD 完全卸载
+    wait_volume_detached(state, user_id).await?;
     steps.push("volume detached".to_string());
 
     // 3. 增量 sync（agent 已停, 数据面冻结, 增量体积极小）
@@ -398,45 +495,200 @@ pub async fn cutover(
 
     // 5. 恢复 agent 的切换前形态（ensure 幂等; migrated 已生效 → 重建即挂
     // per-agent RBD）。
-    let restart_step = match AgentRestore::decide(agent_was_present, agent_present_after_flip) {
-        AgentRestore::KeepStopped => {
-            drop(migration_lock);
-            steps.push("agent left stopped (not running before cutover)".to_string());
-            _migration_gate_guard.release();
-            return Ok(MigrationOutcome {
-                user_id: user_id.to_string(),
-                action: "cutover",
-                migration_state: WorkspaceMigrationState::Migrated,
-                steps,
-            });
-        }
-        AgentRestore::ReplaceWoken => {
-            state
-                .runtime()
-                .stop_container_by_identifier(user_id, &service_type)
-                .await
-                .map_err(|e| wrap("stop_agent_woken_during_cutover", e))?;
-            "agent woken during cutover replaced on RBD"
-        }
-        AgentRestore::Restart => "agent restarted on RBD",
-    };
-    // 重建前释放编排锁（原因见 rebuild_agent_on_current_volume）。限额在入口
-    // 已对"切换前在运行"判过；这里兜住 ReplaceWoken——切换期间被其他副本在
-    // 旧卷上唤醒的 agent 已停，同样必须重建。
-    drop(migration_lock);
-    let Some(resource_limits) = resource_limits else {
-        return Err(missing_resource_limits_error("restart agent"));
-    };
-    rebuild_agent_on_current_volume(state, user_id, resource_limits).await?;
-    steps.push(restart_step.to_string());
+    let restart_step = restore_agent_as_before(
+        state,
+        user_id,
+        preparation,
+        agent_present_after_flip,
+        migration_lock,
+        "cutover",
+    )
+    .await?;
+    steps.push(restart_step);
 
-    _migration_gate_guard.release();
     Ok(MigrationOutcome {
         user_id: user_id.to_string(),
         action: "cutover",
         migration_state: WorkspaceMigrationState::Migrated,
         steps,
     })
+}
+
+/// backfill: 停 agent → 防呆等 detach → 只补缺失的拷贝（+ 软链校验）→ 起 agent。
+///
+/// 给**已迁移**用户的 RBD 卷补缺失的文件（典型: 旧排除规则带走的 node_modules）。
+/// 与 cutover 同一套准备和收尾, 但**不翻标记**——用户始终在 RBD 上; 卷上已有的文件
+/// 一律不动（`rclone copy --ignore-existing`）, 所以失败了也没有需要回退的状态：
+/// 目标卷上多出来的只是补进去的文件, 重跑幂等。
+pub async fn backfill(
+    state: &AppState,
+    user_id: &str,
+    src_pvc: &str,
+    backfill: &WorkspaceBackfill,
+) -> Result<BackfillOutcome, ContainerRuntimeError> {
+    let service_type = ServiceType::ComputerAgentRunner;
+    let mut steps = Vec::new();
+
+    // 请求先于一切 I/O 校验：范围里的错误不能等到停完 agent、Job 跑起来才暴露。
+    if let Err(reason) = backfill.validate() {
+        return Err(ContainerRuntimeError::ConfigurationError(format!(
+            "cannot backfill the workspace of '{user_id}': {reason}"
+        )));
+    }
+
+    // 编排互斥(同 phase_a / cutover)。
+    let migration_lock = ComputerContainerManager::acquire_migration_lock(user_id)
+        .await
+        .map_err(|e| wrap("acquire_migration_lock", runtime_error_from_app(e)))?;
+    // 入口校验①: 只对已迁移用户。未迁移的用户数据面还在共享卷上, 往 RBD 卷上补没有
+    // 意义; 那个卷可能是 phase-a 的半成品, 该做的是走完 phase-a + cutover。
+    if !matches!(
+        state
+            .runtime()
+            .workspace_migration_state(user_id, &service_type)
+            .await
+            .map_err(|e| wrap("migration_state_check", e))?,
+        WorkspaceMigrationState::Migrated
+    ) {
+        return Err(ContainerRuntimeError::Conflict(format!(
+            "user '{user_id}' is not migrated; backfill only adds missing files to the \
+             RBD volume of a migrated user (run phase-a and cutover first)"
+        )));
+    }
+    // 入口校验②: 目标 PVC 必须存在——否则 NotFound 要到停 agent **之后**才触发。
+    if !state
+        .runtime()
+        .workspace_pvc_exists(user_id, &service_type)
+        .await
+        .map_err(|e| wrap("pvc_exists_check", e))?
+    {
+        return Err(ContainerRuntimeError::ContainerNotFound(format!(
+            "per-agent PVC for '{user_id}' not found; run phase-a before backfill"
+        )));
+    }
+    // 入口校验③: 迁移 Job 镜像必须已配置——配置问题不能留下停机残留。
+    require_migration_job_config(state).await?;
+
+    // 写门禁、排空在途写、采样 agent 形态、限额前置判定。
+    let preparation = prepare_to_stop_agent(state, user_id, "backfill", &mut steps).await?;
+
+    // 1. 停 agent（RWO: 卷挂着的时候 Job 挂不上, 同节点双挂还会损坏文件系统）
+    state
+        .runtime()
+        .stop_container_by_identifier(user_id, &service_type)
+        .await
+        .map_err(|e| wrap("stop_agent", e))?;
+    steps.push("agent stopped".to_string());
+
+    // 2. 防呆: 等 RBD 完全卸载
+    wait_volume_detached(state, user_id).await?;
+    steps.push("volume detached".to_string());
+
+    // 3. 只补缺失的拷贝; Job 自己再对刚补过的范围做一遍软链校验, 仍有坏软链即失败
+    // （失败原因——空间不够、坏软链清单——在 Job 日志里, 运行时层已带进错误）。
+    let report = match state
+        .runtime()
+        .backfill_workspace(user_id, &service_type, backfill, src_pvc)
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            return Err(restore_after_failed_backfill(
+                state,
+                user_id,
+                preparation,
+                migration_lock,
+                wrap("backfill", error),
+            )
+            .await);
+        }
+    };
+    steps.push(format!(
+        "{} path(s) backfilled, {} skipped (missing on the shared volume)",
+        report.copied.len(),
+        report.skipped.len()
+    ));
+
+    // 4. 恢复 agent 的切换前形态（标记没变, 重建仍挂 RBD）。
+    let agent_present_now = agent_present(state, user_id)
+        .await
+        .map_err(|e| wrap("agent_present_check", e))?;
+    let restart_step = restore_agent_as_before(
+        state,
+        user_id,
+        preparation,
+        agent_present_now,
+        migration_lock,
+        "backfill",
+    )
+    .await?;
+    steps.push(restart_step);
+
+    Ok(BackfillOutcome {
+        migration: MigrationOutcome {
+            user_id: user_id.to_string(),
+            action: "backfill",
+            migration_state: WorkspaceMigrationState::Migrated,
+            steps,
+        },
+        report,
+    })
+}
+
+/// 补迁的 Job 没成功时的收尾，然后返回 Job 的错误（带上收尾的结果）。
+///
+/// 补迁不改任何状态——标记没翻、卷上已有的文件没动——所以停之前在跑的 agent 照常拉回来，
+/// 不留停机等用户的下一个请求（Job 脚本那条路径靠 EXIT trap 做同一件事）。
+async fn restore_after_failed_backfill(
+    state: &AppState,
+    user_id: &str,
+    preparation: StopPreparation,
+    migration_lock: tokio::sync::OwnedMutexGuard<()>,
+    failure: ContainerRuntimeError,
+) -> ContainerRuntimeError {
+    // 此刻 agent 在不在只影响"被别的副本唤醒过"的判定；查不出来就当不在（停之前在跑的照样重建）。
+    let present_now = agent_present(state, user_id).await.unwrap_or(false);
+    match restore_agent_as_before(
+        state,
+        user_id,
+        preparation,
+        present_now,
+        migration_lock,
+        "backfill",
+    )
+    .await
+    {
+        // 本来就闲置: 没有收尾动作, 不往错误里加话
+        Ok(step) if step.starts_with("agent left stopped") => failure,
+        Ok(step) => with_detail(failure, &step),
+        Err(restore_error) => with_detail(
+            failure,
+            &format!(
+                "restoring the agent after the failed backfill also failed ({restore_error}); \\
+                 the user's next request will rebuild it on the RBD volume"
+            ),
+        ),
+    }
+}
+
+/// 给错误的文案补一句收尾情况。变体原样保留——HTTP 状态码跟着变体走。
+fn with_detail(error: ContainerRuntimeError, detail: &str) -> ContainerRuntimeError {
+    let add = |message: String| format!("{message}; {detail}");
+    match error {
+        ContainerRuntimeError::Conflict(message) => ContainerRuntimeError::Conflict(add(message)),
+        ContainerRuntimeError::ContainerNotFound(message) => {
+            ContainerRuntimeError::ContainerNotFound(add(message))
+        }
+        ContainerRuntimeError::ConfigurationError(message) => {
+            ContainerRuntimeError::ConfigurationError(add(message))
+        }
+        ContainerRuntimeError::ConnectionError(message) => {
+            ContainerRuntimeError::ConnectionError(add(message))
+        }
+        ContainerRuntimeError::Timeout(message) => ContainerRuntimeError::Timeout(add(message)),
+        ContainerRuntimeError::K8sError(message) => ContainerRuntimeError::K8sError(add(message)),
+        other => other,
+    }
 }
 
 /// rollback: 翻回 NotMigrated（共享卷数据全程保留, 用户回共享路径;
@@ -611,4 +863,4 @@ fn runtime_error_from_app(error: crate::AppError) -> ContainerRuntimeError {
 }
 
 #[cfg(test)]
-mod agent_restore_tests;
+mod tests;
