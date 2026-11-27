@@ -368,6 +368,9 @@ async fn without_a_mount_table_a_swap_of_an_unrecorded_mount_is_refused() {
     daemon.assert_followed(3);
 }
 
+/// 回归（Codex 第七轮 P1）：源确定在日志根之外的日志挂载照原样重放，重放之前要核对它还在。
+/// Compose 部署里宿主机路径和 RCoder 容器内路径不一样，宿主机路径在本进程并不存在——只有经
+/// 挂载表反查才看得见它。只看本进程的同名路径会误报缺失，恢复一直卡在这里
 #[tokio::test]
 async fn an_outside_log_visible_through_the_mount_table_can_be_replayed_in_compose() {
     use crate::runtime::docker_runtime::host_path_space::{LogDomainVerdict, viewing};

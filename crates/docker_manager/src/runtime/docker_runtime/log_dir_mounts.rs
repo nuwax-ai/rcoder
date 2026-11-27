@@ -23,7 +23,8 @@
 //!
 //! - 停在一个存在的对象上：它（是文件则是它的父目录）连同各级父目录都在占用中；
 //! - 路径上有一级不存在：源已经消失，没有可保护的东西，也不卡住其余目录的清理——
-//!   容器还在、目录被删，正是这次要修的故障现场；
+//!   容器还在、目录被删，正是这次要修的故障现场。登记着的源另有一步，见下面"正在准备挂载
+//!   的目录"；
 //! - 从头到尾没有读到过链接，整条路径都在 RCoder 的挂载之外：与任何候选无关；
 //! - 其余——读到过链接、之后却走进 RCoder 看不见的路径（看不见的那一段里可能还有链接
 //!   绕回来），被另一条挂载遮蔽，`..` 回退到 RCoder 看不到的那一级，读取出错，链接层数
@@ -37,7 +38,7 @@
 //!
 //! 1. 候选按词法换算到宿主机后，等于清单里的某个挂载源，或某个挂载源位于它之下 → 仍被挂载；
 //! 2. 候选的目录身份，等于某个挂载源的真实位置（文件则取其父目录）或它某级祖先的身份 →
-//!    仍被挂载；
+//!    仍被挂载。还没建出来的登记取它最近一级已存在的目录祖先，连同各级祖先；
 //! 3. 候选换算不到宿主机、读不到身份，或者清单里有无法确认指向何处的挂载源 → 无法确认，
 //!    保留；
 //! 4. 其余 → 确认未被挂载。
@@ -61,6 +62,15 @@
 //!
 //! 创建方判不出在不在日志根里的 bind 源也登记在这里（它用的是同一个走法，对这条源同样判不
 //! 出来，所以不让创建失败，改为登记）。这样的源定不了位，本轮所有候选都保留——确认不了就不删。
+//!
+//! 登记着的路径可能**还没建出来**（创建方先登记、稍后才建目录），那时没有身份可比。它要绑的
+//! 目录会建在它最近一级已存在的目录祖先下面，所以保护这个祖先——连同它直到离开 RCoder 视野
+//! 的各级祖先，按真实位置取身份。经别名、经另一条挂载视图看到的是同一个目录时身份一样，照
+//! 样认得出。中间有一级是文件就建不出目录，不保护；祖先读不出、定不了位，整轮所有候选都保留。
+//!
+//! 清理器发许可（[`begin_reclaim`]）和创建方登记时发现已经有许可（`reclaim_wait`）用的是同一
+//! 份观察（[`observe`]）：先登记后发许可、先发许可后登记，两种先后顺序下"要绑的目录在不在正被
+//! 删的目录里"的答案一致。
 //!
 //! # 删除之前的最后一次确认
 //!
@@ -229,12 +239,16 @@ async fn occupy_ancestors(
 struct MountObservations {
     /// 词法：挂载源及其全部祖先（宿主机路径）。候选等于其中之一，就是候选包含被挂载的子路径
     registered: HashSet<PathBuf>,
-    /// 身份：挂载源的真实位置（文件则取其父目录），以及它直到离开 RCoder 视野的各级祖先
+    /// 身份：挂载源的真实位置（文件则取其父目录）以及它直到离开 RCoder 视野的各级祖先；还
+    /// 没建出来的登记是它最近一级已存在的目录祖先及其各级祖先
     mounted: HashSet<DirectoryId>,
     /// 无法确认指向何处的挂载源。它可能指向任何候选，所以出现时所有候选都保留
     unidentifiable: Option<String>,
 }
 
+/// 算出一轮判定所需的观察结果。`mounted_sources` 是 Docker 报回的挂载源，`pending_sources` 是
+/// 登记着的（在途的和结果不明的）；两类都进词法比对，也都按真实位置取身份。不一样的只有一处：
+/// 登记着的源还没建出来时，保护它最近一级已存在的目录祖先
 async fn observe(
     space: &HostPathSpace<'_>,
     mounted_sources: &[PathBuf],
@@ -291,8 +305,10 @@ async fn observe(
     observations
 }
 
-/// A pending bind can create a missing source before Docker sees it. Protect
-/// its existing directory ancestors by identity, even across different views.
+/// 一条还没建出来的登记要绑在哪：它此后的位置（链接已解析）往上第一级已存在的目录。
+///
+/// 中间有一级是文件：这下面建不出目录，没有要保护的。往上一路都在 RCoder 的挂载之外：没有
+/// 身份可比。读不出来就带着原因返回——它可能落在任何候选里，整轮所有候选都保留
 async fn pending_directory_ancestor(
     locations: &mut RealLocations<'_>,
     source: &Path,
@@ -304,8 +320,6 @@ async fn pending_directory_ancestor(
                 directory: true,
             }) => return Ok(Some(path)),
             Ok(Location::Absent { .. }) => continue,
-            // A file cannot acquire children. An ancestor outside every
-            // view has no directory identity we can compare.
             Ok(
                 Location::Present {
                     directory: false, ..

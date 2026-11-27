@@ -377,3 +377,43 @@ async fn an_unrecorded_bind_into_the_log_root_is_replayed_and_registered() {
         restart.expected_volumes(&[(LOG_TARGET, &fresh)])
     );
 }
+
+/// 有挂载见证、又不是日志挂载的一条 bind，源判不出在不在日志根里（经过一个指到 RCoder 挂载
+/// 之外的符号链接，宿主机路径在本进程直接看得见）：照原样重放，源同样登记到替代容器建出来。
+/// 旧容器一删，这个目录就不在任何容器的挂载里了，而清理器对它同样判不出来——登记着，清理器
+/// 才会保留所有候选
+#[tokio::test]
+async fn an_unclassifiable_data_mount_with_a_witness_is_replayed_and_registered() {
+    let mut restart = LoggedRestart::new();
+    let outside = tempfile::tempdir().unwrap();
+    let notes = sources::add_unconfirmable_data_mount(&mut restart, outside.path(), true);
+    let seen_at_create = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen_at_create);
+    let daemon = scripted_with_hook(
+        creation_script(step("POST", "/containers/create", 200, created())),
+        Arc::new(move |request: &str| {
+            if request.starts_with("POST") && request.contains("/containers/create") {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .extend(crate::log_directory::pending_bind_sources());
+            }
+        }),
+    )
+    .await;
+
+    restart.restore(&daemon).await.unwrap();
+
+    let name = restart.bound_log_name(&daemon, 4, LOG_TARGET);
+    let mut seen = seen_at_create.lock().unwrap().clone();
+    seen.sort();
+    let mut expected = vec![
+        PathBuf::from(new_log_directory(&restart, &name)),
+        PathBuf::from(&notes),
+    ];
+    expected.sort();
+    assert_eq!(
+        seen, expected,
+        "while the request is in flight, the unclassifiable source is claimed too"
+    );
+}

@@ -326,6 +326,9 @@ async fn an_unmappable_candidate_is_refused_the_reclaim() {
     );
 }
 
+/// 回归（Codex 第七轮 P1）：清理器取完清单**之后**，创建方登记了一个还没建出来的路径，它经
+/// 别名落在候选里面。登记时没有任何删除在进行，创建方不等；清理器这边必须认得出它——没有身份
+/// 可比，看它会建在哪一级已存在的目录下面。拒的理由是"有登记落在它里面"，不是判不出来
 #[tokio::test]
 async fn a_claim_on_an_absent_aliased_child_blocks_a_later_reclaim() {
     use crate::runtime::docker_runtime::host_path_space::HostPathSpace;
@@ -348,9 +351,62 @@ async fn a_claim_on_an_absent_aliased_child_blocks_a_later_reclaim() {
         )
         .await
         .unwrap();
-    let result = runtime.begin_log_directory_reclaim(&candidate).await;
+    let refused = runtime.begin_log_directory_reclaim(&candidate).await;
+
     assert!(
-        result.is_err(),
-        "the deletion permit ignores a previous live claim for an absent descendant reached through a known symlink: {result:?}"
+        matches!(refused, Err(ReclaimRefused::InUse(_))),
+        "the deletion permit must not ignore a live claim for an absent descendant reached through a known symlink: {refused:?}"
     );
+}
+
+/// 同一个登记在取清单**之前**就在了：清单阶段这个候选就算作仍被占用
+#[tokio::test]
+async fn an_absent_claim_below_a_candidate_shows_in_the_inventory() {
+    use crate::runtime::docker_runtime::host_path_space::HostPathSpace;
+    let tree = Tree::new();
+    let candidate = tree.path("logs/runner-a");
+    let resolver = tree.resolver();
+    let space = HostPathSpace::Container(&resolver);
+    let mut claimed = PendingBinds::default();
+    claimed
+        .claim(
+            Path::new("/host/base/alias/runner-a/not-created"),
+            Some(&space),
+        )
+        .await
+        .unwrap();
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+
+    let inventory = runtime
+        .mounted_log_directories(std::slice::from_ref(&candidate))
+        .await
+        .unwrap();
+
+    assert_eq!(inventory.mounted, HashSet::from([candidate]));
+}
+
+/// 还没建出来的登记落在别的目录下面：只保护它最近一级已存在的祖先（这里是日志根自己），不挡
+/// 这个候选
+#[tokio::test]
+async fn an_absent_claim_under_another_directory_does_not_block_the_reclaim() {
+    use crate::runtime::docker_runtime::host_path_space::HostPathSpace;
+    let tree = Tree::new();
+    let candidate = tree.path("logs/runner-a");
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+    let resolver = tree.resolver();
+    let space = HostPathSpace::Container(&resolver);
+    let mut claimed = PendingBinds::default();
+    claimed
+        .claim(
+            Path::new("/host/base/logs/runner-new/not-created"),
+            Some(&space),
+        )
+        .await
+        .unwrap();
+
+    let permit = runtime.begin_log_directory_reclaim(&candidate).await;
+
+    assert!(permit.is_ok(), "{permit:?}");
 }

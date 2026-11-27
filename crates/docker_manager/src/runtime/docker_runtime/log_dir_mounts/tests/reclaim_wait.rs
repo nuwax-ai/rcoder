@@ -341,6 +341,8 @@ async fn without_a_path_space_a_claim_waits_for_every_deletion() {
     );
 }
 
+/// 回归（Codex 第七轮 P1）：还没建出来的路径要建在一个目录里，那个目录同时经另一条挂载暴露
+/// （另一个宿主机名字）。两边按目录身份比，不看路径拼写：登记要等这次删除
 #[tokio::test]
 async fn missing_child_of_the_same_physical_directory_via_another_mount_waits() {
     bound_the_wait();
@@ -372,5 +374,22 @@ async fn missing_child_of_the_same_physical_directory_via_another_mount_waits() 
         result,
         deleted,
         "both views of the existing ancestor have the same filesystem identity",
+    );
+}
+
+/// 经别名登记、还没建出来的路径，中间有一级是文件：这下面建不出目录。按身份找不到已存在的
+/// 祖先落在被删目录里，不等
+#[tokio::test]
+async fn a_path_not_created_below_a_file_does_not_wait() {
+    bound_the_wait();
+    let tree = Tree::new();
+    std::fs::write(tree.path("logs/runner-a/a-file"), b"").unwrap();
+    let _held = mark(&tree, "logs/runner-a", REAL_A);
+
+    assert!(
+        claim(&tree, "/host/base/alias/runner-a/a-file/not-created")
+            .await
+            .is_ok(),
+        "nothing can be created below a file; waiting would have timed out"
     );
 }

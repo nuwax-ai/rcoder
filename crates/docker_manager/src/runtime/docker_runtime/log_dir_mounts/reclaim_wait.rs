@@ -9,8 +9,9 @@
 //! 登记进来，拼写不同，删的却是它。
 //!
 //! 要登记的路径**还没建出来**时没有身份可比（创建方常常是先登记、稍后才在下面建目录）。这时看
-//! 它会建在哪一级已存在的祖先下面：按真实位置，祖先等于被删目录或在它里面，就是在同一棵正在
-//! 删的目录树里。
+//! 它会建在哪一级已存在的祖先下面：取那个祖先（按真实位置）连同各级祖先的身份，祖先正是被删
+//! 目录或在它里面，就是在同一棵正在删的目录树里。经别名、经另一条挂载视图看到的同一个目录，
+//! 身份一样。
 //!
 //! 探测（读目录身份）和等待共用同一个截止时间：探测自己卡住（文件系统不响应）也算等不到。
 
@@ -54,8 +55,9 @@ fn wait_limit() -> Duration {
 /// 时限管的是整个调用：探测目录身份也可能卡住，所以探测和等待共用同一个截止时间。探测没在
 /// 时限内返回，说明不了它和正在删的目录不相干，同样按等不到处理。
 ///
-/// 等到了也只是删完了：目录已经不在，后面的创建由 Docker 明确拒绝（源目录不存在），不会绑到
-/// 一个正在被删的目录上。
+/// 等到了也只是删完了：目录已经不在，不会绑到一个正在被删的目录上。之后的创建也不会悄悄绑上
+/// 一个空目录——应用容器用的是 `HostConfig.Mounts`，源目录不在时 Docker 不补建；builder 重启
+/// 重放的是 legacy Binds（Docker 会补建），所以它在创建替代容器之前还会核对一次原样重放的源。
 ///
 /// 先登记、后读标记，顺序不能反：读完标记之后才打上的标记，打它的那次删除会读到这里已经登记
 /// 的 `claim`，自己放弃。
@@ -107,8 +109,10 @@ async fn first_reclaim_holding(claim: &Path, space: Option<&HostPathSpace<'_>>) 
     None
 }
 
-/// The same pending-bind observation is used before granting a reclaim permit
-/// and when a creator finds a permit already held. An unknown match must wait.
+/// 被删的目录 `directory`（RCoder 进程里的路径）装不装得下创建方要绑的 `bind`（宿主机路径）。
+///
+/// 用的就是清理器发许可前的那份观察（[`observe`]），要登记的路径当成在途登记：两边对"同一个
+/// 目录"的定义因此完全一致。判不出来也算装得下——证明不了不相干，宁可等
 async fn holds_bind(space: &HostPathSpace<'_>, directory: &Path, bind: &Path) -> bool {
     let fs = LocalFileSystem;
     let observations = observe(space, &[], &[bind.to_path_buf()], &fs).await;
