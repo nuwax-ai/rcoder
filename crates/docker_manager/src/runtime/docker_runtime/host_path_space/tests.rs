@@ -175,22 +175,28 @@ async fn an_absent_root_is_located_where_it_will_be() {
     );
 }
 
-/// 挂载表里没有一条覆盖日志根：确定没有日志域，谁都不在里面。
+/// 挂载表里没有一条覆盖日志根：换算不出来的只是词法路径。清理器照样能从这个进程路径读到
+/// 目录，所以不能当成"没有日志域"放行——什么都判不出来
 #[tokio::test]
-async fn a_root_no_mount_covers_means_there_is_no_log_domain() {
+async fn a_root_no_mount_covers_tells_nothing() {
     let layout = Layout::new();
 
     let domain =
         LogDomain::locate(Some(&layout.space()), Path::new("/not/mounted/container")).await;
 
-    assert!(matches!(domain, LogDomain::None));
-    assert_eq!(domain.limitation(), None);
-    assert_eq!(
+    assert!(matches!(domain, LogDomain::Blind(_)));
+    assert!(
+        domain
+            .limitation()
+            .is_some_and(|reason| reason.contains("no mount of RCoder's own container covers")),
+        "{domain:?}"
+    );
+    assert!(matches!(
         layout
             .verdict(&domain, "/not/mounted/container/runner-a")
             .await,
-        LogDomainVerdict::Outside
-    );
+        LogDomainVerdict::Unknown(_)
+    ));
 }
 
 /// 日志根是相对路径：清理器按工作目录读它，这里对不上。什么都判不出来，不是"没有日志域"

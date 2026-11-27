@@ -54,6 +54,51 @@ fn dropping_one_guard_leaves_the_others_claimed() {
     );
 }
 
+/// 同一条路径被两个守卫同时登记（判不出来的 bind 源会被几个容器共用）：先退出的那个不能把
+/// 登记抹掉，另一个还在用
+#[test]
+fn a_path_claimed_by_two_guards_stays_claimed_until_the_last_one_leaves() {
+    let mut first = PendingBinds::default();
+    first.claim(Path::new("/srv/logs/container/shared"));
+    let mut second = PendingBinds::default();
+    second.claim(Path::new("/srv/logs/container/shared"));
+
+    drop(first);
+
+    assert_eq!(
+        pending_bind_sources(),
+        [PathBuf::from("/srv/logs/container/shared")]
+    );
+
+    drop(second);
+    assert!(pending_bind_sources().is_empty());
+}
+
+/// 先退出的那个结果不明：它的登记转去带过期时间的表，另一个的在途登记照旧
+#[test]
+fn a_path_claimed_by_two_guards_survives_the_unknown_outcome_of_one() {
+    let mut first = PendingBinds::default();
+    first.claim(Path::new("/srv/logs/container/shared"));
+    let mut second = PendingBinds::default();
+    second.claim(Path::new("/srv/logs/container/shared"));
+
+    first.request_sent();
+    drop(first);
+
+    assert_eq!(
+        pending_bind_sources(),
+        [PathBuf::from("/srv/logs/container/shared")]
+    );
+
+    drop(second);
+
+    assert_eq!(
+        pending_bind_sources(),
+        [PathBuf::from("/srv/logs/container/shared")],
+        "an unknown outcome keeps its claim until it expires"
+    );
+}
+
 /// 在途登记不淘汰：再多活守卫，登记也一条不少
 #[test]
 fn live_claims_are_never_evicted() {
@@ -127,7 +172,9 @@ async fn a_request_that_succeeds_releases_the_claims() {
     let mut binds = PendingBinds::default();
     binds.claim(Path::new("/srv/logs/container/runner-a"));
 
-    let created = binds.until_settled(async { Ok("container-id") }).await;
+    let created = binds
+        .until_settled(async { Ok::<_, crate::DockerError>("container-id") })
+        .await;
 
     assert_eq!(created.unwrap(), "container-id");
     drop(binds);

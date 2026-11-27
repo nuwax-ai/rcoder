@@ -38,9 +38,6 @@ use crate::{DockerManager, HostPathResolver};
 /// 可回收的日志根，以及怎么判断一条 bind 源在不在它下面
 #[derive(Debug)]
 pub(crate) enum LogDomain {
-    /// 确定没有可回收的日志域：路径空间里没有挂载覆盖日志根，RCoder 创建不出它下面的宿主机
-    /// 路径，没有 bind 能指向它
-    None,
     /// 日志根的宿主机路径定出来了；真实位置可能求不出来
     Root {
         /// 归一化之后的宿主机路径
@@ -48,7 +45,8 @@ pub(crate) enum LogDomain {
         /// 逐级解析符号链接之后的宿主机路径；求不出来时是原因
         real: Result<PathBuf, String>,
     },
-    /// 什么都判不出来：取不到路径空间，日志根不是绝对路径
+    /// 什么都判不出来：取不到路径空间，日志根不是绝对路径，或者 RCoder 自己的挂载没有一条
+    /// 覆盖它
     Blind(String),
 }
 
@@ -73,7 +71,8 @@ impl LogDomain {
     ///
     /// - `space` 取不到（`None`）：什么都判不出来；
     /// - 日志根不是绝对路径：清理器按工作目录读它，这里对不上，什么都判不出来；
-    /// - 路径空间里没有挂载覆盖日志根：确定没有日志域；
+    /// - 路径空间里没有挂载覆盖日志根：同样什么都判不出来。换算失败只说明词法路径没命中
+    ///   挂载表，清理器照样能从这个进程路径读到目录（比如它是指向某个已映射目录的符号链接）；
     /// - 宿主机路径定出来了、真实位置求不出来：只有词法判得出。
     pub(crate) async fn locate(space: Option<&HostPathSpace<'_>>, reclaim_root: &Path) -> Self {
         let Some(space) = space else {
@@ -86,7 +85,10 @@ impl LogDomain {
             ));
         }
         let Ok(lexical) = space.to_host(reclaim_root) else {
-            return Self::None;
+            return Self::Blind(format!(
+                "no mount of RCoder's own container covers the reclaimable log root {}",
+                reclaim_root.display()
+            ));
         };
         let lexical = crate::normalize_path(&lexical);
         let real = RealLocations::new(space, &LocalFileSystem)
@@ -98,7 +100,6 @@ impl LogDomain {
     /// 这次判定缺什么：取不到路径空间，或者日志根的真实位置求不出来。不缺时为 `None`
     pub(crate) fn limitation(&self) -> Option<String> {
         match self {
-            Self::None => None,
             Self::Blind(reason) => Some(reason.clone()),
             Self::Root {
                 real: Err(reason), ..
@@ -114,7 +115,6 @@ impl LogDomain {
         host_path: &str,
     ) -> LogDomainVerdict {
         match self {
-            Self::None => LogDomainVerdict::Outside,
             Self::Blind(reason) => LogDomainVerdict::Unknown(reason.clone()),
             Self::Root { lexical, real } => {
                 let lexical_path = crate::normalize_path(Path::new(host_path));
