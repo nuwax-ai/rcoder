@@ -11,16 +11,16 @@ use super::templates::{directory_visible_to_this_process, path_after_resolved_ba
 use super::{HostPathLookup, MountContext};
 use crate::DockerError;
 use crate::container_builder::ContainerConfigBuilder;
-use crate::log_directory::LogDomain;
 use crate::log_directory::PendingBinds;
+use crate::runtime::docker_runtime::host_path_space::{LogDomainAdmission, LogDomainVerdict};
 
 /// 按配置逐条加挂载。`auto_injected_paths` 是自动注入已经占用的容器内路径；新建的日志目录
-/// 登记进 `pending_binds`
+/// 和判不出在不在日志根里的 bind 源登记进 `pending_binds`
 pub(super) async fn add_config_mounts(
     mut builder: ContainerConfigBuilder,
     ctx: &MountContext<'_>,
     lookup: &dyn HostPathLookup,
-    log_domain: &LogDomain,
+    admission: &LogDomainAdmission<'_>,
     auto_injected_paths: &HashSet<String>,
     pending_binds: &mut PendingBinds,
 ) -> crate::DockerResult<ContainerConfigBuilder> {
@@ -157,13 +157,23 @@ pub(super) async fn add_config_mounts(
 
         // 指向可回收日志域的挂载：绑定的必须是为本容器独占新建的目录。同名目录已存在时会换个
         // 名字，绑定的路径和 CONTAINER_LOG_NAME 都跟着用最终的名字
-        let reclaimable = log_domain.contains(&resolved_host_path);
+        let verdict = admission
+            .classify(
+                &format!("Mount {}", mount_config.container_path),
+                &resolved_host_path,
+            )
+            .await;
+        let reclaimable = verdict == LogDomainVerdict::Inside;
+        // 判不出在不在的：照常挂载，但登记到创建结束——清理器对它同样判不出来，登记着就不会删
+        let unclassified = matches!(verdict, LogDomainVerdict::Unknown(_));
         let mut log_dir_name = log_dir_name.clone();
         if reclaimable {
             log_dir_name = create_reclaimable_directory(mount_config, &mount_variables).await?;
             mount_variables.insert("log_dir_name".to_string(), log_dir_name.clone());
             resolved_host_path = resolve_host_path(&mount_variables);
             resolved_container_path = resolve_container_path(&mount_variables);
+        }
+        if reclaimable || unclassified {
             pending_binds.claim(Path::new(&resolved_host_path));
         }
 

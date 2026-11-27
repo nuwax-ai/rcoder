@@ -612,6 +612,13 @@ impl AgentContainerRuntime for DockerRuntime {
         self.restore_builder_template(template).await
     }
 
+    async fn builder_restart_replaced_mounts(
+        &self,
+        template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        self.restart_replaced_mounts(template).await
+    }
+
     async fn capture_builder_compute_volumes(
         &self,
         target: &shared_types::BuilderControlTarget,

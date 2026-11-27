@@ -3,9 +3,12 @@
 use super::*;
 use crate::log_directory::PendingBinds;
 use crate::runtime::docker_runtime::DockerRuntime;
+use async_trait::async_trait;
 use container_runtime_api::AgentContainerRuntime as _;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+
+use super::super::host_path_space::Entry;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// 假挂载表里宿主机一侧的根，对应 `Tree::base`

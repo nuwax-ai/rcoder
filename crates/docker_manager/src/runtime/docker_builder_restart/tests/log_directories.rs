@@ -1,6 +1,12 @@
-//! 替代 builder 的日志目录：哪些 bind 换成新目录、label 怎么记、创建结果不明时怎么善后。
+//! 替代 builder 的日志目录：哪些 bind 换成新目录、label 怎么记。
+//!
+//! 这里放夹具和换目录、核对 label 的用例。登记与创建结果（`claims`）、重启协议
+//! （`replacement`）各有自己的文件。
 
 use super::*;
+
+mod claims;
+mod replacement;
 
 // ─── 带日志挂载的重启 ───────────────────────────────────────────────────────
 
@@ -168,8 +174,6 @@ fn new_log_directory(restart: &LoggedRestart, name: &str) -> String {
         .into_owned()
 }
 
-// ─── 用例：替代容器的日志目录 ───────────────────────────────────────────────
-
 /// 落在可回收日志根下的 bind 不照原样重放：替代容器绑定同级的新目录，挂载点和选项不动，
 /// 其它 bind 原样；新目录记在 label 上。
 #[tokio::test]
@@ -243,39 +247,6 @@ async fn the_replacement_gets_a_new_log_directory() {
     assert_eq!(
         replacement.expected_volumes,
         restart.expected_volumes(&[(LOG_TARGET, &new_directory)])
-    );
-}
-
-/// 日志目录建好之后、创建请求得到应答之前，一直登记为正在准备挂载。
-#[tokio::test]
-async fn a_fresh_log_directory_stays_claimed_while_the_create_request_is_in_flight() {
-    let restart = LoggedRestart::new();
-    let seen_at_create = Arc::new(Mutex::new(Vec::new()));
-    let recorder = Arc::clone(&seen_at_create);
-    let daemon = scripted_with_hook(
-        creation_script(step("POST", "/containers/create", 200, created())),
-        Arc::new(move |request: &str| {
-            if request.starts_with("POST") && request.contains("/containers/create") {
-                recorder
-                    .lock()
-                    .unwrap()
-                    .extend(crate::log_directory::pending_bind_sources());
-            }
-        }),
-    )
-    .await;
-
-    restart.restore(&daemon).await.unwrap();
-
-    let name = restart.bound_log_name(&daemon, 4, LOG_TARGET);
-    assert_eq!(
-        seen_at_create.lock().unwrap().as_slice(),
-        [PathBuf::from(new_log_directory(&restart, &name))],
-        "while the request is in flight the directory is claimed, so the cleaner treats it as mounted"
-    );
-    assert!(
-        crate::log_directory::pending_bind_sources().is_empty(),
-        "once Docker has answered, the inventory alone protects the directory"
     );
 }
 
@@ -389,7 +360,7 @@ async fn a_bind_into_the_log_root_without_a_mount_witness_is_refused() {
         matches!(&result, Err(Error::Conflict(message)) if message.contains("lies under the reclaimable log root but has no mount witness")),
         "{result:?}"
     );
-    daemon.assert_followed(2);
+    daemon.assert_no_request();
     assert!(
         !restart.visible_root().exists(),
         "nothing is created for a refused restart"
@@ -413,7 +384,7 @@ async fn a_log_bind_that_does_not_match_the_witness_conflicts_and_creates_nothin
         matches!(&result, Err(Error::Conflict(message)) if message.contains("Restart log bind does not match the archived mount witness")),
         "{result:?}"
     );
-    daemon.assert_followed(2);
+    daemon.assert_no_request();
     assert!(!restart.visible_root().exists());
 }
 
@@ -590,119 +561,39 @@ async fn a_resumed_label_that_misses_a_log_mount_is_refused() {
     daemon.assert_followed(2);
 }
 
-/// daemon 以 4xx 明确拒绝：替代容器确实没建成，刚建的日志目录没人用，删掉。
+/// label 里不能出现换源计划之外的挂载点：多出来的键会改写那条挂载（比如工作区）的期望值。
 #[tokio::test]
-async fn new_log_directories_are_discarded_when_the_replacement_is_explicitly_rejected() {
+async fn a_resumed_label_that_names_a_mount_outside_the_plan_is_refused() {
     let restart = LoggedRestart::new();
-    let daemon = scripted(creation_script(step(
-        "POST",
-        "/containers/create",
-        400,
-        json!({"message": "bad parameter"}),
-    )))
+    let daemon = scripted(vec![
+        step("GET", ORIGINAL_UID, 404, no_such_container()),
+        step(
+            "GET",
+            "rcoder-app-builder-",
+            200,
+            retained_replacement(
+                &restart.template,
+                json!({
+                    RESTORE: restart.template.archive.uid.clone(),
+                    RESTART_LOG_DIR: json!({
+                        LOG_TARGET: new_log_directory(
+                            &restart,
+                            "rcoder-app-builder-265-20251026090000"
+                        ),
+                        WORKSPACE_TARGET: "/srv/elsewhere/workspace"
+                    })
+                    .to_string(),
+                }),
+            ),
+        ),
+    ])
     .await;
 
     let result = restart.restore(&daemon).await;
 
     assert!(
-        matches!(&result, Err(Error::DockerError(message)) if message.contains("Create replacement builder")),
-        "{result:?}"
-    );
-    daemon.assert_followed(5);
-    assert_eq!(
-        std::fs::read_dir(restart.visible_root()).unwrap().count(),
-        0,
-        "directories made for a replacement that was never created are removed"
-    );
-}
-
-/// 创建请求还没发出去就失败了（读取 daemon 信息被拒）：同样确认没建成，删掉。
-#[tokio::test]
-async fn new_log_directories_are_discarded_when_the_request_was_never_sent() {
-    let restart = LoggedRestart::new();
-    let mut script = absent_original();
-    script.extend([
-        step("GET", "/images/", 200, image_inspect()),
-        step("GET", "/info", 500, json!({"message": "daemon refused"})),
-    ]);
-    let daemon = scripted(script).await;
-
-    let result = restart.restore(&daemon).await;
-
-    assert!(result.is_err(), "{result:?}");
-    daemon.assert_followed(4);
-    assert_eq!(
-        std::fs::read_dir(restart.visible_root()).unwrap().count(),
-        0,
-        "nothing was sent to Docker, so the directories are certainly unused"
-    );
-}
-
-async fn assert_kept_after_unknown_outcome(result: Result<Replacement>, restart: &LoggedRestart) {
-    assert!(result.is_err(), "{result:?}");
-    assert_eq!(
-        std::fs::read_dir(restart.visible_root()).unwrap().count(),
-        1,
-        "the replacement may exist and bind this directory; it must be left alone"
-    );
-    assert!(
-        crate::log_directory::pending_bind_sources().is_empty(),
-        "the claim ends with the attempt; the inventory takes over"
-    );
-}
-
-/// 请求发出去了、daemon 报 5xx：结果不明，替代容器可能已经建出来，目录原样留着。
-#[tokio::test]
-async fn new_log_directories_are_kept_when_the_daemon_fails_after_the_request() {
-    let restart = LoggedRestart::new();
-    let daemon = scripted(creation_script(step(
-        "POST",
-        "/containers/create",
-        500,
-        json!({"message": "driver failed"}),
-    )))
-    .await;
-
-    assert_kept_after_unknown_outcome(restart.restore(&daemon).await, &restart).await;
-}
-
-/// 请求发出去了、应答是成功却没有 ID：容器可能已经建出来，目录原样留着。
-#[tokio::test]
-async fn new_log_directories_are_kept_when_the_reply_carries_no_id() {
-    let restart = LoggedRestart::new();
-    let daemon = scripted(creation_script(step(
-        "POST",
-        "/containers/create",
-        201,
-        json!({"Id": "", "Warnings": []}),
-    )))
-    .await;
-
-    assert_kept_after_unknown_outcome(restart.restore(&daemon).await, &restart).await;
-}
-
-/// 请求发出去了、应答丢了：结果不明，目录原样留着。
-#[tokio::test]
-async fn new_log_directories_are_kept_when_the_reply_is_lost() {
-    let restart = LoggedRestart::new();
-    let daemon = scripted(creation_script(lost_reply("POST", "/containers/create"))).await;
-
-    assert_kept_after_unknown_outcome(restart.restore(&daemon).await, &restart).await;
-}
-
-/// 工作区核对不过时不建日志目录。
-#[tokio::test]
-async fn no_log_directory_is_created_when_another_bind_source_is_missing() {
-    let restart = LoggedRestart::new();
-    std::fs::remove_dir_all(restart.workspace.path()).unwrap();
-    let daemon = scripted(absent_original()).await;
-
-    let result = restart.restore(&daemon).await;
-
-    assert!(
-        matches!(&result, Err(Error::Conflict(message)) if message.contains("Restart bind source is missing")),
+        matches!(&result, Err(Error::Conflict(message)) if message.contains("which the restart does not replace")),
         "{result:?}"
     );
     daemon.assert_followed(2);
-    assert!(!restart.visible_root().exists());
 }

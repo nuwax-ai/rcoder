@@ -10,14 +10,20 @@
 //! 清理器回收。建不出来就是建不出来，不退回去绑定任何已有的路径。
 //!
 //! 哪些 bind 源必须走这一套，按**源路径**判定，不看容器内的挂载点叫什么：落在可回收的日志根
-//! （`DockerManagerConfig::log_reclaim_root`）下面的都是。见 `agent_container_starter::mounts`。
+//! （`DockerManagerConfig::log_reclaim_root`）下面的都是。怎么判在
+//! `runtime::docker_runtime::host_path_space::LogDomain`，创建容器和 builder 重启都用它。
 //!
 //! # 正在准备挂载的目录
 //!
 //! 目录建好到 Docker 登记这个挂载之间（中间可能隔着一次很慢的镜像拉取，多久没有上界），它在
 //! 挂载清单里还看不到。这段时间靠 [`pending`] 按路径登记，清理器把登记着的目录当作仍被挂载。
+//! 登记分两类：创建还在进行的（在途，不淘汰），和请求发出去了却没能确认结果的（结果不明，
+//! 保留到过期）。
+//!
+//! 登记的不只是新建的日志目录：创建方判不出在不在日志根里的 bind 源也登记进来（靠的是同一个
+//! 路径空间，`runtime::docker_runtime::host_path_space`）。判不出来不拒绝创建容器——清理器对这条
+//! 源同样判不出来，登记着它就整轮不删。
 
-mod domain;
 mod pending;
 
 use std::io::ErrorKind;
@@ -28,7 +34,6 @@ use tracing::warn;
 /// 同名目录已存在时，名字最多试到 `<名字>-16`
 pub(crate) const NAME_ATTEMPTS: u32 = 16;
 
-pub(crate) use domain::LogDomain;
 pub use pending::PendingBinds;
 pub(crate) use pending::pending_bind_sources;
 

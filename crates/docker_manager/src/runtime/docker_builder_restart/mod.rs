@@ -580,11 +580,15 @@ impl DockerRuntime {
         Ok(restored)
     }
 
-    /// 用归档重放出替代 builder：必要时先移除仍被保留的旧容器，核对 bind 源，再创建。
+    /// 用归档重放出替代 builder：先定下要换哪些日志目录，必要时移除仍被保留的旧容器，
+    /// 核对其它 bind 源，再创建。
     ///
     /// 落在可回收日志根下面的 bind 不照原样重放，换成同级的新目录：旧目录可能已经过期，
     /// 日志清理器正在回收它。新目录登记为正在准备挂载，清理器碰不到它，这一段不需要和
     /// 清理器互斥。
+    ///
+    /// 判不出在不在日志根里的 bind 照原样重放，源登记到替代容器建出来：清理器对它同样判不
+    /// 出来，登记着就不会删。日志根定位不完整、取不到路径空间都不让恢复失败，只告警。
     async fn replace_builder_container(
         &self,
         template: &BuilderRestartTemplate,
@@ -593,6 +597,11 @@ impl DockerRuntime {
     ) -> Result<Replacement> {
         let client = self.inner.get_docker_client();
         let mut replay = archive.clone();
+        // 先把能提前定的都定下来，再去动旧容器：日志域在哪、哪些 bind 要换源。这一步失败时
+        // 原容器还在，恢复可以原地重试
+        let admission = self.log_domain().await;
+        admission.warn_if_limited("Restart builder");
+        let binds = plan(template, archive, &admission).await?;
         // Old versions may retain stopped builders. Replace that exact instance
         // only after its stop receipt and mount witnesses are confirmed.
         if let Some(existing) = inspect_absent(
@@ -670,14 +679,13 @@ impl DockerRuntime {
                 ));
             }
         }
-        let domain = self.log_domain().await?;
-        let plans = plan(template, archive, &domain)?;
         if let Some((id, label)) = resumed {
             let expected_volumes = match label {
                 None => template.volumes.clone(),
-                Some(label) => {
-                    with_log_sources(&template.volumes, &resumed_sources(&label, &plans)?)
-                }
+                Some(label) => with_log_sources(
+                    &template.volumes,
+                    &resumed_sources(&label, template, &binds.plans, admission.space().is_none())?,
+                ),
             };
             return Ok(Replacement {
                 id,
@@ -687,7 +695,7 @@ impl DockerRuntime {
         // 先定下要换哪些日志目录，再核对其它 bind 源：核对不过就不建
         for volume in &template.volumes {
             // 日志目录换成新建的，旧的可能早已被清理器回收，不要求它还在
-            if plans.iter().any(|plan| plan.volume == volume) {
+            if binds.plans.iter().any(|plan| plan.volume() == volume) {
                 continue;
             }
             if !bind_source_exists(&volume.uid)? {
@@ -708,25 +716,34 @@ impl DockerRuntime {
             .map_err(|error| {
                 Error::DockerError(format!("Prepare restart image {image}: {error}"))
             })?;
-        let fresh = FreshLogDirectories::create(self, &plans).await?;
-        fresh.apply(&mut replay, &plans);
-        let log_label = (!plans.is_empty()).then(|| fresh.label());
+        let mut fresh = FreshLogDirectories::create(admission.space(), &binds).await?;
+        fresh.apply(&mut replay, &binds.plans);
+        let log_label = (!binds.plans.is_empty()).then(|| fresh.label());
+        // 创建请求马上发出。之后拿不到确切结果——包括这个 future 等应答时被取消——登记都会
+        // 转去"结果不明"保留着：替代容器可能已经建出来、正绑着这些目录
+        fresh.request_sent();
         match self
             .create_replacement(template, &replay, log_label.as_deref(), original)
             .await
         {
-            Ok(id) => Ok(Replacement {
-                id,
-                expected_volumes: fresh.expected_volumes(&template.volumes),
-            }),
-            // 确认没建成：刚建的日志目录没人用，删掉
+            Ok(id) => {
+                fresh.created();
+                Ok(Replacement {
+                    id,
+                    expected_volumes: fresh.expected_volumes(&template.volumes),
+                })
+            }
+            // 确认没建成：登记注销，刚建的日志目录没人用，删掉
             Err(CreateFailure::NotCreated(error)) => {
-                fresh.discard_created().await;
+                fresh.confirmed_absent().await;
                 Err(error)
             }
-            // 结果不明：替代容器可能已经建出来、正绑着这些目录。原样留着，下一次恢复按
-            // 名称找到它、按它的 label 核对；确实没建成的，过完保留期由清理器回收
-            Err(CreateFailure::Unknown(error)) => Err(error),
+            // 结果不明：目录和登记都原样留着。下一次恢复按名称找到替代容器、按它的 label
+            // 核对；确实没建成的，登记过期之后由清理器回收
+            Err(CreateFailure::Unknown(error)) => {
+                fresh.outcome_unknown();
+                Err(error)
+            }
         }
     }
 
@@ -777,11 +794,14 @@ impl DockerRuntime {
         let created = match created {
             Ok(created) => created,
             Err(error) => {
-                let message = fail(format!("Create replacement builder: {error}"));
-                return Err(if explicitly_rejected(&error) {
-                    CreateFailure::NotCreated(message)
-                } else {
-                    CreateFailure::Unknown(message)
+                return Err(match observed_rejection(&error) {
+                    // daemon 明确拒绝了这次请求：替代容器不存在。保留结构化的拒绝，上层据此
+                    // 按"确实被拒绝"归类，而不是按结果不明
+                    Some(rejection) => CreateFailure::NotCreated(Error::RequestRejected(rejection)),
+                    // 5xx、408、499、连接断了、应答丢了：请求可能已经生效，结果不明
+                    None => {
+                        CreateFailure::Unknown(fail(format!("Create replacement builder: {error}")))
+                    }
                 });
             }
         };
@@ -860,14 +880,18 @@ impl DockerRuntime {
     }
 }
 
-/// daemon 是否以 4xx 明确拒绝了这次请求。5xx 和 408、499 不算：请求可能已经生效。
-/// 与 `container_runtime_api::runtime_mutation_outcome_unknown` 的口径一致
-fn explicitly_rejected(error: &bollard::errors::Error) -> bool {
+/// daemon 对这次请求给出的明确拒绝。只有 4xx 算（408、499 除外）：5xx 和超时类的应答
+/// 说明请求可能已经生效。口径同 `RuntimeRequestRejection::from_status`，也就是
+/// `container_runtime_api::runtime_mutation_outcome_unknown` 的反面
+fn observed_rejection(
+    error: &bollard::errors::Error,
+) -> Option<shared_types::RuntimeRequestRejection> {
     match error {
-        bollard::errors::Error::DockerResponseServerError { status_code, .. } => {
-            (400..500).contains(status_code) && !matches!(status_code, 408 | 499)
-        }
-        _ => false,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message,
+        } => shared_types::RuntimeRequestRejection::from_status(*status_code, message.clone()),
+        _ => None,
     }
 }
 

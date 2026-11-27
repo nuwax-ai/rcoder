@@ -5,24 +5,30 @@
 //!
 //! 可回收的日志根按**源路径**准入：bind 源落在它下面的挂载，必须是为本容器独占新建的目录，
 //! 否则拒绝创建容器；建好之后登记为正在准备挂载。
+//!
+//! 判不出一条 bind 源在不在日志根里时不拒绝：照常挂载，登记到创建结束（`unclassified`）。
+//! 清理器对它同样判不出来，而它确认不了就不删。
+//!
+//! 在不在日志根里用的是清理器那个路径空间。这里给它进程路径就是宿主机路径的那一种
+//! （`HostPathSpace::Host`），于是日志根直接用一个真实的临时目录，符号链接、`..` 都是文件
+//! 系统上的真实效果；按挂载表换算的那一种在 `host_path_space` 自己的测试里。
 
 use super::*;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
+mod unclassified;
+
 use crate::DockerError;
 use crate::container_builder::ContainerConfigBuilder;
 use crate::log_directory::{PendingBinds, pending_bind_sources};
+use crate::runtime::docker_runtime::host_path_space::{HostPathSpace, LogDomainAdmission};
 use shared_types::ServiceMountConfig;
 
 const CONTAINER: &str = "computer-agent-runner-user_42";
-/// 可回收的日志根（RCoder 进程里的路径）
-const RECLAIM_ROOT: &str = "/app/logs/container";
 /// 日志根下面的另一条日志挂载在容器内的路径
 const AUDIT_TARGET: &str = "/app/audit-logs";
-/// 不在日志根下面的另一块挂载（RCoder 进程里的路径）
-const ASSETS_ROOT: &str = "/app/assets";
 /// 工作区的解析路径
 const WORKSPACE_ROOT: &str = "/app/computer-project-workspace";
 
@@ -76,6 +82,17 @@ impl Layout {
     fn host_assets_root(&self) -> PathBuf {
         self.root.path().join("assets")
     }
+
+    /// 挂载配置里的 `resolve_from`：RCoder 进程里的日志根。假的换算把它换到 daemon 看到的
+    /// 日志总根
+    fn log_resolve_from(&self) -> String {
+        self.visible_log_root().to_str().unwrap().to_owned()
+    }
+
+    /// 日志根外面那块挂载的 `resolve_from`
+    fn assets_resolve_from(&self) -> String {
+        self.host_assets_root().to_str().unwrap().to_owned()
+    }
 }
 
 /// 假的路径换算：只认登记过的几个路径，别的一律解析失败
@@ -122,6 +139,11 @@ fn log_mount(layout: &Layout) -> ServiceMountConfig {
     )
 }
 
+/// 进程路径就是宿主机路径的那种判定，日志根是 `reclaim_root`
+async fn admission(reclaim_root: &Path) -> LogDomainAdmission<'static> {
+    LogDomainAdmission::in_space(HostPathSpace::Host, reclaim_root).await
+}
+
 /// 返回建好的配置和"正在准备挂载"的登记
 async fn apply(
     layout: &Layout,
@@ -143,12 +165,40 @@ async fn apply_with_workspace(
     }))
     .unwrap();
     let variables = HashMap::new();
-    let ctx = MountContext {
-        log_reclaim_root: Path::new(RECLAIM_ROOT),
+    // 路径空间用的是进程路径就是宿主机路径的那一种，日志根也就是布局里的宿主机路径
+    let log_reclaim_root = layout.host_log_root();
+    let ctx = mount_context(&log_reclaim_root, &service_config, &variables);
+    // 日志根有两个名字：配置里的 `log_reclaim_root`，和挂载的 `resolve_from`
+    let mut mappings = vec![
+        (layout.visible_log_root(), layout.host_log_root()),
+        (layout.host_assets_root(), layout.host_assets_root()),
+    ];
+    if let Some(host) = workspace_host {
+        mappings.push((PathBuf::from(WORKSPACE_ROOT), host.to_path_buf()));
+    }
+    let applied = apply_auto_mounts(
+        ContainerConfigBuilder::new("user_42"),
+        &ctx,
+        &FakeLookup { mappings },
+        &admission(&log_reclaim_root).await,
+    )
+    .await?;
+    let config = applied.builder.build()?;
+    Ok((config, applied.pending_binds))
+}
+
+/// 一次创建的挂载上下文：`computer-agent-runner`，容器 `user_42`，日志根是 `log_reclaim_root`
+fn mount_context<'a>(
+    log_reclaim_root: &'a Path,
+    service_config: &'a ServiceImageConfig,
+    variables: &'a HashMap<String, String>,
+) -> MountContext<'a> {
+    MountContext {
+        log_reclaim_root,
         container_id: "user_42",
         container_prefix: "computer-agent-runner",
-        service_config: &service_config,
-        variables: &variables,
+        service_config,
+        variables,
         workspace_resolution: WORKSPACE_ROOT,
         workspace_container: "/home/user",
         service_type: &ServiceType::ComputerAgentRunner,
@@ -158,24 +208,7 @@ async fn apply_with_workspace(
         pod_id: None,
         tenant_id: None,
         space_id: None,
-    };
-    // 日志根有两个名字：配置里的 `log_reclaim_root`，和挂载的 `resolve_from`
-    let mut mappings = vec![
-        (PathBuf::from(RECLAIM_ROOT), layout.host_log_root()),
-        (layout.visible_log_root(), layout.host_log_root()),
-        (PathBuf::from(ASSETS_ROOT), layout.host_assets_root()),
-    ];
-    if let Some(host) = workspace_host {
-        mappings.push((PathBuf::from(WORKSPACE_ROOT), host.to_path_buf()));
     }
-    let applied = apply_auto_mounts(
-        ContainerConfigBuilder::new("user_42"),
-        &ctx,
-        &FakeLookup { mappings },
-    )
-    .await?;
-    let config = applied.builder.build()?;
-    Ok((config, applied.pending_binds))
 }
 
 fn only_mount(config: &crate::DockerContainerConfig) -> &crate::MountPoint {
@@ -504,7 +537,7 @@ async fn mounts_outside_the_log_root_keep_using_the_existing_directory() {
             "/app/wallpaper",
             "{resolved_path}/wallpaper",
             false,
-            Some(ASSETS_ROOT),
+            Some(&layout.assets_resolve_from()),
         )],
     )
     .await
@@ -533,7 +566,7 @@ async fn a_read_only_mount_outside_the_log_root_is_allowed() {
             "/app/assets",
             "{resolved_path}/static",
             true,
-            Some(ASSETS_ROOT),
+            Some(&layout.assets_resolve_from()),
         )],
     )
     .await
@@ -604,5 +637,52 @@ async fn in_deploy_host_form_the_directory_is_created_on_the_bind_source_itself(
     assert_eq!(
         entries(&layout.host_log_root()),
         [bound.file_name().unwrap().to_str().unwrap().to_owned()]
+    );
+}
+
+/// 归一化之后落在日志根里的路径就是在日志根里：Docker 登记挂载源时同样会做词法归一化。
+#[tokio::test]
+async fn a_path_that_climbs_out_and_back_into_the_log_root_is_a_log_directory() {
+    let layout = Layout::new();
+    let climbing = mount(
+        "/app/container-logs",
+        "{resolved_path}/../container/{log_dir_name}",
+        false,
+        Some(&layout.log_resolve_from()),
+    );
+
+    let (config, _pending) = apply(&layout, vec![climbing]).await.unwrap();
+
+    let mount = only_mount(&config);
+    let name = file_name(&mount.host_path);
+    // 绑定字符串照配置原样（Docker 登记时归一化），指的就是日志根下的那个目录
+    assert_eq!(
+        crate::normalize_path(Path::new(&mount.host_path)),
+        layout.host_log_root().join(name)
+    );
+    assert!(layout.host_log_root().join(name).is_dir());
+    assert_eq!(entries(&layout.host_log_root()), [name.to_owned()]);
+}
+
+/// 词法上在日志根外面、经符号链接却指进日志根的路径，也算在日志根里：Docker 挂载那一刻
+/// 解析的就是链接指向的位置。
+#[tokio::test]
+async fn a_symlink_into_the_log_root_counts_as_being_inside_it() {
+    let layout = Layout::new();
+    std::fs::create_dir_all(layout.host_log_root()).unwrap();
+    std::fs::create_dir_all(layout.host_assets_root()).unwrap();
+    std::os::unix::fs::symlink("../container", layout.host_assets_root().join("alias")).unwrap();
+    let through_alias = mount(
+        "/app/notes",
+        "{resolved_path}/alias/shared",
+        false,
+        Some(&layout.assets_resolve_from()),
+    );
+
+    let error = apply(&layout, vec![through_alias]).await.unwrap_err();
+
+    assert!(
+        matches!(&error, DockerError::ConfigurationError(message) if message.contains("under the reclaimable log root")),
+        "{error:?}"
     );
 }

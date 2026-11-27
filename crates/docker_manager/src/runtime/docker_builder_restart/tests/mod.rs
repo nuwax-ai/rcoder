@@ -30,6 +30,8 @@ struct Step {
     body: Value,
     /// 不应答，直接断开连接：模拟应答丢失
     hang_up: bool,
+    /// 收下请求之后一直不应答：模拟 daemon 迟迟不回
+    stall: bool,
 }
 
 fn step(method: &'static str, contains: impl Into<String>, status: u16, body: Value) -> Step {
@@ -39,6 +41,7 @@ fn step(method: &'static str, contains: impl Into<String>, status: u16, body: Va
         status,
         body,
         hang_up: false,
+        stall: false,
     }
 }
 
@@ -50,6 +53,19 @@ fn lost_reply(method: &'static str, contains: impl Into<String>) -> Step {
         status: 0,
         body: Value::Null,
         hang_up: true,
+        stall: false,
+    }
+}
+
+/// 收下请求之后一直不应答
+fn stalled(method: &'static str, contains: impl Into<String>) -> Step {
+    Step {
+        method,
+        contains: contains.into(),
+        status: 0,
+        body: Value::Null,
+        hang_up: false,
+        stall: true,
     }
 }
 
@@ -103,6 +119,15 @@ impl ScriptedDaemon {
             self.requests.lock().unwrap().len(),
             expected_requests,
             "every scripted request must have been made"
+        );
+    }
+
+    /// 一个请求都没到过
+    fn assert_no_request(&self) {
+        assert!(
+            self.requests.lock().unwrap().is_empty(),
+            "no request must reach Docker: {:?}",
+            self.requests.lock().unwrap()
         );
     }
 
@@ -176,6 +201,9 @@ async fn scripted_with_hook(steps: Vec<Step>, hook: RequestHook) -> ScriptedDaem
                 .unwrap()
                 .push(String::from_utf8_lossy(&body).into_owned());
             hook(&request);
+            if step.as_ref().is_some_and(|step| step.stall) {
+                std::future::pending::<()>().await;
+            }
             if step.as_ref().is_some_and(|step| step.hang_up) {
                 continue;
             }

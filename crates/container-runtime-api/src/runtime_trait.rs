@@ -525,6 +525,20 @@ pub trait AgentContainerRuntime: Send + Sync {
         ))
     }
 
+    /// Mount targets (container paths) whose bind source `restore_builder_restart`
+    /// deliberately replaces with a fresh directory for this template. Recaptured
+    /// mounts may differ from the archived ones only at these targets; every other
+    /// mount must come back exactly as archived. The runtime itself verifies the
+    /// replacement's actual mounts against the sources it handed out. An error
+    /// means the runtime cannot tell: callers must not relax anything. The
+    /// default replaces nothing.
+    async fn builder_restart_replaced_mounts(
+        &self,
+        _template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     async fn capture_builder_compute_volumes(
         &self,
         _target: &shared_types::BuilderControlTarget,

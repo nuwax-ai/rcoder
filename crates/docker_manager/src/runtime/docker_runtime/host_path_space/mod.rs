@@ -1,7 +1,8 @@
 //! RCoder 进程命名空间里的路径如何与宿主机路径互相换算。
 //!
-//! 判定日志目录是否仍被挂载（[`super::log_dir_mounts`]）和给替代 builder 新建日志目录
-//! （[`create_host_directory`]）共用这一套换算，两边看到的必须是同一个映射。
+//! 几处共用这一套视图，看到的必须是同一个映射：判定日志目录是否仍被挂载
+//! （[`super::log_dir_mounts`]）、判断一条 bind 源在不在可回收的日志根里（[`log_domain`]，
+//! 创建容器、builder 重启、组装应用数据挂载都用它）、给替代 builder 新建日志目录。
 //!
 //! # 两边必须在同一个路径空间里比
 //!
@@ -14,17 +15,30 @@
 //! [`viewing`] 只采纳能核验的视图：视图里的路径换算回宿主机必须还是这个路径。容器内的
 //! 路径被另一条挂载遮蔽时，看到的是另一棵目录，换算回去就对不上，这样的视图不算。
 
+mod log_domain;
+mod real_location;
+
+#[cfg(test)]
+pub(crate) use log_domain::LogDomain;
+pub(crate) use log_domain::{
+    LogDomainAdmission, LogDomainVerdict, bind_source, create_host_directory,
+};
+#[cfg(test)]
+pub(super) use real_location::Entry;
+pub(super) use real_location::{
+    DirectoryId, FileSystemView, LocalFileSystem, Location, RealLocations, is_absent,
+};
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
 use tokio::sync::OnceCell;
 
-use crate::log_directory::LogDomain;
-use crate::{DockerManager, DockerResult, HostPathResolver};
+use crate::{DockerManager, HostPathResolver};
 
 /// RCoder 进程命名空间里的路径如何与宿主机路径互相换算
-pub(super) enum HostPathSpace<'a> {
+pub(crate) enum HostPathSpace<'a> {
     /// deploy-host 形态：RCoder 与 daemon 同在宿主机，进程路径就是宿主机路径
     Host,
     /// 容器形态：按 RCoder 所在容器的挂载表替换前缀
@@ -32,13 +46,13 @@ pub(super) enum HostPathSpace<'a> {
 }
 
 /// 一个宿主机路径在 RCoder 命名空间里的一个视图：这个宿主机路径经某条挂载看到的路径
-pub(super) struct Projection {
-    pub(super) path: PathBuf,
+pub(crate) struct Projection {
+    path: PathBuf,
 }
 
 impl HostPathSpace<'_> {
     /// 与创建侧 `apply_auto_mounts` 登记挂载时逐字一致：先做词法归一化，再替换前缀
-    pub(super) fn to_host(&self, path: &Path) -> DockerResult<PathBuf> {
+    pub(crate) fn to_host(&self, path: &Path) -> crate::DockerResult<PathBuf> {
         let lexical = crate::normalize_path(path);
         match self {
             HostPathSpace::Host => Ok(lexical),
@@ -47,7 +61,7 @@ impl HostPathSpace<'_> {
     }
 
     /// `host_path` 在 RCoder 命名空间里的全部视图：同一个宿主机目录挂了几次就有几个
-    pub(super) fn projections(&self, host_path: &Path) -> Vec<Projection> {
+    fn projections(&self, host_path: &Path) -> Vec<Projection> {
         let host_path = crate::normalize_path(host_path);
         match self {
             HostPathSpace::Host => vec![Projection { path: host_path }],
@@ -61,14 +75,14 @@ impl HostPathSpace<'_> {
 
     /// 这个视图看到的确实是 `host_path`：把视图里的路径再正向换算回去，必须得到 `host_path`。
     /// 路径中途被另一条挂载遮蔽时，看到的是另一棵目录，换算回去就对不上。
-    pub(super) fn shows(&self, projection: &Projection, host_path: &Path) -> bool {
+    fn shows(&self, projection: &Projection, host_path: &Path) -> bool {
         self.to_host(&projection.path)
             .is_ok_and(|mapped| mapped == crate::normalize_path(host_path))
     }
 }
 
 /// 一个宿主机路径经哪个视图看得到
-pub(super) enum Viewed {
+pub(crate) enum Viewed {
     Through(Projection),
     /// RCoder 的任何挂载都不覆盖它
     Unmounted,
@@ -76,9 +90,19 @@ pub(super) enum Viewed {
     Hidden,
 }
 
+impl Viewed {
+    /// 这个视图在 RCoder 进程里的路径；RCoder 看不到时为 `None`
+    pub(crate) fn visible_path(self) -> Option<PathBuf> {
+        match self {
+            Viewed::Through(projection) => Some(projection.path),
+            Viewed::Unmounted | Viewed::Hidden => None,
+        }
+    }
+}
+
 /// 取最具体的那个能核验的视图。视图里的路径要能换算回这个宿主机路径才算数：路径中途被
 /// 另一条挂载遮蔽时，看到的是另一棵目录，换算回去就对不上
-pub(super) fn viewing(space: &HostPathSpace<'_>, host_path: &Path) -> Viewed {
+pub(crate) fn viewing(space: &HostPathSpace<'_>, host_path: &Path) -> Viewed {
     let mut hidden = false;
     for projection in space.projections(host_path) {
         if space.shows(&projection, host_path) {
@@ -90,57 +114,6 @@ pub(super) fn viewing(space: &HostPathSpace<'_>, host_path: &Path) -> Viewed {
         Viewed::Hidden
     } else {
         Viewed::Unmounted
-    }
-}
-
-/// 在宿主机路径 `host_dir` 上新建一个空目录，经 RCoder 自己的挂载视图操作，返回新建目录在
-/// RCoder 进程里的路径。
-///
-/// 新建是独占的（见 `crate::log_directory`）：同名目录已经存在时换一个名字，所以返回路径的
-/// 最后一级不一定等于 `host_dir` 的。
-pub(crate) async fn create_host_directory(
-    manager: &DockerManager,
-    log_path_resolver: &OnceCell<HostPathResolver>,
-    host_dir: &Path,
-) -> Result<PathBuf, CreateHostDirectoryError> {
-    let space = path_space(manager, log_path_resolver)
-        .await
-        .map_err(|error| CreateHostDirectoryError::Resolve(error.to_string()))?;
-    let (Some(parent), Some(name)) = (
-        host_dir.parent(),
-        host_dir.file_name().and_then(|name| name.to_str()),
-    ) else {
-        return Err(CreateHostDirectoryError::NotVisible);
-    };
-    let Viewed::Through(projection) = viewing(&space, parent) else {
-        return Err(CreateHostDirectoryError::NotVisible);
-    };
-    crate::log_directory::create_fresh_directory(&projection.path, name)
-        .await
-        .map_err(CreateHostDirectoryError::Create)
-}
-
-/// 在宿主机上建目录失败的原因
-#[derive(Debug)]
-pub(crate) enum CreateHostDirectoryError {
-    /// RCoder 所在容器的挂载表取不到：自检失败或超时
-    Resolve(String),
-    /// RCoder 的挂载看不到这个位置：在所有挂载之外，或者被另一条挂载遮蔽
-    NotVisible,
-    /// 看得到，但目录没建成
-    Create(crate::log_directory::FreshDirectoryError),
-}
-
-impl std::fmt::Display for CreateHostDirectoryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Resolve(detail) => write!(f, "RCoder's own mount table is unavailable: {detail}"),
-            Self::NotVisible => write!(
-                f,
-                "no mount of RCoder's own container shows this host directory"
-            ),
-            Self::Create(error) => write!(f, "{error}"),
-        }
     }
 }
 
@@ -164,9 +137,14 @@ async fn container_resolver<'a>(
     })
 }
 
-/// 这次用哪个路径空间：显式注入的挂载表优先，其次 deploy-host，否则自检 RCoder 所在容器的
-/// 挂载表（只在首次用到时做一次）
-pub(super) async fn path_space<'a>(
+/// 这次用哪个路径空间——清理器看宿主机路径的那一副眼镜。
+///
+/// 显式注入的挂载表优先；deploy-host 形态进程路径就是宿主机路径；否则自检 RCoder 所在容器的
+/// 挂载表（每个 `log_path_resolver` 只做一次）。
+///
+/// 取不到路径空间是"信息不足"，不是"没有日志域"：清理器这时保留所有候选；创建容器、builder
+/// 重启不因此失败，见 [`log_domain::LogDomainAdmission`]。
+pub(crate) async fn path_space<'a>(
     manager: &DockerManager,
     log_path_resolver: &'a OnceCell<HostPathResolver>,
 ) -> ContainerRuntimeResult<HostPathSpace<'a>> {
@@ -178,16 +156,5 @@ pub(super) async fn path_space<'a>(
     })
 }
 
-/// 可回收的日志根（RCoder 进程里的路径）在宿主机上的位置。日志根换算不出宿主机路径时为空：
-/// 那说明没有 bind 能指向它。builder 重启用它判断哪些 bind 不能原样重放
-pub(crate) async fn resolve_log_domain(
-    manager: &DockerManager,
-    log_path_resolver: &OnceCell<HostPathResolver>,
-    reclaim_root: &Path,
-) -> ContainerRuntimeResult<LogDomain> {
-    let space = path_space(manager, log_path_resolver).await?;
-    Ok(match space.to_host(reclaim_root) {
-        Ok(host_root) => LogDomain::new(host_root),
-        Err(_) => LogDomain::none(),
-    })
-}
+#[cfg(test)]
+mod tests;

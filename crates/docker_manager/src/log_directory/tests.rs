@@ -107,35 +107,3 @@ async fn every_taken_name_is_reported_instead_of_reusing_one() {
 
     assert!(matches!(error, FreshDirectoryError::Exhausted));
 }
-
-/// 日志根本身不算"落在它下面"：清理器回收的是它里面的目录
-#[test]
-fn the_log_domain_covers_only_what_is_strictly_below_its_root() {
-    let domain = LogDomain::new(PathBuf::from("/srv/logs/container"));
-
-    assert!(domain.contains("/srv/logs/container/runner-a"));
-    assert!(domain.contains("/srv/logs/container/tenant/runner-a"));
-    assert!(!domain.contains("/srv/logs/container"));
-    assert!(!domain.contains("/srv/logs/container-other/runner-a"));
-    assert!(!domain.contains("/srv/logs"));
-}
-
-#[test]
-fn a_bind_is_judged_by_its_source_prefix_without_splitting_it() {
-    let domain = LogDomain::new(PathBuf::from("/srv/logs/container"));
-
-    assert!(domain.contains_bind_source("/srv/logs/container/runner-a:/app/container-logs"));
-    assert!(domain.contains_bind_source("/srv/logs/container/runner-a:/app/container-logs:rw,z"));
-    assert!(domain.contains_bind_source("/srv/logs/container/runner:a:/x"));
-    assert!(!domain.contains_bind_source("/srv/logs/container:/app/container-logs"));
-    assert!(!domain.contains_bind_source("/srv/logs/container-other/runner-a:/app/container-logs"));
-    assert!(!domain.contains_bind_source("/srv/workspace/runner-a:/app/container-logs"));
-}
-
-#[test]
-fn without_a_host_root_nothing_is_in_the_domain() {
-    let domain = LogDomain::none();
-
-    assert!(!domain.contains("/srv/logs/container/runner-a"));
-    assert!(!domain.contains_bind_source("/srv/logs/container/runner-a:/app/container-logs"));
-}

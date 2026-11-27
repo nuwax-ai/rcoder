@@ -352,10 +352,13 @@ impl<'a> AgentContainerStarter<'a> {
         let network_name = self.manager.get_main_network_name().await;
         builder = builder.network_name(network_name);
 
+        // 给容器加挂载。判断哪些 bind 源落在可回收的日志根里用的是清理器那个路径空间；判不出
+        // 来的不拒绝创建，那条源登记到创建结束
         let mounts::AppliedMounts {
             builder,
-            pending_binds,
-        } = mounts::apply_auto_mounts(
+            mut pending_binds,
+        } = mounts::prepare_auto_mounts(
+            self.manager,
             builder,
             &mounts::MountContext {
                 log_reclaim_root: &self.manager.config.log_reclaim_root,
@@ -394,8 +397,11 @@ impl<'a> AgentContainerStarter<'a> {
         }
         // Never cancel this future: Docker may still be creating or starting
         // the container. Only acknowledged writes permit handing over the lease.
-        let created = self.manager.create_container(config).await?;
-        // Docker 已经应答：容器要么登记了这些日志目录，要么确实没建成，占用登记可以注销
+        // 请求马上发出，登记跟着结果走：建出来了就注销；请求报错或者这个 future 等应答时被
+        // 取消，登记转去"结果不明"、保留到过期——Docker 可能已经建出了容器，正绑着这些目录
+        let created = pending_binds
+            .until_settled(self.manager.create_container(config))
+            .await?;
         drop(pending_binds);
         if is_cancelled() {
             return Err(DockerError::BuilderCreationCancelled);
