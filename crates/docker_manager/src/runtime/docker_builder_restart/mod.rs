@@ -18,6 +18,7 @@
 //! The log mount is the one bind that is not replayed verbatim: the replacement
 //! gets a new log directory instead, see [`log_directory`].
 use super::docker_runtime::DockerRuntime;
+use crate::log_directory::PendingBinds;
 use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
 use log_directory::{FreshLogDirectories, plan};
 use log_label::RESTART_LOG_DIR;
@@ -607,6 +608,13 @@ impl DockerRuntime {
         let admission = self.log_domain().await;
         admission.warn_if_limited("Restart builder");
         let binds = plan(template, archive, &admission).await?;
+        // 原样重放的 bind（落在日志根里的持久数据、判不出来的源）从现在起登记到替代容器建
+        // 出来。要在动旧容器之前：旧容器一删，这些目录就不在任何容器的挂载里了，到建替代
+        // 容器之间可能还要拉镜像。下面任何一步失败，守卫 drop，登记注销
+        let mut replayed = PendingBinds::default();
+        for source in &binds.replayed {
+            replayed.claim(source);
+        }
         // Old versions may retain stopped builders. Replace that exact instance
         // only after its stop receipt and mount witnesses are confirmed.
         if let Some(existing) = inspect_absent(
@@ -698,11 +706,12 @@ impl DockerRuntime {
         let mut fresh = FreshLogDirectories::create(
             admission.space(),
             &binds,
+            replayed,
             &self.inner.config.log_reclaim_root,
         )
         .await?;
         fresh.apply(&mut replay, &binds.plans);
-        let log_label = (!binds.plans.is_empty()).then(|| fresh.label());
+        let log_label = fresh.has_sources().then(|| fresh.label());
         // 创建请求马上发出。之后拿不到确切结果——包括这个 future 等应答时被取消——登记都会
         // 转去"结果不明"保留着：替代容器可能已经建出来、正绑着这些目录
         fresh.request_sent();

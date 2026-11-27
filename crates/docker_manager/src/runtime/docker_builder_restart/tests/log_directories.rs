@@ -24,6 +24,8 @@ struct LoggedRestart {
     /// 原容器的日志目录（宿主机路径）
     old_directory: String,
     old_name: String,
+    /// 挂载表里另外的条目（容器内路径 → 宿主机路径）
+    extra_mounts: Vec<(PathBuf, PathBuf)>,
 }
 
 impl LoggedRestart {
@@ -78,15 +80,17 @@ impl LoggedRestart {
             archive,
             old_directory,
             old_name,
+            extra_mounts: Vec::new(),
         }
     }
 
     fn runtime(&self, address: std::net::SocketAddr) -> DockerRuntime {
-        let resolver = crate::HostPathResolver::from_mount_table(vec![(
+        let mut mounts = vec![(
             self.root.path().join("visible/logs"),
             self.root.path().join("host"),
-        )])
-        .unwrap();
+        )];
+        mounts.extend(self.extra_mounts.iter().cloned());
+        let resolver = crate::HostPathResolver::from_mount_table(mounts).unwrap();
         // 配置里的日志根是 RCoder 进程里的路径，经上面这张表落在 `host/container`
         let config = crate::DockerManagerConfig {
             log_reclaim_root: self.visible_root(),

@@ -89,6 +89,63 @@ async fn a_log_mount_that_cannot_be_classified_gets_a_new_directory() {
     );
 }
 
+/// 判不出来时换新目录只是尽量：那个位置被别的挂载挡住、RCoder 看不到，新目录建不出来，就照
+/// 原样重放并登记旧目录。不让恢复失败。
+#[tokio::test]
+async fn an_evidenced_log_mount_that_cannot_get_a_new_directory_is_replayed() {
+    let mut restart = LoggedRestart::new();
+    // 宿主机 `host/hidden` 在 RCoder 里被另一条挂载挡住：同一个容器内路径对应别的宿主机目录
+    restart.extra_mounts.push((
+        restart.root.path().join("visible/logs/hidden"),
+        restart.root.path().join("host/elsewhere"),
+    ));
+    let hidden = restart.root.path().join("host/hidden");
+    std::fs::create_dir_all(hidden.join(&restart.old_name)).unwrap();
+    let old_directory = hidden
+        .join(&restart.old_name)
+        .to_string_lossy()
+        .into_owned();
+    for volume in &mut restart.template.volumes {
+        if volume.name == LOG_TARGET {
+            volume.uid = old_directory.clone();
+        }
+    }
+    restart.archive.binds[0] = format!("{old_directory}:{LOG_TARGET}:rw,z");
+    let seen_at_create = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen_at_create);
+    let daemon = scripted_with_hook(
+        creation_script(step("POST", "/containers/create", 200, created())),
+        Arc::new(move |request: &str| {
+            if request.starts_with("POST") && request.contains("/containers/create") {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .extend(crate::log_directory::pending_bind_sources());
+            }
+        }),
+    )
+    .await;
+
+    let replacement = restart.restore(&daemon).await.unwrap_or_else(|error| {
+        panic!("a log mount that cannot get a new directory must not fail the restart: {error:?}")
+    });
+
+    // 绑的还是旧目录，没有换源记录
+    let binds = daemon.body(4)["HostConfig"]["Binds"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        binds.contains(&json!(format!("{old_directory}:{LOG_TARGET}:rw,z"))),
+        "{binds:?}"
+    );
+    assert!(daemon.body(4)["Labels"][RESTART_LOG_DIR].is_null());
+    assert_eq!(replacement.expected_volumes, restart.template.volumes);
+    // 旧目录的源登记到替代容器建出来
+    let seen = seen_at_create.lock().unwrap().clone();
+    assert!(seen.contains(&PathBuf::from(&old_directory)), "{seen:?}");
+}
+
 /// 日志目录建好之后、创建请求得到应答之前，一直登记为正在准备挂载。
 #[tokio::test]
 async fn a_fresh_log_directory_stays_claimed_while_the_create_request_is_in_flight() {

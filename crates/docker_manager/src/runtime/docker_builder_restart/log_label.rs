@@ -9,7 +9,9 @@
 //! - 归档里的一条 HostPath 挂载；
 //! - 不是持久数据（`/home/user` 下面的挂载永不换源）；
 //! - 旧目录的同级新目录：绝对路径、同一个上级、不是旧目录本身；
-//! - 现在判它在可回收日志根里，或者归档能核实它是日志挂载。
+//! - 不是"确定既不在可回收日志根里、又不是日志挂载"。判不出来不拦：这份记录是我们自己写在
+//!   带归档标记的替代容器上的，替代容器也已经绑着它记的目录；挂载表一时取不到就拒绝，续做
+//!   会一直卡在恢复里。
 //!
 //! 没有这份记录的替代容器是旧版本建的，那时归档原样重放，它绑的就是归档里的目录。
 
@@ -157,11 +159,14 @@ async fn resumed_sources(
             )));
         }
         ensure_fresh_sibling(volume, source)?;
-        let under_root = admission.classify(name, &volume.uid).await == LogDomainVerdict::Inside;
-        if !under_root && !is_log_mount(name, archive) {
-            return Err(conflict(format!(
-                "Restart target's log directory label names mount {name}, which is not a log mount"
-            )));
+        match admission.classify(name, &volume.uid).await {
+            LogDomainVerdict::Inside | LogDomainVerdict::Unknown(_) => {}
+            LogDomainVerdict::Outside if is_log_mount(name, archive) => {}
+            LogDomainVerdict::Outside => {
+                return Err(conflict(format!(
+                    "Restart target's log directory label names mount {name}, which is not a log mount"
+                )));
+            }
         }
     }
     Ok(sources)

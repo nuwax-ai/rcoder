@@ -217,3 +217,136 @@ async fn a_resumed_label_that_names_an_auxiliary_mount_is_refused() {
     );
     daemon.assert_followed(2);
 }
+
+/// 旧版本保留的停止容器还在、工作区落在日志根里：工作区的源在删旧容器**之前**就登记，一直到
+/// 替代容器建出来。旧容器一删它就不在任何容器的挂载里了，到建替代容器之间还要确认镜像。
+#[tokio::test]
+#[allow(unsafe_code)] // 测试内设置进程环境变量；nextest 每个用例独立进程
+async fn data_under_the_log_root_is_registered_before_the_old_container_is_removed() {
+    let receipts = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("RCODER_OPERATION_RECEIPT_ROOT", receipts.path());
+    }
+    let mut restart = LoggedRestart::new();
+    restart.move_workspace_under_log_root();
+    // 真实归档里的卷按挂载点排好，和从容器读回的见证同序
+    restart
+        .template
+        .volumes
+        .sort_by(|a, b| (&a.name, &a.uid).cmp(&(&b.name, &b.uid)));
+    let workspace = restart.workspace.path().to_string_lossy().into_owned();
+    crate::runtime::docker_compute_receipt::save_stop(&restart.template.source)
+        .await
+        .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let daemon = scripted_with_hook(
+        vec![
+            step(
+                "GET",
+                ORIGINAL_UID,
+                200,
+                retained_original(&restart.template),
+            ),
+            step("GET", "/images/", 200, image_inspect()),
+            step("DELETE", ORIGINAL_UID, 204, json!({})),
+            step("GET", ORIGINAL_UID, 404, no_such_container()),
+            step("GET", "rcoder-app-builder-", 404, no_such_container()),
+            step("GET", "/images/", 200, image_inspect()),
+            step("GET", "/info", 200, daemon_info()),
+            step("POST", "/containers/create", 200, created()),
+        ],
+        Arc::new(move |request: &str| {
+            let deleting = request.starts_with("DELETE");
+            let preparing_image = request.starts_with("GET") && request.contains("/images/");
+            let creating = request.starts_with("POST") && request.contains("/containers/create");
+            if deleting || preparing_image || creating {
+                recorder.lock().unwrap().push((
+                    request.split_whitespace().next().unwrap_or("").to_owned(),
+                    crate::log_directory::pending_bind_sources(),
+                ));
+            }
+        }),
+    )
+    .await;
+
+    restart.restore(&daemon).await.unwrap();
+
+    daemon.assert_followed(8);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    for (request, sources) in seen.iter() {
+        assert!(
+            sources.contains(&PathBuf::from(&workspace)),
+            "{request}: the data directory is nobody's mount once the old container is gone: {sources:?}"
+        );
+    }
+}
+
+/// 取不到挂载表时读换源记录：判不出来不拦。记录里有一条名字不带 `container-logs` 的挂载
+/// （建替代容器的时候判它在日志根里，所以换了），续做照样认。
+#[cfg(not(feature = "deploy-host"))]
+#[tokio::test]
+async fn without_a_mount_table_a_recorded_swap_is_accepted_for_a_mount_without_a_log_name() {
+    let mut restart = LoggedRestart::new();
+    let old_cache = restart.host_root().join("cache-old");
+    std::fs::create_dir_all(&old_cache).unwrap();
+    let old_cache = old_cache.to_string_lossy().into_owned();
+    restart
+        .template
+        .volumes
+        .push(host_path_volume("/app/cache", &old_cache));
+    restart
+        .archive
+        .binds
+        .push(format!("{old_cache}:/app/cache"));
+    let fresh_log = new_log_directory(&restart, "rcoder-app-builder-265-20251026090000");
+    let fresh_cache = new_log_directory(&restart, "cache-new");
+    let daemon = scripted(vec![
+        // 自检从 ping 开始；测试进程不在容器里，拿不到自己的容器 ID，等于取不到挂载表
+        step("GET", "_ping", 200, json!("OK")),
+        step("GET", ORIGINAL_UID, 404, no_such_container()),
+        step(
+            "GET",
+            "rcoder-app-builder-",
+            200,
+            retained_replacement(
+                &restart.template,
+                json!({
+                    RESTORE: restart.template.archive.uid.clone(),
+                    RESTART_LOG_DIR: json!({
+                        LOG_TARGET: fresh_log,
+                        "/app/cache": fresh_cache,
+                    })
+                    .to_string(),
+                }),
+            ),
+        ),
+    ])
+    .await;
+    let runtime = DockerRuntime::new(docker_manager_configured(
+        daemon.address,
+        crate::DockerManagerConfig {
+            log_reclaim_root: restart.visible_root(),
+            ..Default::default()
+        },
+    ));
+
+    let replacement = runtime
+        .replace_builder_container(
+            &restart.template,
+            &restart.archive,
+            original(&restart.template),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("an unavailable mount table must not block the resume: {error:?}")
+        });
+
+    daemon.assert_followed(3);
+    assert_eq!(replacement.id, REPLACEMENT_UID);
+    assert_eq!(
+        replacement.expected_volumes,
+        restart.expected_volumes(&[(LOG_TARGET, &fresh_log), ("/app/cache", &fresh_cache)])
+    );
+}

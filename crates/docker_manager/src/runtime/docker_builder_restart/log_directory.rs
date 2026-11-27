@@ -19,8 +19,9 @@
 //!
 //! 判不出一条 bind 在不在日志根里，不让恢复失败：
 //!
-//! - 归档能核实它是日志挂载的（挂载点就是 `CONTAINER_LOGS_DIR`，或者带 `container-logs`），照样
-//!   换新目录。日志目录是一次性的，不该复用；旧的那个可能早已过期，清理器正在回收。
+//! - 归档能核实它是日志挂载的（挂载点就是 `CONTAINER_LOGS_DIR`，或者带 `container-logs`），尽量
+//!   换新目录。日志目录是一次性的，不该复用；旧的那个可能早已过期，清理器正在回收。这只是
+//!   稳妥起见：新目录建不出来（比如那个位置 RCoder 看不到）就照原样重放，不让恢复失败。
 //! - 其余的照归档原样重放，源登记到替代容器建出来。清理器对判不出来的源同样判不出来，而它
 //!   确认不了就不删。
 //!
@@ -57,6 +58,9 @@ impl DockerRuntime {
 pub(super) struct LogMountPlan<'a> {
     /// 这条挂载在归档模板里的见证：`name` 是挂载点，`uid` 是不能再绑一次的旧目录
     volume: &'a AppResourceIdentity,
+    /// 源确定落在日志根里：必须换，新目录建不出来就恢复失败。否则只是尽量换（源判不出来、
+    /// 靠归档核实它是日志挂载），换不了就照原样重放
+    required: bool,
     /// 这条挂载在 `Archive::binds` 里的下标
     bind: usize,
     /// 旧目录的上级目录（宿主机路径）
@@ -114,14 +118,10 @@ pub(super) async fn plan<'a>(
             }
             continue;
         }
-        let swap = match verdict {
-            LogDomainVerdict::Inside => true,
-            LogDomainVerdict::Outside => false,
-            // 判不出来、但归档能核实它是日志挂载的也换：旧目录是一次性的，可能早已过期
-            LogDomainVerdict::Unknown(_) => {
-                admission.space().is_some() && is_log_mount(&volume.name, archive)
-            }
-        };
+        let required = verdict == LogDomainVerdict::Inside;
+        let swap = required
+            // 判不出来、但归档能核实它是日志挂载的也尽量换：旧目录是一次性的，可能早已过期
+            || (admission.space().is_some() && is_log_mount(&volume.name, archive));
         if !swap {
             continue;
         }
@@ -131,25 +131,26 @@ pub(super) async fn plan<'a>(
         let bind = archive
             .binds
             .iter()
-            .position(|bind| bind == &archived || bind.starts_with(&format!("{archived}:")))
-            .ok_or_else(|| {
-                conflict(format!(
-                    "Restart log bind does not match the archived mount witness for {}",
-                    volume.name
-                ))
-            })?;
+            .position(|bind| bind == &archived || bind.starts_with(&format!("{archived}:")));
         let previous = Path::new(&volume.uid);
-        let (Some(parent), Some(previous_name)) = (
+        let directory = (
             previous.parent(),
             previous.file_name().and_then(|name| name.to_str()),
-        ) else {
-            return Err(conflict(format!(
-                "Restart log bind source is not a directory path: {}",
-                volume.uid
-            )));
+        );
+        let (Some(bind), Some(parent), Some(previous_name)) = (bind, directory.0, directory.1)
+        else {
+            if required {
+                return Err(conflict(format!(
+                    "Restart log bind does not match the archived mount witness for {}",
+                    volume.name
+                )));
+            }
+            // 只是尽量换的那条改不了：照原样重放，下面的循环会登记它的源
+            continue;
         };
         binds.plans.push(LogMountPlan {
             volume,
+            required,
             bind,
             parent: parent.to_path_buf(),
             preferred: crate::log_directory::replacement_log_directory_name(
@@ -203,21 +204,20 @@ impl FreshLogDirectories {
     /// 逐条独占新建。任何一条建不出来都报错，并把已经建好的删掉——替代容器还没开始建，这些
     /// 目录没人用。不退回去绑定归档里的旧目录。
     ///
-    /// 原样重放的那些 bind 的源（`binds.replayed`）一并登记。`reclaim_root` 是可回收的日志根
-    /// （RCoder 进程里的路径）：新目录建在它下面更深处时，要刷新上一级候选的修改时间。
+    /// `replayed` 是调用方为原样重放的 bind（`binds.replayed`）已经登记好的守卫，在这里接
+    /// 手：它要一直拿到替代容器建出来。`reclaim_root` 是可回收的日志根（RCoder 进程里的
+    /// 路径）：新目录建在它下面更深处时，要刷新上一级候选的修改时间。
     pub(super) async fn create(
         space: Option<&HostPathSpace<'_>>,
         binds: &LogBinds<'_>,
+        replayed: PendingBinds,
         reclaim_root: &Path,
     ) -> Result<Self> {
         let mut fresh = Self {
             sources: HashMap::new(),
             created: Vec::new(),
-            pending: PendingBinds::default(),
+            pending: replayed,
         };
-        for source in &binds.replayed {
-            fresh.pending.claim(source);
-        }
         for plan in &binds.plans {
             // 有换源计划就有路径空间：计划是靠它判出来的
             let Some(space) = space else {
@@ -228,6 +228,16 @@ impl FreshLogDirectories {
             let preferred = plan.parent.join(&plan.preferred);
             let created = match create_host_directory(space, &preferred).await {
                 Ok(created) => created,
+                // 只是尽量换的那条换不了：照原样重放，旧目录的源登记到替代容器建出来
+                Err(error) if !plan.required => {
+                    tracing::warn!(
+                        mount = %plan.volume.name,
+                        %error,
+                        "Cannot create a new directory for a log mount whose source cannot be classified; its archived directory is used as it is and registered until the replacement is created"
+                    );
+                    fresh.pending.claim(Path::new(&plan.volume.uid));
+                    continue;
+                }
                 Err(error) => {
                     fresh.discard_created().await;
                     return Err(conflict(format!(
@@ -282,6 +292,11 @@ impl FreshLogDirectories {
         volumes: &[AppResourceIdentity],
     ) -> Vec<AppResourceIdentity> {
         with_log_sources(volumes, &self.sources)
+    }
+
+    /// 有没有换过源的挂载：一条都没换成时不写 label
+    pub(super) fn has_sources(&self) -> bool {
+        !self.sources.is_empty()
     }
 
     /// 记到替代容器 label 上的值：挂载点 → 新目录
