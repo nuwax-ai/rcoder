@@ -16,6 +16,9 @@ mod docker_builder_control;
 mod docker_builder_restart;
 mod docker_compute_receipt;
 
+/// prod 应用换镜像重建经假 daemon
+#[cfg(test)]
+mod docker_app_recreate_tests;
 /// 测试用的假 Docker daemon
 #[cfg(test)]
 pub(crate) mod fake_daemon;

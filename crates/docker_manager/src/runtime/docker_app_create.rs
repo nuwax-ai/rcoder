@@ -33,7 +33,25 @@ impl DockerRuntime {
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         let prepared = self.prepare_app_container(params).await?;
-        self.create_prepared_app_container(prepared).await
+        let mut mounts = super::docker_app_mounts::app_mount_guard(self, &prepared.config).await?;
+        mounts
+            .until_settled(self.create_prepared_app_container(prepared))
+            .await
+    }
+
+    /// 先删旧容器、再建新容器（更新、换镜像重建）。删之前先拿挂载守卫：数据目录落在日志根里
+    /// 就拒绝，旧容器原样留着；守卫登记着这些 bind 源，直到新容器建出来——中间这一段它们
+    /// 不在任何容器的挂载里。
+    async fn replace_app_container(
+        &self,
+        prepared: PreparedAppContainer,
+        snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        let mut mounts = super::docker_app_mounts::app_mount_guard(self, &prepared.config).await?;
+        self.delete_app_snapshot(snapshot).await?;
+        mounts
+            .until_settled(self.create_prepared_app_container(prepared))
+            .await
     }
 
     async fn prepare_app_container(
@@ -418,8 +436,7 @@ impl DockerRuntime {
                 message: error.to_string(),
             })
         })?;
-        self.delete_app_snapshot(&snapshot).await?;
-        self.create_prepared_app_container(prepared).await
+        self.replace_app_container(prepared, &snapshot).await
     }
 
     pub(crate) async fn scale_deployment_impl(
@@ -637,8 +654,7 @@ impl DockerRuntime {
             operation_id: target.context.operation_id.clone(),
             resources: vec![target.resource.clone()],
         };
-        self.delete_app_snapshot(&snapshot).await?;
-        self.create_prepared_app_container(prepared).await?;
+        self.replace_app_container(prepared, &snapshot).await?;
         Ok(())
     }
 

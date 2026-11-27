@@ -9,16 +9,27 @@
 //! 锚点反解失败 fail fast：静默降级等于 PG/制品落容器 overlay，容器删除即丢
 //! （与 builder 卷同款 fail-fast 语义）。
 //!
+//! 四个目录都是数据目录，不能落在可回收的日志根里（日志根配得和 prod 目录树重叠时）：组装
+//! 时先判定，重叠就拒绝创建应用，目录也不建；判不出来的只告警。
+//!
+//! # 应用容器的挂载守卫
+//!
+//! 首次创建、更新、换镜像重建都经 [`app_mount_guard`]：数据目录落在日志根里就拒绝；这些 bind
+//! 源登记到新容器建出来。更新和重建是先删旧容器再建，中间这一段数据目录不在任何容器的挂载
+//! 里，日志清理器会把它们当成没人用——守卫要在删旧容器之前拿到，登记才接得上。重建的挂载
+//! 是从旧容器的 `HostConfig` 原样抄的，不过组装这一步，所以守卫看的是"实际要绑什么"。
+//!
 //! 四个目录都是数据目录，不能落在可回收的日志根里（日志根配得和 prod 目录树重叠时）：
 //! 组装时先判定，重叠或判不出来都拒绝创建应用，目录也不建。
 
 use std::path::{Path, PathBuf};
 
-use bollard::models::{Mount, MountType};
+use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
 use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
 
 use super::docker_runtime::DockerRuntime;
-use super::docker_runtime::host_path_space::{LogDomainAdmission, LogDomainVerdict};
+use super::docker_runtime::host_path_space::{LogDomainAdmission, LogDomainVerdict, bind_source};
+use crate::log_directory::PendingBinds;
 
 /// 组装 prod 四目录 bind 挂载（含宿主目录预创建）。
 ///
@@ -50,6 +61,58 @@ pub(super) async fn build_prod_flat_mounts(
     #[cfg(not(feature = "deploy-host"))]
     let precreate_root: &Path = Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
     prod_flat_mounts(runtime, &host_root, precreate_root, app_id).await
+}
+
+/// 应用容器要绑定的全部 bind：`HostConfig.Mounts` 里类型为 bind 的，加上旧式的 `Binds`。
+/// 每项是（宿主机源，容器内挂载点）
+pub(super) fn bind_mounts(host_config: Option<&HostConfig>) -> Vec<(String, String)> {
+    let mut mounts = Vec::new();
+    let Some(host_config) = host_config else {
+        return mounts;
+    };
+    for mount in host_config.mounts.iter().flatten() {
+        if mount.typ != Some(MountType::BIND) {
+            continue;
+        }
+        if let (Some(source), Some(target)) = (mount.source.as_deref(), mount.target.as_deref())
+            && !source.is_empty()
+        {
+            mounts.push((source.to_owned(), target.to_owned()));
+        }
+    }
+    for bind in host_config.binds.iter().flatten() {
+        // 和 Docker 的切分一致：以 `/` 开头的才是宿主机路径，取到第一个冒号为止
+        let Some(source) = bind_source(bind) else {
+            continue;
+        };
+        mounts.push((
+            source.to_owned(),
+            bind.split(':').nth(1).unwrap_or_default().to_owned(),
+        ));
+    }
+    mounts
+}
+
+/// 应用容器的挂载守卫：数据目录落在可回收的日志根里就拒绝；否则登记这些 bind 源，调用方在
+/// 新容器建出来之前一直拿着（[`PendingBinds::until_settled`]）。
+///
+/// 见模块说明。判不出来的不拒绝，照样登记。
+pub(super) async fn app_mount_guard(
+    runtime: &DockerRuntime,
+    config: &ContainerCreateBody,
+) -> ContainerRuntimeResult<PendingBinds> {
+    let mounts = bind_mounts(config.host_config.as_ref());
+    let sources: Vec<PathBuf> = mounts
+        .iter()
+        .map(|(source, _)| PathBuf::from(source))
+        .collect();
+    let targets: Vec<String> = mounts.iter().map(|(_, target)| target.clone()).collect();
+    refuse_prod_mounts_in_log_domain(runtime, &sources, &targets).await?;
+    let mut pending = PendingBinds::default();
+    for source in sources {
+        pending.claim(&source);
+    }
+    Ok(pending)
 }
 
 /// `host_root` 是 prod 目录树在宿主机上的根；`precreate_root` 是这棵树在本进程里的路径
@@ -131,141 +194,4 @@ pub(crate) fn prod_flat_container_paths(app_id: &str) -> [String; 4] {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    #[test]
-    fn prod_flat_mounts_pair_with_layout_source() {
-        let subs = shared_types::paths::userapp_prod_subpaths("a1");
-        let targets = prod_flat_container_paths("a1");
-        // 段序配对：workspace/data/logs/agent-store → /home/user 下四挂载点
-        assert_eq!(
-            targets,
-            [
-                "/home/user/a1".to_string(),
-                "/home/user/data".to_string(),
-                "/home/user/logs".to_string(),
-                "/home/user/.agent-store".to_string(),
-            ]
-        );
-        assert_eq!(subs[0], "prod/userapp/a1");
-        assert!(subs[1].ends_with("data/a1") && targets[1].ends_with("/data"));
-        assert!(subs[2].ends_with("logs/a1") && targets[2].ends_with("/logs"));
-        assert!(subs[3].ends_with("agent-store/a1") && targets[3].ends_with("/.agent-store"));
-        // data 段兼容视图与布局事实源一致（清理链存量调用方依赖）
-        assert_eq!(
-            subs[1],
-            shared_types::paths::userapp_prod_data_subpath("a1")
-        );
-    }
-
-    /// 一个运行时：日志根是 `reclaim_root`，挂载表只有一条（`covered` 挂在它自己的路径上）
-    fn runtime(reclaim_root: PathBuf, covered: &Path) -> DockerRuntime {
-        let (actor, containers) = crate::ContainerStateActor::new();
-        tokio::spawn(actor.run());
-        let manager = Arc::new(crate::DockerManager {
-            docker: bollard::Docker::connect_with_http(
-                "http://127.0.0.1:9",
-                1,
-                bollard::API_DEFAULT_VERSION,
-            )
-            .unwrap(),
-            config: crate::DockerManagerConfig {
-                log_reclaim_root: reclaim_root,
-                ..Default::default()
-            },
-            containers,
-            main_network_name: Arc::new(tokio::sync::RwLock::new("test".into())),
-            api_cache: Arc::new(crate::api_cache::DockerApiCache::new(600, 600, 100)),
-        });
-        let resolver = crate::HostPathResolver::from_mount_table(vec![(
-            covered.to_path_buf(),
-            covered.to_path_buf(),
-        )])
-        .unwrap();
-        DockerRuntime::with_log_path_resolver(manager, resolver)
-    }
-
-    /// 日志根在另一棵目录树上（默认部署的样子）：prod 挂载不在它里面，照常组装并预创建。
-    #[tokio::test]
-    async fn prod_mounts_outside_the_log_root_are_allowed() {
-        let covered = tempfile::tempdir().unwrap();
-
-        let mounts = prod_flat_mounts(
-            &runtime("/srv/logs/container".into(), covered.path()),
-            covered.path(),
-            covered.path(),
-            "a1",
-        )
-        .await
-        .unwrap();
-
-        let subs = shared_types::paths::userapp_prod_subpaths("a1");
-        assert_eq!(mounts.len(), 4);
-        let sources: Vec<String> = subs
-            .iter()
-            .map(|rel| covered.path().join(rel).to_string_lossy().into_owned())
-            .collect();
-        let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
-        assert_eq!(
-            mounts
-                .iter()
-                .filter_map(|mount| mount.source.as_deref())
-                .collect::<Vec<_>>(),
-            sources,
-            "every prod directory is bind-mounted from the prod tree"
-        );
-        for source in &sources {
-            assert!(
-                std::fs::metadata(source).is_ok_and(|metadata| metadata.is_dir()),
-                "the bind source {source} is created before the container"
-            );
-        }
-    }
-
-    /// 日志根配到了 prod 目录树上面：组装时拒绝，一个目录都不建。
-    #[tokio::test]
-    async fn prod_mounts_under_the_log_root_are_refused() {
-        let covered = tempfile::tempdir().unwrap();
-
-        let error = prod_flat_mounts(
-            &runtime(covered.path().to_path_buf(), covered.path()),
-            covered.path(),
-            covered.path(),
-            "a1",
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            matches!(&error, ContainerRuntimeError::ConfigurationError(message)
-                if message.contains("data directory /home/user/a1 binds")
-                    && message.contains("which lies under the reclaimable log root")),
-            "{error}"
-        );
-        assert!(
-            !covered.path().join("prod").exists(),
-            "a refused layout must not leave directories behind"
-        );
-    }
-    /// 判不出数据目录在不在日志根里（这里日志根是相对路径，定位不了）：不拒绝创建应用。
-    /// 拒绝的话，一个环境问题会让应用发布不出去
-    #[tokio::test]
-    async fn prod_mounts_that_cannot_be_classified_are_allowed() {
-        let covered = tempfile::tempdir().unwrap();
-
-        let mounts = prod_flat_mounts(
-            &runtime("logs/container".into(), covered.path()),
-            covered.path(),
-            covered.path(),
-            "a1",
-        )
-        .await
-        .unwrap_or_else(|error| {
-            panic!("an unlocatable log root must not block the application: {error}")
-        });
-
-        assert_eq!(mounts.len(), 4);
-    }
-}
+mod tests;
