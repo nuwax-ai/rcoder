@@ -15,7 +15,9 @@
 //!   文件名就是 `CONTAINER_LOG_NAME`——两个值一起对上同一条 bind。挂载点落在 `/home/user` 整棵
 //!   里的不是（持久数据）。
 //! - **路径**：源在可回收日志根下面（`host_path_space::LogDomain`，用的是清理器那个路径
-//!   空间），或者判不出来。
+//!   空间），或者判不出来。**确定在日志根外的不换**：换的理由只有一个——旧目录可能被清理器
+//!   回收，而清理器碰不到日志根外面的目录。换了反而每次重启多留一个没人回收的目录，容器里
+//!   还看不到上一次的日志。
 //!
 //! 两条都满足才换。角色是主判据：日志根的配置一旦盖住别的东西（自定义数据目录），只按路径挑
 //! 会把一份有数据的目录换成空的新目录，数据就丢了。名字像不像日志目录、挂载点怎么拼写都**不是
@@ -69,8 +71,8 @@ impl DockerRuntime {
 pub(super) struct LogMountPlan<'a> {
     /// 这条挂载在归档模板里的见证：`name` 是挂载点，`uid` 是不能再绑一次的旧目录
     volume: &'a AppResourceIdentity,
-    /// 源确定落在日志根里：必须换，新目录建不出来就恢复失败。否则只是尽量换（源判不出来、
-    /// 靠归档核实它是日志挂载），换不了就照原样重放
+    /// 源确定落在日志根里：必须换，新目录建不出来就恢复失败。否则只是尽量换（源判不出来），
+    /// 换不了就照原样重放
     required: bool,
     /// 这条挂载在 `Archive::binds` 里的下标
     bind: usize,
@@ -141,14 +143,20 @@ pub(super) async fn plan<'a>(
             }
             continue;
         }
-        let required = verdict == LogDomainVerdict::Inside;
-        // 是日志挂载就换，不看判定结果：日志目录是一次性的，不该复用，旧的那个可能早已过期，
-        // 清理器正在回收。源确定在日志根外时清理器碰不到它，旧目录原样留着，换的代价只是容器
-        // 里看不到上一次的日志
-        let swap = required || admission.space().is_some();
-        if !swap {
-            continue;
-        }
+        // 换源的理由只有一个：旧目录在日志根里，可能已经被清理器回收。确定在日志根外的照原样
+        // 重放——清理器碰不到它；换了只会每次重启多留一个没人回收的目录，容器里还看不到上一次
+        // 的日志
+        let required = match verdict {
+            LogDomainVerdict::Inside => true,
+            LogDomainVerdict::Outside => continue,
+            // 判不出来：尽量换。连路径空间都定不了的，新目录也建不出来，不换
+            LogDomainVerdict::Unknown(_) => {
+                if admission.space().is_none() {
+                    continue;
+                }
+                false
+            }
+        };
         // 按见证（源加挂载点）整段前缀去找那条 bind，不按冒号切分：源路径里有 Windows 盘符时
         // 切分有歧义。
         let archived = format!("{}:{}", volume.uid, volume.name);

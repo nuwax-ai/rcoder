@@ -3,6 +3,73 @@
 
 use super::*;
 
+/// 日志挂载的源确定在日志根之外：不换。换的理由只有一个——旧目录可能被清理器回收；清理器碰不到
+/// 日志根外面的目录，照原样绑回去是安全的。换了反而每次重启多留一个没人回收的目录，容器里还
+/// 看不到上一次的日志。
+///
+/// 源放在 RCoder 看得到的卷上、只是不在清理目录之下（`cleanup_config.log_cleanup.log_dir` 没盖住
+/// 日志挂载源的形态）：同级新目录是建得出来的，所以"不换"必须是代码的决定，不是建不出来的副作用。
+///
+/// 回归：第三轮加"必须换"标志的时候丢了这一条，日志根外的日志挂载跟着换了一个多版本。
+#[tokio::test]
+async fn a_log_mount_outside_the_log_root_keeps_its_directory() {
+    let mut restart = LoggedRestart::new();
+    // `host/container` 是日志根；`host/other` 和它在同一块卷上，却不在日志根之下
+    let outside = restart.root.path().join("host/other");
+    std::fs::create_dir_all(outside.join(&restart.old_name)).unwrap();
+    std::fs::write(
+        outside.join(&restart.old_name).join("last-time.log"),
+        b"kept",
+    )
+    .unwrap();
+    let old_directory = outside
+        .join(&restart.old_name)
+        .to_string_lossy()
+        .into_owned();
+    for volume in &mut restart.template.volumes {
+        if volume.name == LOG_TARGET {
+            volume.uid = old_directory.clone();
+        }
+    }
+    restart.archive.binds[0] = format!("{old_directory}:{LOG_TARGET}:rw,z");
+    restart.re_record(LOG_TARGET, &old_directory);
+    let daemon = scripted(creation_script(step(
+        "POST",
+        "/containers/create",
+        200,
+        created(),
+    )))
+    .await;
+
+    let replacement = restart.restore(&daemon).await.unwrap();
+
+    daemon.assert_followed(5);
+    let body = daemon.body(4);
+    let binds = body["HostConfig"]["Binds"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        binds.contains(&json!(format!("{old_directory}:{LOG_TARGET}:rw,z"))),
+        "the log mount keeps its directory: {binds:?}"
+    );
+    // 没有新建目录，也没有换源记录：上一次的日志容器里照旧看得到
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        1,
+        "no new directory is left behind"
+    );
+    assert!(body["Labels"][RESTART_LOG_DIR].is_null());
+    // 日志挂载记录原样带过去：下次重启它，照样认得出
+    assert_eq!(
+        body["Labels"][LOG_MOUNTS_LABEL]
+            .as_str()
+            .and_then(|label| serde_json::from_str::<Value>(label).ok()),
+        Some(json!([{ "target": LOG_TARGET, "source": old_directory }]))
+    );
+    assert_eq!(replacement.expected_volumes, restart.template.volumes);
+}
+
 /// 日志挂载在日志根下更深处：替代容器的新目录建在同一层，日志根下那第一级目录的修改时间
 /// 不会自己变，清理器会一直把它当过期候选。恢复时把它刷新到现在，清理器删前的复查才看得出
 /// "刚被用过"。

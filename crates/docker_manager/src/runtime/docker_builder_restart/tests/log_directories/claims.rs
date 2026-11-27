@@ -91,19 +91,19 @@ async fn a_log_mount_that_cannot_be_classified_gets_a_new_directory() {
     );
 }
 
-/// 记录里的日志挂载、源却在日志根之外：换新目录只是尽量。那个位置被别的挂载挡住、RCoder 看
-/// 不到，新目录建不出来，就照原样重放并登记旧目录。不让恢复失败。
+/// 判不出来时换新目录只是尽量：判不出来的原因本身也让新目录建不出来，就照原样重放并登记旧
+/// 目录。不让恢复失败。
 #[tokio::test]
-async fn an_evidenced_log_mount_that_cannot_get_a_new_directory_is_replayed() {
+async fn an_unclassified_log_mount_that_cannot_get_a_new_directory_is_replayed() {
     let mut restart = LoggedRestart::new();
-    // 宿主机 `host/hidden` 在 RCoder 里被另一条挂载挡住：同一个容器内路径对应别的宿主机目录
-    restart.extra_mounts.push((
-        restart.root.path().join("visible/logs/hidden"),
-        restart.root.path().join("host/elsewhere"),
-    ));
-    let hidden = restart.root.path().join("host/hidden");
-    std::fs::create_dir_all(hidden.join(&restart.old_name)).unwrap();
-    let old_directory = hidden
+    // RCoder 进程里的 `visible/logs/loop` 指向它自己：走不出去，判不出它通向哪里；在里面建目录
+    // 同样建不出来
+    std::fs::create_dir_all(restart.root.path().join("visible/logs")).unwrap();
+    std::os::unix::fs::symlink("loop", restart.root.path().join("visible/logs/loop")).unwrap();
+    let old_directory = restart
+        .root
+        .path()
+        .join("host/loop")
         .join(&restart.old_name)
         .to_string_lossy()
         .into_owned();
@@ -541,5 +541,75 @@ async fn a_cancelled_restore_keeps_the_directory_claimed() {
         crate::log_directory::pending_bind_sources()
             .contains(&PathBuf::from(new_log_directory(&restart, &fresh[0]))),
         "a cancelled request was sent: its outcome is unknown, so the claim must stay"
+    );
+}
+
+/// 取不到路径空间（拿不到 RCoder 自己的挂载表）：判不出来，新目录也建不出来。日志挂载照原样
+/// 重放，源登记到替代容器建出来，恢复不能失败。
+#[cfg(not(feature = "deploy-host"))]
+#[tokio::test]
+async fn without_a_path_space_a_log_mount_is_replayed_and_registered() {
+    let restart = LoggedRestart::new();
+    let seen_at_create = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen_at_create);
+    let mut script = vec![step("GET", "_ping", 200, json!("OK"))];
+    script.extend(creation_script(step(
+        "POST",
+        "/containers/create",
+        200,
+        created(),
+    )));
+    let daemon = scripted_with_hook(
+        script,
+        Arc::new(move |request: &str| {
+            if request.starts_with("POST") && request.contains("/containers/create") {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .extend(crate::log_directory::pending_bind_sources());
+            }
+        }),
+    )
+    .await;
+    // 自检从 ping 开始；测试进程不在容器里，拿不到自己的容器 ID，等于取不到挂载表
+    let runtime = DockerRuntime::new(docker_manager_configured(
+        daemon.address,
+        crate::DockerManagerConfig {
+            log_reclaim_root: restart.visible_root(),
+            ..Default::default()
+        },
+    ));
+
+    let replacement = runtime
+        .replace_builder_container(
+            &restart.template,
+            &restart.archive,
+            original(&restart.template),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("an unavailable mount table must not fail the restart: {error:?}")
+        });
+
+    daemon.assert_followed(6);
+    let binds = daemon.body(5)["HostConfig"]["Binds"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        binds.contains(&json!(format!(
+            "{}:{LOG_TARGET}:rw,z",
+            restart.old_directory
+        ))),
+        "the log mount is replayed as archived: {binds:?}"
+    );
+    assert!(daemon.body(5)["Labels"][RESTART_LOG_DIR].is_null());
+    assert_eq!(replacement.expected_volumes, restart.template.volumes);
+    assert!(
+        seen_at_create
+            .lock()
+            .unwrap()
+            .contains(&PathBuf::from(&restart.old_directory)),
+        "the archived directory is registered until the replacement exists"
     );
 }
