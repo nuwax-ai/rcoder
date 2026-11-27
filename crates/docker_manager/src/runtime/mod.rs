@@ -15,6 +15,11 @@ pub(crate) mod docker_app_runtime;
 mod docker_builder_control;
 mod docker_builder_restart;
 mod docker_compute_receipt;
+
+/// 测试用的假 Docker daemon
+#[cfg(test)]
+pub(crate) mod fake_daemon;
+
 mod docker_readiness;
 pub mod docker_runtime;
 pub(crate) mod docker_workspace;
