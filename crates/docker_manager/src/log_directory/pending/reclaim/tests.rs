@@ -1,145 +1,102 @@
-//! 删除和登记的目录级互斥：清理器先标记再核对，创建方先登记再等。
+//! 登记表：在途登记、代次、删除标记。
 //!
-//! 核对（"有没有创建方登记着它"）不在这一层：它用的判定和清理器取清单时一致，在
-//! `runtime::docker_runtime::log_dir_mounts::begin_reclaim`。这里只有标记和等待。
+//! 两边的判定不在这里——清理器核对"有没有登记落在被删目录里"、创建方等"要绑的目录"删完——
+//! 都在 `runtime::docker_runtime::log_dir_mounts`。
 
 use super::*;
-use crate::log_directory::{PendingBinds, pending_bind_sources};
+use crate::log_directory::{PendingBinds, reclaim_marks, registry_view};
 
-/// 同一个目录只许一个清理器在删：第二个标记被拒绝，这一轮不再碰它
+const HOST: &str = "/srv/logs/container/runner-a";
+const PROCESS: &str = "/app/logs/container/runner-a";
+
+fn mark(host: &str) -> (ReclaimMark, RegistryView) {
+    mark_reclaim(Path::new(host), Path::new(PROCESS)).unwrap()
+}
+
+/// 同一个目录只许一次删除在删：第二个标记被拒绝
 #[test]
 fn a_directory_cannot_be_marked_twice() {
-    let first = mark_reclaim(Path::new("/srv/logs/container/runner-a")).unwrap();
+    let (first, _) = mark(HOST);
 
     assert!(
-        mark_reclaim(Path::new("/srv/logs/container/runner-a")).is_err(),
-        "another sweep is already deleting this directory"
+        mark_reclaim(Path::new(HOST), Path::new(PROCESS)).is_err(),
+        "another deletion is already deleting this directory"
     );
 
     drop(first);
-    assert!(mark_reclaim(Path::new("/srv/logs/container/runner-a")).is_ok());
+    assert!(mark_reclaim(Path::new(HOST), Path::new(PROCESS)).is_ok());
 }
 
-/// 标记按归一化之后的路径比：同一个目录的两种写法只算一个
+/// 标记按归一化之后的宿主机路径认；进程路径原样留着，创建方按目录身份判冲突时要用
 #[test]
-fn a_mark_is_keyed_by_its_normalized_path() {
-    let first = mark_reclaim(Path::new("/srv/logs/container/./runner-a")).unwrap();
+fn a_mark_keeps_both_names_of_the_directory() {
+    let (first, _) = mark("/srv/logs/container/./runner-a");
 
-    assert!(mark_reclaim(Path::new("/srv/logs/container/runner-a")).is_err());
+    assert!(mark_reclaim(Path::new(HOST), Path::new(PROCESS)).is_err());
+    assert_eq!(
+        reclaim_marks(),
+        [(PathBuf::from(HOST), PathBuf::from(PROCESS))]
+    );
 
     drop(first);
+    assert!(reclaim_marks().is_empty(), "dropping the mark releases it");
 }
 
-/// 登记一个正被删的目录：等这次删除结束。等到了目录已经不在，创建由 Docker 明确拒绝，不会绑到
-/// 一个正在被删的目录上
-#[tokio::test]
-async fn a_creator_waits_for_the_deletion_of_the_directory_it_reuses() {
-    let mark = mark_reclaim(Path::new("/srv/logs/container/runner-a")).unwrap();
-    let waiting = tokio::spawn(async {
-        let mut binds = PendingBinds::default();
-        binds
-            .claim(Path::new("/srv/logs/container/runner-a"))
-            .await
-    });
-    // 登记在等待之前就生效：清理器读得到它
-    tokio::task::yield_now().await;
-    assert_eq!(
-        pending_bind_sources(),
-        [PathBuf::from("/srv/logs/container/runner-a")],
-        "the claim is registered before the creator starts waiting"
-    );
-
-    // 删了 30 毫秒：登记方等到它结束
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    drop(mark);
-    let claimed = waiting.await.unwrap();
-    assert!(claimed.is_ok(), "the creator proceeds once the deletion is done");
-}
-
-/// 删除一直不结束：等不过 [`RECLAIM_WAIT_LIMIT`]，报错
-#[tokio::test]
-async fn a_creator_gives_up_waiting_for_a_deletion_that_never_ends() {
-    RECLAIM_WAIT_LIMIT_MILLIS.store(20, Ordering::SeqCst);
-    let _mark = mark_reclaim(Path::new("/srv/logs/container/runner-a")).unwrap();
-
-    let waited = PendingBinds::default()
-        .claim(Path::new("/srv/logs/container/runner-a"))
-        .await;
-
-    assert_eq!(
-        waited.err(),
-        Some(DirectoryBeingReclaimed(PathBuf::from(
-            "/srv/logs/container/runner-a"
-        )))
-    );
-    assert!(
-        DirectoryBeingReclaimed(PathBuf::from("/srv/logs/container/runner-a"))
-            .to_string()
-            .contains("still being reclaimed"),
-        "the message must be a full English sentence"
-    );
-}
-
-/// 标记的是别的目录：登记直接通过，不等待
-#[tokio::test]
-async fn a_claim_on_a_directory_nobody_is_deleting_returns_at_once() {
-    let mark = mark_reclaim(Path::new("/srv/logs/container/runner-b")).unwrap();
-
-    let claimed = PendingBinds::default()
-        .claim(Path::new("/srv/logs/container/runner-a"))
-        .await;
-
-    assert!(claimed.is_ok());
-    drop(mark);
-}
-
-/// 等的是**被删目录里面**的路径：标记覆盖整个子树
-#[tokio::test]
-async fn a_creator_waits_for_the_deletion_of_the_directory_holding_its_bind() {
-    RECLAIM_WAIT_LIMIT_MILLIS.store(200, Ordering::SeqCst);
-    let mark = mark_reclaim(Path::new("/srv/logs/container/runner-a")).unwrap();
-    let waiting = tokio::spawn(async {
-        let mut binds = PendingBinds::default();
-        binds
-            .claim(Path::new("/srv/logs/container/runner-a/log"))
-            .await
-    });
-    tokio::task::yield_now().await;
-    assert_eq!(
-        pending_bind_sources(),
-        [PathBuf::from("/srv/logs/container/runner-a/log")]
-    );
-
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    drop(mark);
-    assert!(
-        waiting.await.unwrap().is_ok(),
-        "a bind inside the deleted directory waits for the same deletion"
-    );
-}
-
-/// 标记解除之后再登记同一个路径，不再等待
-#[tokio::test]
-async fn a_claim_after_the_mark_is_gone_does_not_wait() {
-    let mark = mark_reclaim(Path::new("/srv/logs/container/runner-a")).unwrap();
-    drop(mark);
-
-    let claimed = PendingBinds::default()
-        .claim(Path::new("/srv/logs/container/runner-a"))
-        .await;
-
-    assert!(claimed.is_ok());
-}
-
-/// 新建的日志目录不会撞上删除：它的名字是新的，不在任何标记里
+/// 打标记和读表是同一次持锁：返回的视图就是打上标记那一刻的登记和代次
 #[test]
-fn a_fresh_directory_is_never_under_a_reclaim_mark() {
-    let mark = mark_reclaim(Path::new("/srv/logs/container/runner-a-20261029035324")).unwrap();
+fn marking_returns_the_registry_as_of_that_moment() {
+    let mut guard = PendingBinds::default();
+    guard.claim_blocking(Path::new(HOST));
+    let before = registry_view().generation;
 
-    let fresh = Path::new("/srv/logs/container/runner-a-20261127060000");
-    assert!(
-        !being_reclaimed(&lock(), fresh),
-        "a fresh directory has its own name and is never inside a marked one"
+    let (_mark, view) = mark(HOST);
+
+    assert_eq!(view.sources, [PathBuf::from(HOST)]);
+    assert_eq!(view.generation, before, "marking itself does not move it");
+    drop(guard);
+}
+
+/// 代次：登记加上、最后一个守卫注销，各加一。同一条路径还有别的守卫时，先退出的不动代次——
+/// 登记还在，清理器读得到
+#[test]
+fn every_registration_and_every_release_advances_the_generation() {
+    let start = registry_view().generation;
+    let mut first = PendingBinds::default();
+    first.claim_blocking(Path::new(HOST));
+    assert_eq!(registry_view().generation, start + 1);
+
+    let mut second = PendingBinds::default();
+    second.claim_blocking(Path::new(HOST));
+    assert_eq!(registry_view().generation, start + 2);
+
+    drop(first);
+    assert_eq!(
+        registry_view().generation,
+        start + 2,
+        "one of two guards leaving keeps the registration"
     );
-    drop(mark);
+    assert_eq!(registry_view().sources, [PathBuf::from(HOST)]);
+
+    drop(second);
+    assert_eq!(registry_view().generation, start + 3);
+    assert!(registry_view().sources.is_empty());
+}
+
+/// 请求发出后结果不明的登记不占在途表：它转去带过期时间的那张表，代次照常往前走
+#[tokio::test]
+async fn a_registration_with_an_unknown_outcome_leaves_the_in_flight_table() {
+    let start = registry_view().generation;
+    let mut binds = PendingBinds::default();
+    binds.claim_blocking(Path::new(HOST));
+    binds.request_sent();
+
+    drop(binds);
+
+    assert_eq!(registry_view().generation, start + 2);
+    assert!(view().sources.is_empty(), "nothing is in flight any more");
+    // 它没消失：转去了带过期时间的那张表，清理器照样读得到
+    assert_eq!(
+        crate::log_directory::unresolved_sources(),
+        [PathBuf::from(HOST)]
+    );
 }

@@ -24,8 +24,7 @@ pub trait MountedPathsProbe: Send + Sync {
         candidates: &[PathBuf],
     ) -> Result<LogDirectoryMounts, String>;
 
-    /// 删除一个候选目录之前的最后一次确认。清单读不到快照之后才登记的创建方，这一问答
-    /// 得到：
+    /// 删除一个候选目录之前的最后一次确认。清单读不到它之后才发生的创建，这一问答得到：
     ///
     /// - 已经有创建方登记了它（或它下面的路径）：[`ReclaimRefused::InUse`]，必须保留；
     /// - 判不出来：[`ReclaimRefused::Unconfirmed`]，必须保留；

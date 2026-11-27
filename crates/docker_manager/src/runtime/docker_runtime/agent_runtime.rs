@@ -992,8 +992,7 @@ impl AgentContainerRuntime for DockerRuntime {
         &self,
         candidates: &[std::path::PathBuf],
     ) -> ContainerRuntimeResult<container_runtime_api::LogDirectoryMounts> {
-        log_dir_mounts::mounted_log_directories(&self.inner, &self.log_path_resolver, candidates)
-            .await
+        log_dir_mounts::mounted_log_directories(self, candidates).await
     }
 
     async fn begin_log_directory_reclaim(
@@ -1003,7 +1002,7 @@ impl AgentContainerRuntime for DockerRuntime {
         container_runtime_api::ReclaimPermit,
         container_runtime_api::ReclaimRefused,
     > {
-        log_dir_mounts::begin_reclaim(&self.inner, &self.log_path_resolver, candidate).await
+        log_dir_mounts::begin_reclaim(self, candidate).await
     }
 
     /// Docker 基础诊断：find_container → docker inspect → 读 State(OOMKilled/exit_code/running)。

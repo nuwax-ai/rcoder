@@ -14,11 +14,11 @@ async fn a_claim_is_visible_until_its_guard_is_dropped() {
 
     let mut binds = PendingBinds::default();
     binds
-        .claim(Path::new("/srv/logs/container/runner-a"))
+        .claim(Path::new("/srv/logs/container/runner-a"), None)
         .await
         .unwrap();
     binds
-        .claim(Path::new("/srv/logs/container/runner-b"))
+        .claim(Path::new("/srv/logs/container/runner-b"), None)
         .await
         .unwrap();
     assert_eq!(
@@ -37,7 +37,7 @@ async fn a_claim_is_visible_until_its_guard_is_dropped() {
 async fn a_claim_is_keyed_by_its_normalized_path() {
     let mut binds = PendingBinds::default();
     binds
-        .claim(Path::new("/srv/logs/container/./runner-a/"))
+        .claim(Path::new("/srv/logs/container/./runner-a/"), None)
         .await
         .unwrap();
 
@@ -52,12 +52,12 @@ async fn a_claim_is_keyed_by_its_normalized_path() {
 async fn dropping_one_guard_leaves_the_others_claimed() {
     let mut first = PendingBinds::default();
     first
-        .claim(Path::new("/srv/logs/container/runner-a"))
+        .claim(Path::new("/srv/logs/container/runner-a"), None)
         .await
         .unwrap();
     let mut second = PendingBinds::default();
     second
-        .claim(Path::new("/srv/logs/container/runner-b"))
+        .claim(Path::new("/srv/logs/container/runner-b"), None)
         .await
         .unwrap();
 
@@ -75,12 +75,12 @@ async fn dropping_one_guard_leaves_the_others_claimed() {
 async fn a_path_claimed_by_two_guards_stays_claimed_until_the_last_one_leaves() {
     let mut first = PendingBinds::default();
     first
-        .claim(Path::new("/srv/logs/container/shared"))
+        .claim(Path::new("/srv/logs/container/shared"), None)
         .await
         .unwrap();
     let mut second = PendingBinds::default();
     second
-        .claim(Path::new("/srv/logs/container/shared"))
+        .claim(Path::new("/srv/logs/container/shared"), None)
         .await
         .unwrap();
 
@@ -100,12 +100,12 @@ async fn a_path_claimed_by_two_guards_stays_claimed_until_the_last_one_leaves() 
 async fn a_path_claimed_by_two_guards_survives_the_unknown_outcome_of_one() {
     let mut first = PendingBinds::default();
     first
-        .claim(Path::new("/srv/logs/container/shared"))
+        .claim(Path::new("/srv/logs/container/shared"), None)
         .await
         .unwrap();
     let mut second = PendingBinds::default();
     second
-        .claim(Path::new("/srv/logs/container/shared"))
+        .claim(Path::new("/srv/logs/container/shared"), None)
         .await
         .unwrap();
 
@@ -133,7 +133,10 @@ async fn live_claims_are_never_evicted() {
     for index in 0..20_000 {
         let mut binds = PendingBinds::default();
         binds
-            .claim(&PathBuf::from(format!("/srv/logs/container/runner-{index}")))
+            .claim(
+                &PathBuf::from(format!("/srv/logs/container/runner-{index}")),
+                None,
+            )
             .await
             .unwrap();
         guards.push(binds);
@@ -151,7 +154,7 @@ async fn live_claims_are_never_evicted() {
 async fn a_guard_dropped_after_the_request_was_sent_keeps_its_claims() {
     let mut binds = PendingBinds::default();
     binds
-        .claim(Path::new("/srv/logs/container/runner-a"))
+        .claim(Path::new("/srv/logs/container/runner-a"), None)
         .await
         .unwrap();
     binds.request_sent();
@@ -169,7 +172,7 @@ async fn a_guard_dropped_after_the_request_was_sent_keeps_its_claims() {
 async fn a_guard_dropped_before_the_request_was_sent_releases_its_claims() {
     let mut binds = PendingBinds::default();
     binds
-        .claim(Path::new("/srv/logs/container/runner-a"))
+        .claim(Path::new("/srv/logs/container/runner-a"), None)
         .await
         .unwrap();
 
@@ -186,7 +189,7 @@ async fn an_unknown_outcome_expires() {
     UNRESOLVED_TTL_MILLIS.store(10, Ordering::SeqCst);
     let mut binds = PendingBinds::default();
     binds
-        .claim(Path::new("/srv/logs/container/runner-a"))
+        .claim(Path::new("/srv/logs/container/runner-a"), None)
         .await
         .unwrap();
     binds.request_sent();
@@ -208,7 +211,7 @@ async fn an_unknown_outcome_expires() {
 async fn a_request_that_succeeds_releases_the_claims() {
     let mut binds = PendingBinds::default();
     binds
-        .claim(Path::new("/srv/logs/container/runner-a"))
+        .claim(Path::new("/srv/logs/container/runner-a"), None)
         .await
         .unwrap();
 
@@ -226,7 +229,7 @@ async fn a_request_that_succeeds_releases_the_claims() {
 async fn a_request_that_fails_keeps_the_claims() {
     let mut binds = PendingBinds::default();
     binds
-        .claim(Path::new("/srv/logs/container/runner-a"))
+        .claim(Path::new("/srv/logs/container/runner-a"), None)
         .await
         .unwrap();
 
@@ -253,7 +256,7 @@ async fn a_request_cancelled_while_waiting_keeps_the_claims() {
     let task = tokio::spawn(async {
         let mut binds = PendingBinds::default();
         binds
-            .claim(Path::new("/srv/logs/container/runner-a"))
+            .claim(Path::new("/srv/logs/container/runner-a"), None)
             .await
             .unwrap();
         let request = binds.until_settled(std::future::pending::<crate::DockerResult<()>>());
@@ -277,7 +280,7 @@ async fn a_request_dropped_before_it_was_polled_releases_the_claims() {
     let task = tokio::spawn(async {
         let mut binds = PendingBinds::default();
         binds
-            .claim(Path::new("/srv/logs/container/runner-a"))
+            .claim(Path::new("/srv/logs/container/runner-a"), None)
             .await
             .unwrap();
         binds
@@ -295,7 +298,7 @@ async fn a_request_dropped_before_it_was_polled_releases_the_claims() {
 async fn an_unknown_outcome_keeps_the_claims_and_the_guard_can_then_be_dropped() {
     let mut binds = PendingBinds::default();
     binds
-        .claim(Path::new("/srv/logs/container/runner-a"))
+        .claim(Path::new("/srv/logs/container/runner-a"), None)
         .await
         .unwrap();
     binds.request_sent();

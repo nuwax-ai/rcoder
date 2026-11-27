@@ -774,10 +774,8 @@ pub trait AgentContainerRuntime: Send + Sync {
     /// until the deletion has returned. Candidates are in the RCoder
     /// process's filesystem namespace, as above.
     ///
-    /// The inventory is one snapshot. A creator that registers a path after
-    /// the snapshot was taken is invisible to it, and a creator that
-    /// replays an expired directory may do exactly that. This call closes
-    /// that race: it is one atomic step with the creators' registration.
+    /// The inventory is one snapshot, and this call closes the gaps it
+    /// leaves. It is one atomic step with the creators' registration:
     ///
     /// - A creator has already registered the candidate, or a path below
     ///   it: [`ReclaimRefused::InUse`]. The caller keeps the directory.
@@ -786,6 +784,13 @@ pub trait AgentContainerRuntime: Send + Sync {
     /// - Otherwise a permit is returned, and until it is dropped a creator
     ///   that registers the candidate waits for the deletion to finish
     ///   instead of binding a directory that is being removed.
+    ///
+    /// A creation that both started and finished after the inventory was
+    /// taken is in neither of its sets. The runtime keeps the inventory it
+    /// handed out together with a generation of the creators' registry;
+    /// when the generation has moved by the time of this call, it re-reads
+    /// the runtime once the candidate is marked and works from the newer
+    /// view for the rest of the sweep.
     ///
     /// Like the inventory, the default refuses: an unsupported runtime
     /// must never delete.

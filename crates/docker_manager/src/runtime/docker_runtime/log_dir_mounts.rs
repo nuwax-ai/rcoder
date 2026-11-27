@@ -62,28 +62,69 @@
 //! 创建方判不出在不在日志根里的 bind 源也登记在这里（它用的是同一个走法，对这条源同样判不
 //! 出来，所以不让创建失败，改为登记）。这样的源定不了位，本轮所有候选都保留——确认不了就不删。
 //!
-//! 登记只对"这一轮读到的"有效：创建方在取完登记之后才登记的，这一轮看不到。所以清理器删
-//! 每个目录之前还要回来确认一次（[`begin_reclaim`]）：判定和取清单时是同一个（[`classify`]），
-//! 只把 Docker 清单换成登记本身。
+//! # 删除之前的最后一次确认
 //!
-//! 确认分两步，顺序不能反：先给目录打上"正在删"的标记，再核对登记。标记之后才登记的创建方
-//! 一定看得到标记、会等这次删除结束，所以核对时登记里没有就是真没有。反过来先核对再打标记，
-//! 两步之间登记的创建方两头都看不到。
+//! 清单和登记都只是取清单那一刻的样子，之后的创建这一轮看不到。所以清理器删每个目录之前还要
+//! 回来确认一次（[`begin_reclaim`]），判定和取清单时是同一个（[`classify`]）。要补的是两种交错：
+//!
+//! - **创建方在取完登记之后才登记**，要复用一个已过期的旧目录。确认时先给目录打上"正在删"的
+//!   标记，再读登记，两步在同一次持锁里：标记之后才登记的创建方一定看得到标记、会等这次删除
+//!   结束（`reclaim_wait`），所以读到的登记里没有就是真没有。反过来先读登记再打标记，两步之间
+//!   登记的创建方两头都看不到。
+//! - **登记已经交给了容器**：创建方登记 → Docker 把容器建出来 → 创建方注销，三步都在取完清单
+//!   之后。登记表里没有它，那份 Docker 清单里也没有。所以每份视图都记着取它时登记表的代次，
+//!   确认时对一下：变了就说明清单之后有创建开始或结束，在标记之下重新取一次，**整轮换成这份
+//!   新的**——只给当前这一个候选用是不够的，绑着后面候选的容器同样不在旧清单里。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use bollard::models::ContainerSummary;
 use container_runtime_api::{
-    ContainerRuntimeError, ContainerRuntimeResult, LogDirectoryMounts, ReclaimPermit, ReclaimRefused,
+    ContainerRuntimeError, ContainerRuntimeResult, LogDirectoryMounts, ReclaimPermit,
+    ReclaimRefused,
 };
-use tokio::sync::OnceCell;
+use std::sync::{Arc, PoisonError};
 
+use super::DockerRuntime;
 use super::host_path_space::{
     DirectoryId, FileSystemView, HostPathSpace, LocalFileSystem, Location, RealLocations,
     is_absent, path_space, viewing,
 };
-use crate::{DockerError, DockerManager, DockerResult, HostPathResolver};
+use crate::{DockerError, DockerResult};
+
+mod reclaim_wait;
+pub(crate) use reclaim_wait::wait_while_reclaiming;
+
+/// 清理器的一份视图：取清单那一刻登记表的代次，和按那份清单算好的观察结果。
+///
+/// 代次没变，这份视图就还代表现在：登记表里没有新的登记加上、也没有登记注销，所以取清单之后
+/// 不会有新的容器建出来——创建方登记在先，登记一动代次就变
+#[derive(Debug)]
+pub(super) struct LogDirectoryView {
+    generation: u64,
+    observations: Arc<MountObservations>,
+}
+
+impl DockerRuntime {
+    fn with_log_directory_view<T>(&self, read: impl FnOnce(Option<&LogDirectoryView>) -> T) -> T {
+        let view = self
+            .log_directory_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        read(view.as_ref())
+    }
+
+    fn remember_log_directory_view(&self, generation: u64, observations: Arc<MountObservations>) {
+        *self
+            .log_directory_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(LogDirectoryView {
+            generation,
+            observations,
+        });
+    }
+}
 
 /// 从一次容器列表的响应里收齐所有挂载源。
 ///
@@ -184,6 +225,7 @@ async fn occupy_ancestors(
 }
 
 /// 判定一轮候选所需的观察结果：取一次清单、算一次，逐候选使用
+#[derive(Debug)]
 struct MountObservations {
     /// 词法：挂载源及其全部祖先（宿主机路径）。候选等于其中之一，就是候选包含被挂载的子路径
     registered: HashSet<PathBuf>,
@@ -288,31 +330,38 @@ async fn classify(
     LogDirMount::Unmounted
 }
 
-/// 判定每个候选日志目录是否仍被容器挂载。
+/// 判定每个候选日志目录是否仍被容器挂载。这一轮的视图同时留给 [`begin_reclaim`]。
 ///
-/// 清单一律取自真实 Docker，不读进程内缓存，整轮只发一次列表请求；另加上正在准备挂载的
-/// 目录的占用登记（`crate::log_directory::pending_bind_sources`）。单个候选换算失败或读不到
-/// 身份只影响它自己，记为无法确认；只有整份清单拿不到时才返回 `Err`。
+/// 清单一律取自真实 Docker，不读进程内缓存，一轮取一次；另加上登记表里正在准备挂载的目录
+/// （在途的和结果不明的）。单个候选换算失败或读不到身份只影响它自己，记为无法确认；只有整份
+/// 清单拿不到时才返回 `Err`
 pub(super) async fn mounted_log_directories(
-    manager: &DockerManager,
-    log_path_resolver: &OnceCell<HostPathResolver>,
+    runtime: &DockerRuntime,
     candidates: &[PathBuf],
 ) -> ContainerRuntimeResult<LogDirectoryMounts> {
     if candidates.is_empty() {
         return Ok(LogDirectoryMounts::default());
     }
-    // 先读占用登记，再取 Docker 清单，顺序不能反。登记在 Docker 应答之后才注销：一个目录
-    // 要么此刻登记着，要么注销时容器已经登记进 Docker、会出现在之后取的清单里。反过来先取
-    // 清单再读登记会两头落空。
-    let pending = crate::log_directory::pending_bind_sources();
-    let sources: Vec<PathBuf> = pending
+    // 先读登记表（连同代次），再取 Docker 清单，顺序不能反。登记在 Docker 应答之后才注销：
+    // 一个目录要么此刻登记着，要么注销时容器已经登记进 Docker、会出现在之后取的清单里。反过来
+    // 先取清单再读登记会两头落空
+    let registry = crate::log_directory::registry_view();
+    let sources: Vec<PathBuf> = registry
+        .sources
         .into_iter()
-        .chain(manager.mounted_host_paths().await.map_err(list_error)?)
+        .chain(
+            runtime
+                .inner
+                .mounted_host_paths()
+                .await
+                .map_err(list_error)?,
+        )
         .collect();
 
-    let space = path_space(manager, log_path_resolver).await?;
+    let space = path_space(&runtime.inner, &runtime.log_path_resolver).await?;
     let fs = LocalFileSystem;
-    let observations = observe(&space, &sources, &fs).await;
+    let observations = Arc::new(observe(&space, &sources, &fs).await);
+    runtime.remember_log_directory_view(registry.generation, Arc::clone(&observations));
 
     let mut mounts = LogDirectoryMounts::default();
     for candidate in candidates {
@@ -329,31 +378,49 @@ pub(super) async fn mounted_log_directories(
     Ok(mounts)
 }
 
-/// 清理器删一个候选目录之前的最后一次确认，见模块说明"正在准备挂载的目录"。
+/// 清理器删一个候选目录之前的最后一次确认，见模块说明"删除之前的最后一次确认"。
 ///
 /// 许可（[`ReclaimPermit`]）由调用方拿到删除结束：它 drop 时才解除"正在删"的标记，登记着
-/// 这个目录的创建方也在那之前一直等
+/// 这个目录的创建方也在那之前一直等。
+///
+/// 用的是这一轮的视图（登记、Docker 清单，连同取它时的代次）。代次变了——清单之后有创建开始
+/// 或者结束——旧视图已经不代表现在：标记打上之后重新取一次，整轮换成新的。只给当前这个候选用
+/// 是不够的：绑着后面某个候选的容器同样不在旧清单里
 pub(super) async fn begin_reclaim(
-    manager: &DockerManager,
-    log_path_resolver: &OnceCell<HostPathResolver>,
+    runtime: &DockerRuntime,
     candidate: &Path,
 ) -> Result<ReclaimPermit, ReclaimRefused> {
-    let space = path_space(manager, log_path_resolver)
+    let space = path_space(&runtime.inner, &runtime.log_path_resolver)
         .await
         .map_err(|error| ReclaimRefused::Unconfirmed(error.to_string()))?;
     let registered = match space.to_host(candidate) {
         Ok(path) => crate::normalize_path(&path),
         Err(error) => return Err(ReclaimRefused::Unconfirmed(mapping_failure(&error))),
     };
-    let mark = crate::log_directory::mark_reclaim(&registered)
+    // 一次持锁：打标记，读登记，读代次。之后的登记一定看得到标记
+    let (mark, registry) = crate::log_directory::mark_reclaim(&registered, candidate)
         .map_err(ReclaimRefused::Unconfirmed)?;
+    let still_current = runtime.with_log_directory_view(|view| {
+        view.filter(|view| view.generation == registry.generation)
+            .map(|view| Arc::clone(&view.observations))
+    });
     let fs = LocalFileSystem;
-    let observations = observe(
-        &space,
-        &crate::log_directory::pending_bind_sources(),
-        &fs,
-    )
-    .await;
+    let observations = match still_current {
+        Some(observations) => observations,
+        None => {
+            let fresh = runtime
+                .inner
+                .mounted_host_paths()
+                .await
+                .map_err(|error| ReclaimRefused::Unconfirmed(list_error(error).to_string()))?;
+            let mut sources = registry.sources;
+            sources.extend(crate::log_directory::unresolved_sources());
+            sources.extend(fresh);
+            let observations = Arc::new(observe(&space, &sources, &fs).await);
+            runtime.remember_log_directory_view(registry.generation, Arc::clone(&observations));
+            observations
+        }
+    };
     match classify(candidate, &space, &observations, &fs).await {
         LogDirMount::Unmounted => Ok(ReclaimPermit::release_on_drop(move || drop(mark))),
         LogDirMount::Mounted => Err(ReclaimRefused::InUse(format!(

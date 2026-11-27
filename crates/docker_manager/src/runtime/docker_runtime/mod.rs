@@ -28,6 +28,9 @@ pub struct DockerRuntime {
     // the log directory mount check and by creating a replacement builder's log
     // directory, so both see the same mapping.
     pub(super) log_path_resolver: tokio::sync::OnceCell<crate::HostPathResolver>,
+    /// 日志清理器最近一次取到的那份视图：当时登记表的代次，和按那份清单算好的观察结果。删目录
+    /// 之前的最后一次确认靠它知道那份清单还作不作数，见 `log_dir_mounts`
+    log_directory_view: std::sync::Mutex<Option<log_dir_mounts::LogDirectoryView>>,
 }
 
 impl DockerRuntime {
@@ -37,6 +40,7 @@ impl DockerRuntime {
             inner,
             list_cache: Self::new_list_cache(),
             log_path_resolver: tokio::sync::OnceCell::new(),
+            log_directory_view: std::sync::Mutex::new(None),
         }
     }
 
@@ -53,6 +57,7 @@ impl DockerRuntime {
             inner,
             list_cache: Self::new_list_cache(),
             log_path_resolver: tokio::sync::OnceCell::from(log_path_resolver),
+            log_directory_view: std::sync::Mutex::new(None),
         }
     }
 

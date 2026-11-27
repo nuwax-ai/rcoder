@@ -28,17 +28,24 @@
 //!
 //! # 删除之前的最后一次确认
 //!
-//! 登记是按路径的，清理器一轮只读一次。创建方在清理器读完登记**之后**才登记的，这一轮看不到；
-//! 它绑的如果是一个已经过期的旧目录（复用），清理器可能正好在删它。所以清理器删每个目录之前
-//! 还要回来确认一次：先给目录打上"正在删"的标记（[`mark_reclaim`]），再核对登记——标记之后
-//! 才登记的创建方一定看得到标记。核对和取清单用同一个判定，在
-//! `runtime::docker_runtime::log_dir_mounts`。
+//! 清理器一轮只取一次登记和 Docker 清单，之后的创建它看不到。创建方要复用一个已过期的旧目录
+//! 时，清理器可能正好在删它。所以清理器删每个目录之前还要回来确认一次，在同一次持锁里：先给
+//! 目录打上"正在删"的标记（[`mark_reclaim`]），再读登记和代次。标记之后才登记的创建方一定看
+//! 得到标记。
 //!
 //! 标记和登记在同一张表里（[`reclaim`]），谁先到谁说了算：
 //!
-//! - 创建方先登记：清理器放弃这次删除，留到下一轮；
-//! - 清理器先打标记：创建方等这次删除结束（[`PendingBinds::claim`]）。最多等 10 秒，超时报
-//!   错。这不是"判不出来就拒绝"：目录正在被删是确定的事，绑上去只会绑到一个正在消失的目录。
+//! - 创建方先登记：清理器的核对看得到，放弃这次删除，留到下一轮；
+//! - 清理器先打标记：创建方登记后等这次删除结束（[`PendingBinds::claim`]）。最多等 10 秒，超时
+//!   报错。这不是"判不出来就拒绝"：目录正在被删是确定的事，绑上去只会绑到一个正在消失的目录。
+//!
+//! 两边的判定是同一个函数，按**目录身份**比，不按路径拼写：同一个目录经别名登记也认得出。
+//! "登记落在被删目录里面"和"要绑的目录正被删"是一回事的两面，都在
+//! `runtime::docker_runtime::log_dir_mounts`。
+//!
+//! 登记还会"交给容器"：创建方登记 → Docker 把容器建出来 → 创建方注销。这三步全发生在清理器
+//! 取完清单**之后**的话，登记表里没有它，那份 Docker 清单里也没有。所以取清单时记下登记表的
+//! 代次，删前确认时对一下：变了就在标记之下重新取一次 Docker 清单。
 //!
 //! 新建的日志目录不会等：清理器删的都是过期目录，新建的目录年轻，从来不是候选。会等的只有
 //! 复用旧目录的创建——落在日志根里的持久数据（配置错误，创建容器时就拒绝，这里只是存量）、
@@ -46,6 +53,7 @@
 
 mod reclaim;
 
+use crate::runtime::docker_runtime::host_path_space::HostPathSpace;
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -111,11 +119,19 @@ impl PendingBinds {
     /// 各的，一个守卫退出不影响其余的。
     ///
     /// 这个路径正被清理器删除时，等这次删除结束；等不到就报错，见模块说明"删除之前的最后
-    /// 一次确认"。报错时登记已经生效，守卫 drop 时才注销
-    pub(crate) async fn claim(&mut self, host_path: &Path) -> Result<(), DirectoryBeingReclaimed> {
+    /// 一次确认"。
+    ///
+    /// `space` 是这次创建用的路径空间：按目录身份判"要绑的是不是正被删的那个"要用它。没有它
+    /// 就核不了身份，宁可等——有目录正在删就等它删完。报错时登记已经生效，守卫 drop 时才注销
+    pub(crate) async fn claim(
+        &mut self,
+        host_path: &Path,
+        space: Option<&HostPathSpace<'_>>,
+    ) -> Result<(), DirectoryBeingReclaimed> {
         let path = reclaim::add_claim(host_path);
         self.paths.push(path.clone());
-        reclaim::wait_until_released(&path).await
+        super::super::runtime::docker_runtime::log_dir_mounts::wait_while_reclaiming(&path, space)
+            .await
     }
 
     /// 只登记、不等待，返回登记用的键。
@@ -183,24 +199,63 @@ impl Drop for PendingBinds {
     }
 }
 
-/// 清理器删 `host_path`（宿主机路径）之前的许可：给它打上"正在删"的标记，之后登记它的创建方
-/// 会等这次删除结束。标记随返回值 drop 解除。
+/// 清理器删一个目录之前的许可：给它打上"正在删"的标记，之后登记它的创建方会等这次删除
+/// 结束。标记随返回值 drop 解除。
 ///
-/// 它已经在删了就拒绝。有没有创建方先登记了它，由调用方拿到标记**之后**再核对
-pub(crate) fn mark_reclaim(host_path: &Path) -> Result<reclaim::ReclaimMark, String> {
-    reclaim::mark_reclaim(host_path)
+/// `host_path` 是登记时用的写法（Docker 看到的），`process_path` 是同一个目录在 RCoder 进程里
+/// 的路径：创建方按目录身份判断冲不冲突时，两个都要用。
+///
+/// 它已经在删了就拒绝。返回的视图是打上标记那一刻的表：有没有创建方先登记了它、清单之后有没有
+/// 创建开始或结束，都由调用方拿着标记**对照这份视图**核对
+pub(crate) fn mark_reclaim(
+    host_path: &Path,
+    process_path: &Path,
+) -> Result<(reclaim::ReclaimMark, reclaim::RegistryView), String> {
+    reclaim::mark_reclaim(host_path, process_path)
 }
 
-/// 当前登记着的宿主机路径：在途的和结果不明的。同一条路径只列一次
+/// 登记表这一刻的样子：在途登记和代次，同一次持锁读出。清理器取 Docker 清单之前读它
+pub(crate) fn registry_view() -> reclaim::RegistryView {
+    let view = reclaim::view();
+    reclaim::RegistryView {
+        sources: dedupe(view.sources.into_iter().chain(unresolved_sources())),
+        generation: view.generation,
+    }
+}
+
+/// 清理器此刻正在删的目录，每项是（宿主机路径，RCoder 进程里的路径）
+pub(crate) fn reclaim_marks() -> Vec<(PathBuf, PathBuf)> {
+    reclaim::marks()
+}
+
+/// 等一个目录删完
+pub(crate) fn reclaim_released() -> impl Future<Output = ()> + Send + 'static {
+    reclaim::released()
+}
+
+/// 结果不明的登记还留着的宿主机路径
+pub(crate) fn unresolved_sources() -> Vec<PathBuf> {
+    unresolved()
+        .iter()
+        .map(|(path, _)| PathBuf::from(path.as_ref()))
+        .collect()
+}
+
+/// 当前登记着的宿主机路径：在途的和结果不明的。同一条路径只列一次。测试用
+#[cfg(test)]
 pub(crate) fn pending_bind_sources() -> Vec<PathBuf> {
+    dedupe(
+        reclaim::view()
+            .sources
+            .into_iter()
+            .chain(unresolved_sources()),
+    )
+}
+
+fn dedupe(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    reclaim::claimed_sources()
+    paths
         .into_iter()
-        .chain(
-            unresolved()
-                .iter()
-                .map(|(path, _)| PathBuf::from(path.as_ref())),
-        )
         .filter(|path| seen.insert(path.clone()))
         .collect()
 }

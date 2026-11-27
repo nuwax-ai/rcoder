@@ -24,9 +24,11 @@
 //! 路径空间，`runtime::docker_runtime::host_path_space`）。判不出来不拒绝创建容器——清理器对这条
 //! 源同样判不出来，登记着它就整轮不删。
 //!
-//! 清理器一轮只读一次登记，读不到它读完之后才登记的。所以删每个目录之前它还要回来确认一次
-//! （[`mark_reclaim`]）：有创建方登记着它或它下面的路径就留到下一轮；没有就打上"正在删"的
-//! 标记，这之后才登记它的创建方会等这次删除结束，最多 10 秒。见 [`pending`]。
+//! 清理器一轮只读一次登记和 Docker 清单，读不到它读完之后才发生的创建。所以删每个目录之前它
+//! 还要回来确认一次（[`mark_reclaim`]）：先打上"正在删"的标记，再核对——有创建方登记着它或它
+//! 下面的路径，就解除标记、留到下一轮；清单之后有创建开始或结束，就在标记之下重新取一次 Docker
+//! 清单；都没有才删。标记在，这之后才登记它的创建方就会等这次删除结束，最多 10 秒。见
+//! [`pending`]。
 //!
 //! 新建目录落在日志根下面更深处时，要刷新上一级候选的修改时间，见
 //! [`refresh_candidate_ancestor`]。
@@ -42,7 +44,11 @@ use tracing::warn;
 pub(crate) const NAME_ATTEMPTS: u32 = 16;
 
 pub use pending::{DirectoryBeingReclaimed, PendingBinds};
-pub(crate) use pending::{mark_reclaim, pending_bind_sources};
+#[cfg(test)]
+pub(crate) use pending::pending_bind_sources;
+pub(crate) use pending::{
+    mark_reclaim, reclaim_marks, reclaim_released, registry_view, unresolved_sources,
+};
 
 /// 仅供其它 crate 的测试使用：登记一条正在准备挂载的宿主机路径，守卫 drop 时注销。需要启用
 /// `test-support` feature，生产构建里不存在。
@@ -50,7 +56,7 @@ pub(crate) use pending::{mark_reclaim, pending_bind_sources};
 pub async fn claim_pending_bind_for_test(host_path: &Path) -> PendingBinds {
     let mut binds = PendingBinds::default();
     binds
-        .claim(host_path)
+        .claim(host_path, None)
         .await
         .expect("a test claim must not wait for a reclaim");
     binds

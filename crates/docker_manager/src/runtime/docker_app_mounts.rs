@@ -104,11 +104,12 @@ pub(super) async fn app_mount_guard(
         .map(|(source, _)| PathBuf::from(source))
         .collect();
     let targets: Vec<String> = mounts.iter().map(|(_, target)| target.clone()).collect();
-    refuse_prod_mounts_in_log_domain(runtime, &sources, &targets).await?;
+    let admission = runtime.log_domain().await;
+    refuse_prod_mounts_in_log_domain(&admission, &sources, &targets).await?;
     let mut pending = PendingBinds::default();
     for source in sources {
         pending
-            .claim(&source)
+            .claim(&source, admission.space())
             .await
             .map_err(DirectoryBeingReclaimed::into_container_creation_error)?;
     }
@@ -126,7 +127,7 @@ async fn prod_flat_mounts(
     let targets = prod_flat_container_paths(app_id);
     let sources: Vec<PathBuf> = subs.iter().map(|rel| host_root.join(rel)).collect();
     // 先判定再建目录：被拒绝的布局不会在日志根里留下任何东西
-    refuse_prod_mounts_in_log_domain(runtime, &sources, &targets).await?;
+    refuse_prod_mounts_in_log_domain(&runtime.log_domain().await, &sources, &targets).await?;
     let mut mounts = Vec::with_capacity(4);
     for ((rel, target), host_path) in subs.iter().zip(targets).zip(&sources) {
         let precreate = precreate_root.join(rel);
@@ -156,16 +157,10 @@ async fn prod_flat_mounts(
 /// 在不在日志根里用的是清理器那个路径空间。判不出来的不拒绝（那会让应用发布不出去），只
 /// 告警；取不到路径空间、日志根定位不完整也是只告警。
 async fn refuse_prod_mounts_in_log_domain(
-    runtime: &DockerRuntime,
+    admission: &LogDomainAdmission<'_>,
     sources: &[PathBuf],
     targets: &[String],
 ) -> ContainerRuntimeResult<()> {
-    let admission = LogDomainAdmission::locate(
-        &runtime.inner,
-        &runtime.log_path_resolver,
-        &runtime.inner.config.log_reclaim_root,
-    )
-    .await;
     admission.warn_if_limited("Assemble application data mounts");
     for (source, target) in sources.iter().zip(targets) {
         let source = source.to_string_lossy();

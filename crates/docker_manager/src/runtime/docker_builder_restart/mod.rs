@@ -614,7 +614,7 @@ impl DockerRuntime {
         let mut replayed = PendingBinds::default();
         for source in &binds.replayed {
             replayed
-                .claim(source)
+                .claim(source, admission.space())
                 .await
                 .map_err(DirectoryBeingReclaimed::into_container_creation_error)?;
         }

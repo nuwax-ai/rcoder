@@ -1,46 +1,49 @@
-//! 清理器删除和创建方登记之间的目录级互斥。
+//! 清理器删除和创建方登记之间的目录级互斥：一张表、一把锁。
 //!
-//! 清理器一轮只读一次登记。创建方在它读完之后才登记的，清理器不知道，可能正好在删创建方要
-//! 复用的那个旧目录。所以删除之前清理器要回来做最后一次确认：先给目录打上"正在删"的标记
-//! （[`mark_reclaim`]），再核对登记。标记之后才登记的创建方一定看得到标记、会等这次删除
-//! （[`wait_until_released`]），所以核对时登记里没有就是真没有。创建方的登记
-//! （[`add_claim`]）和清理器的标记用的是同一张表、同一把锁：
+//! 表里有三样东西：
 //!
-//! - 创建方先登记：清理器的核对看得到，放弃这次删除；
-//! - 清理器先打标记：创建方登记后等清理器删完再往下走。
+//! - **在途登记**：创建方准备绑定的宿主机路径，按守卫计数；
+//! - **"正在删"的标记**：清理器正在删的目录，一次删除一个标记，删完才解除；
+//! - **代次**：每次登记加上、或者最后一个守卫注销，都加一。
 //!
-//! 核对（"有没有创建方登记着它或它下面的路径"）不在这里做：它用的判定要和清理器取清单时
-//! 一致，在 `runtime::docker_runtime::log_dir_mounts`。这里只有标记和等待。
+//! 清理器一轮只取一次清单，之后才开始的创建它看不到。所以删每个目录之前要回来做最后一次
+//! 确认，在同一次持锁里：先打标记，再读登记和代次。
 //!
-//! 锁里只有几次内存操作，谁也不在持锁时做 I/O。会等的只有"要绑的目录恰好正在被删"的创建
-//! 方，等的是这一次删除，最多 [`RECLAIM_WAIT_LIMIT`]——不是整轮清理，更不是别的容器。新建的
-//! 日志目录是独占新建的，从来不会撞上删除；会等的只有复用旧目录的创建。
+//! - 创建方先登记：登记在表里，清理器看得到，放弃这次删除；
+//! - 清理器先打标记：创建方登记后看得到标记，等这次删除结束。
+//!
+//! 代次管的是第三种交错：创建方登记、Docker 把容器建出来、创建方注销，全都发生在清理器取
+//! 清单**之后**。那时登记已经不在表里，容器只在 Docker 里，只读登记表看不到它。清理器取清单
+//! 时记下代次，打标记时再读一次：不一样就说明清单之后有创建开始或者结束，那份清单已经不代表
+//! 现在，要在标记之下重新取一次 Docker 清单
+//! （`runtime::docker_runtime::log_dir_mounts::begin_reclaim`）。
+//!
+//! 这里只有表。两边的判定都不在这里，用的是同一个函数：清理器核对"有没有登记落在被删目录
+//! 里"，创建方判断"要绑的目录是不是正被删"，都按目录身份比，见 `log_dir_mounts`。
+//!
+//! 锁里只有几次内存操作，谁也不在持锁时做 I/O。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Duration;
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+/// 这张表某一刻的样子：在途登记和代次，同一次持锁读出
+#[derive(Debug, Default)]
+pub(crate) struct RegistryView {
+    /// 在途登记着的宿主机路径
+    pub(crate) sources: Vec<PathBuf>,
+    /// 代次
+    pub(crate) generation: u64,
+}
 
-/// 创建方登记一个正被删除的目录时，最多等这次删除这么久
-const RECLAIM_WAIT_LIMIT: Duration = Duration::from_secs(10);
-
-/// 测试用：把上面这个时限改成这么多毫秒
-#[cfg(test)]
-static RECLAIM_WAIT_LIMIT_MILLIS: AtomicU64 = AtomicU64::new(0);
-
-/// 等待期间隔多久看一次删完没有。叫醒只对已经在等的生效，所以留一个兜底的轮询
-const RECLAIM_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// 在途登记和"正在删"的标记，同一把锁保护
 #[derive(Default)]
 struct Registry {
     /// 宿主机路径 → 登记着它的守卫数
     claims: HashMap<PathBuf, usize>,
-    /// 清理器正在删的宿主机路径
-    deleting: HashSet<PathBuf>,
+    /// 清理器正在删的目录：宿主机路径 → 同一个目录在 RCoder 进程里的路径
+    deleting: HashMap<PathBuf, PathBuf>,
+    /// 每次登记加上、最后一个守卫注销，都加一
+    generation: u64,
 }
 
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
@@ -56,84 +59,75 @@ fn lock() -> MutexGuard<'static, Registry> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-fn wait_limit() -> Duration {
-    #[cfg(not(test))]
-    {
-        RECLAIM_WAIT_LIMIT
+fn view_of(registry: &Registry) -> RegistryView {
+    RegistryView {
+        sources: registry.claims.keys().cloned().collect(),
+        generation: registry.generation,
     }
-    #[cfg(test)]
-    {
-        match RECLAIM_WAIT_LIMIT_MILLIS.load(Ordering::SeqCst) {
-            0 => RECLAIM_WAIT_LIMIT,
-            millis => Duration::from_millis(millis),
-        }
-    }
-}
-
-/// `path` 就是一个正在被删的目录，或者在它里面
-fn being_reclaimed(registry: &Registry, path: &Path) -> bool {
-    registry
-        .deleting
-        .iter()
-        .any(|deleting| path.strip_prefix(deleting).is_ok())
 }
 
 /// 登记一个宿主机路径：守卫计数加一。返回登记用的键（归一化之后的路径）
 pub(super) fn add_claim(host_path: &Path) -> PathBuf {
     let path = crate::normalize_path(host_path);
-    *lock().claims.entry(path.clone()).or_insert(0) += 1;
+    let mut registry = lock();
+    *registry.claims.entry(path.clone()).or_insert(0) += 1;
+    registry.generation += 1;
     path
 }
 
-/// 注销一次登记：守卫计数减一，最后一个守卫退出时条目消失。`host_path` 是登记时返回的键
-pub(super) fn remove_claim(host_path: &Path) {
+/// 注销一次登记：守卫计数减一，最后一个守卫退出时条目消失。`key` 是登记时返回的键
+pub(super) fn remove_claim(key: &Path) {
     let mut registry = lock();
-    let Some(count) = registry.claims.get_mut(host_path) else {
+    let Some(count) = registry.claims.get_mut(key) else {
         return;
     };
     if *count > 1 {
         *count -= 1;
     } else {
-        registry.claims.remove(host_path);
+        registry.claims.remove(key);
+        registry.generation += 1;
     }
 }
 
-/// 在途登记着的宿主机路径
-pub(super) fn claimed_sources() -> Vec<PathBuf> {
-    lock().claims.keys().cloned().collect()
+/// 在途登记和代次，同一次持锁读出
+pub(super) fn view() -> RegistryView {
+    view_of(&lock())
 }
 
-/// 创建方已经登记了 `host_path`（登记时返回的键）。它要是正被清理器删，等删完；超过时限
-/// 还在删就报错。
+/// 等一个目录删完：下一次有标记解除时醒来
+pub(super) fn released() -> impl Future<Output = ()> + Send + 'static {
+    RELEASED.notified()
+}
+
+/// 清理器此刻正在删的目录，每项是（宿主机路径，同一个目录在 RCoder 进程里的路径）
+pub(super) fn marks() -> Vec<(PathBuf, PathBuf)> {
+    lock()
+        .deleting
+        .iter()
+        .map(|(host, process)| (host.clone(), process.clone()))
+        .collect()
+}
+
+/// 给一个目录打上"正在删"的标记，标记随返回值 drop 解除。和读登记、读代次是同一次持锁：
+/// 返回的那份视图就是打上标记那一刻的表，之后才登记的创建方一定看得到标记。
 ///
-/// 等到了也只是删完了：目录已经不在，后面的创建由 Docker 明确拒绝（源目录不存在），不会绑到
-/// 一个正在被删的目录上
-pub(super) async fn wait_until_released(host_path: &Path) -> Result<(), DirectoryBeingReclaimed> {
-    if !being_reclaimed(&lock(), host_path) {
-        return Ok(());
-    }
-    let deadline = tokio::time::Instant::now() + wait_limit();
-    while being_reclaimed(&lock(), host_path) {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(DirectoryBeingReclaimed(host_path.to_path_buf()));
-        }
-        let _ = tokio::time::timeout(RECLAIM_POLL_INTERVAL, RELEASED.notified()).await;
-    }
-    Ok(())
-}
-
-/// 给 `host_path` 打上"正在删"的标记，标记随返回值 drop 解除。它已经在删了（另一轮清理在删
-/// 同一个目录）就拒绝：那一轮有自己的标记，删完就解除，这一轮不能再删它
-pub(super) fn mark_reclaim(host_path: &Path) -> Result<ReclaimMark, String> {
-    let path = crate::normalize_path(host_path);
+/// 它已经在删了（另一次删除在删同一个目录）就拒绝：那一次有自己的标记，删完才解除
+pub(super) fn mark_reclaim(
+    host_path: &Path,
+    process_path: &Path,
+) -> Result<(ReclaimMark, RegistryView), String> {
+    let host = crate::normalize_path(host_path);
     let mut registry = lock();
-    if !registry.deleting.insert(path.clone()) {
+    if registry.deleting.contains_key(&host) {
         return Err(format!(
-            "{} is already being reclaimed by another sweep",
-            path.display()
+            "{} is already being reclaimed by another deletion",
+            host.display()
         ));
     }
-    Ok(ReclaimMark(path))
+    registry
+        .deleting
+        .insert(host.clone(), process_path.to_path_buf());
+    Ok((ReclaimMark(host), view_of(&registry)))
 }
 
 /// "正在删"的标记：drop 时解除，并叫醒等它的创建方
@@ -141,7 +135,7 @@ pub(crate) struct ReclaimMark(PathBuf);
 
 impl Drop for ReclaimMark {
     fn drop(&mut self) {
-        let removed = lock().deleting.remove(&self.0);
+        let removed = lock().deleting.remove(&self.0).is_some();
         if removed {
             RELEASED.notify_waiters();
         }
@@ -150,7 +144,7 @@ impl Drop for ReclaimMark {
 
 /// 创建方要绑的目录正被清理器删除，等到了时限还没删完
 #[derive(Debug, Eq, PartialEq)]
-pub struct DirectoryBeingReclaimed(PathBuf);
+pub struct DirectoryBeingReclaimed(pub(crate) PathBuf);
 
 impl std::fmt::Display for DirectoryBeingReclaimed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

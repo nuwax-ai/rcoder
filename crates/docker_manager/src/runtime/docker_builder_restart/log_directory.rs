@@ -51,8 +51,8 @@ const CONTAINER_LOGS_DIR_ENV: &str = "CONTAINER_LOGS_DIR";
 const CONTAINER_LOG_NAME_ENV: &str = "CONTAINER_LOG_NAME";
 
 impl DockerRuntime {
-    /// 这次恢复用的路径空间和日志域。定位不完整也不让恢复失败，见 `LogDomainAdmission`
-    pub(super) async fn log_domain(&self) -> LogDomainAdmission<'_> {
+    /// 这次操作用的路径空间和日志域。定位不完整也不让恢复失败，见 `LogDomainAdmission`
+    pub(in crate::runtime) async fn log_domain(&self) -> LogDomainAdmission<'_> {
         LogDomainAdmission::locate(
             &self.inner,
             &self.log_path_resolver,
@@ -294,7 +294,10 @@ impl FreshLogDirectories {
                         %error,
                         "Cannot create a new directory for a log mount whose source cannot be classified; its archived directory is used as it is and registered until the replacement is created"
                     );
-                    fresh.pending.claim(Path::new(&plan.volume.uid)).await
+                    fresh
+                        .pending
+                        .claim(Path::new(&plan.volume.uid), Some(space))
+                        .await
                         .map_err(DirectoryBeingReclaimed::into_container_creation_error)?;
                     continue;
                 }
@@ -313,8 +316,11 @@ impl FreshLogDirectories {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(&plan.preferred));
             let source = plan.parent.join(name).to_string_lossy().into_owned();
-            fresh.pending.claim(Path::new(&source)).await
-                        .map_err(DirectoryBeingReclaimed::into_container_creation_error)?;
+            fresh
+                .pending
+                .claim(Path::new(&source), Some(space))
+                .await
+                .map_err(DirectoryBeingReclaimed::into_container_creation_error)?;
             fresh.created.push(created);
             fresh.sources.insert(plan.volume.name.clone(), source);
         }
