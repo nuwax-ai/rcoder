@@ -410,3 +410,135 @@ async fn an_absent_claim_under_another_directory_does_not_block_the_reclaim() {
 
     assert!(permit.is_ok(), "{permit:?}");
 }
+
+/// 结果不明的登记（创建请求发出去了、应答没拿到）在另一张带过期时间的表里，不在登记表里。
+/// 清单阶段同样算作占用：容器可能已经建出来、正绑着它
+#[tokio::test]
+async fn an_unresolved_registration_shows_in_the_inventory() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/runner-a")).unwrap();
+    let reused = tree.path("logs/runner-a");
+    let mut late = PendingBinds::default();
+    late.claim_blocking(Path::new(REAL_A));
+    late.request_sent();
+    drop(late);
+    assert!(
+        pending_bind_sources().contains(&PathBuf::from(REAL_A)),
+        "the registration is kept as unresolved"
+    );
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+
+    let inventory = runtime
+        .mounted_log_directories(std::slice::from_ref(&reused))
+        .await
+        .unwrap();
+
+    assert_eq!(inventory.mounted, HashSet::from([reused]));
+}
+
+/// 清理器取完清单之后，一次创建的结果不明了：登记表里没有它，那份清单里也没有容器。视图过期
+/// 后重取，结果不明的登记要一起算进去
+#[tokio::test]
+async fn an_unresolved_registration_still_refuses_the_reclaim_after_the_view_is_refreshed() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/runner-a")).unwrap();
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+    let reused = tree.path("logs/runner-a");
+    runtime
+        .mounted_log_directories(std::slice::from_ref(&reused))
+        .await
+        .unwrap();
+
+    let mut late = PendingBinds::default();
+    late.claim_blocking(Path::new(REAL_A));
+    late.request_sent();
+    drop(late);
+    assert!(
+        pending_bind_sources().contains(&PathBuf::from(REAL_A)),
+        "the registration is kept as unresolved"
+    );
+
+    let refused = runtime.begin_log_directory_reclaim(&reused).await;
+
+    assert!(
+        matches!(refused, Err(ReclaimRefused::InUse(_))),
+        "a container whose creation had an unknown outcome may be binding it: {refused:?}"
+    );
+}
+
+/// 登记的路径经过候选里面的一个符号链接指到别处：按身份它落在兄弟目录里，按词法它在候选下面。
+/// 删掉候选，这条路径就解析不了了——词法这一步也算占用（和 Docker 清单同口径）
+#[tokio::test]
+async fn a_claim_whose_path_leaves_the_candidate_through_a_link_inside_it_still_holds_it() {
+    use crate::runtime::docker_runtime::host_path_space::HostPathSpace;
+    let tree = Tree::new();
+    let candidate = tree.path("logs/runner-a");
+    std::fs::create_dir_all(tree.path("logs/runner-b/x")).unwrap();
+    std::os::unix::fs::symlink("../runner-b", tree.path("logs/runner-a/link")).unwrap();
+    let resolver = tree.resolver();
+    let space = HostPathSpace::Container(&resolver);
+    let mut claimed = PendingBinds::default();
+    claimed
+        .claim(Path::new("/host/base/logs/runner-a/link/x"), Some(&space))
+        .await
+        .unwrap();
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+
+    let inventory = runtime
+        .mounted_log_directories(std::slice::from_ref(&candidate))
+        .await
+        .unwrap();
+    assert_eq!(inventory.mounted, HashSet::from([candidate.clone()]));
+    let refused = runtime.begin_log_directory_reclaim(&candidate).await;
+    assert!(
+        matches!(refused, Err(ReclaimRefused::InUse(_))),
+        "the registered path is spelled below the candidate: {refused:?}"
+    );
+}
+
+/// 回归（Codex 第七轮 P1，清理器这一头）：还没建出来的登记要建在一个目录里，那个目录同时经另一
+/// 条挂载暴露（另一个宿主机名字）。清理器按目录身份认得出它，不给删除许可
+#[tokio::test]
+async fn a_missing_child_of_the_same_directory_seen_through_another_mount_blocks_the_permit() {
+    use crate::runtime::docker_runtime::host_path_space::HostPathSpace;
+    let tree = Tree::new();
+    let direct = tree.path("logs");
+    let mirrored_parent = tree.path("mirrored-parent");
+    std::os::unix::fs::symlink(&tree.base, &mirrored_parent).unwrap();
+    let mirror = mirrored_parent.join("logs");
+    assert_eq!(
+        direct.canonicalize().unwrap(),
+        mirror.canonicalize().unwrap()
+    );
+    let resolver = HostPathResolver::from_mount_table(vec![
+        (direct.clone(), PathBuf::from("/host/actual")),
+        (mirror, PathBuf::from("/host/another-mount")),
+    ])
+    .unwrap();
+    let space = HostPathSpace::Container(&resolver);
+    let candidate = direct.join("runner-a");
+    let mut claimed = PendingBinds::default();
+    claimed
+        .claim(
+            Path::new("/host/another-mount/runner-a/new-dir"),
+            Some(&space),
+        )
+        .await
+        .unwrap();
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, resolver);
+
+    let inventory = runtime
+        .mounted_log_directories(std::slice::from_ref(&candidate))
+        .await
+        .unwrap();
+    assert_eq!(inventory.mounted, HashSet::from([candidate.clone()]));
+    let refused = runtime.begin_log_directory_reclaim(&candidate).await;
+    assert!(
+        matches!(refused, Err(ReclaimRefused::InUse(_))),
+        "{refused:?}"
+    );
+}

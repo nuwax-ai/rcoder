@@ -159,6 +159,25 @@ async fn a_file_where_the_bind_expects_a_directory_is_missing() {
     daemon.assert_followed(2);
 }
 
+/// 挂载视图读不出来——不是"在"也不是"不在"，是读取这一步出了错（这里用一个超出文件名长度上限
+/// 的成分触发）。退回两处也看不见：报的是读取失败，不报缺失，也不放行
+#[tokio::test]
+async fn a_source_the_mount_view_cannot_read_is_reported_as_an_inspection_failure() {
+    let mut restart = LoggedRestart::new();
+    std::fs::create_dir_all(restart.root.path().join("visible/logs/other")).unwrap();
+    let oversized = restart.root.path().join("host/other").join("a".repeat(300));
+    add_data_mount(&mut restart, &oversized);
+    let daemon = scripted(absent_original()).await;
+
+    let result = restart.restore(&daemon).await;
+
+    assert!(
+        matches!(&result, Err(Error::DockerError(message)) if message.contains("Inspect restart bind source")),
+        "{result:?}"
+    );
+    daemon.assert_followed(2);
+}
+
 /// 要换新目录的日志挂载不核验旧目录：它可能早被清理器回收了
 #[tokio::test]
 async fn a_reclaimed_log_directory_does_not_stop_the_restart() {

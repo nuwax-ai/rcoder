@@ -393,3 +393,20 @@ async fn a_path_not_created_below_a_file_does_not_wait() {
         "nothing can be created below a file; waiting would have timed out"
     );
 }
+
+/// 登记的路径经过被删目录里面的一个符号链接指到别处：按身份它落在兄弟目录里，按词法它在被删目录
+/// 下面——目录一删，这条路径就解析不了了。和清理器的清单同口径：等
+#[tokio::test]
+async fn a_claim_whose_path_leaves_the_marked_directory_through_a_link_inside_it_waits() {
+    bound_the_wait();
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/runner-b/x")).unwrap();
+    std::os::unix::fs::symlink("../runner-b", tree.path("logs/runner-a/link")).unwrap();
+    let _held = mark(&tree, "logs/runner-a", REAL_A);
+
+    assert_waited_out(
+        claim(&tree, "/host/base/logs/runner-a/link/x").await,
+        REAL_A,
+        "the registered path is spelled inside the directory being deleted",
+    );
+}
