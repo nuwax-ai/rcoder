@@ -18,7 +18,7 @@
 //! The log mount is the one bind that is not replayed verbatim: the replacement
 //! gets a new log directory instead, see [`log_directory`].
 use super::docker_runtime::DockerRuntime;
-use crate::log_directory::PendingBinds;
+use crate::log_directory::{DirectoryBeingReclaimed, PendingBinds};
 use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
 use log_directory::{FreshLogDirectories, plan};
 use log_label::RESTART_LOG_DIR;
@@ -613,7 +613,10 @@ impl DockerRuntime {
         // 容器之间可能还要拉镜像。下面任何一步失败，守卫 drop，登记注销
         let mut replayed = PendingBinds::default();
         for source in &binds.replayed {
-            replayed.claim(source);
+            replayed
+                .claim(source)
+                .await
+                .map_err(DirectoryBeingReclaimed::into_container_creation_error)?;
         }
         // Old versions may retain stopped builders. Replace that exact instance
         // only after its stop receipt and mount witnesses are confirmed.
@@ -671,7 +674,7 @@ impl DockerRuntime {
             "Inspect restart target",
         )? {
             let resumed = self
-                .resumed_replacement(template, archive, &admission, existing)
+                .resumed_replacement(template, archive, existing)
                 .await?;
             let expected_volumes = resumed.expected_volumes(template);
             return Ok(Replacement {

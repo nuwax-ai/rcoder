@@ -4,9 +4,10 @@ use super::*;
 use crate::log_directory::PendingBinds;
 use crate::runtime::docker_runtime::DockerRuntime;
 use async_trait::async_trait;
-use container_runtime_api::AgentContainerRuntime as _;
+use container_runtime_api::{AgentContainerRuntime as _, ReclaimRefused};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::super::host_path_space::Entry;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1025,7 +1026,10 @@ async fn a_pending_bind_counts_as_mounted() {
     let runtime = runtime(daemon.address, tree.resolver());
     let fresh = tree.path("logs/runner-fresh");
     let mut pending = PendingBinds::default();
-    pending.claim(Path::new("/host/base/logs/runner-fresh"));
+    pending
+        .claim(Path::new("/host/base/logs/runner-fresh"))
+        .await
+        .unwrap();
 
     let mounts = runtime
         .mounted_log_directories(std::slice::from_ref(&fresh))
@@ -1051,7 +1055,10 @@ async fn a_pending_bind_also_protects_the_directories_above_it() {
     let runtime = runtime(daemon.address, tree.resolver());
     let tenant = tree.path("logs/tenant");
     let mut pending = PendingBinds::default();
-    pending.claim(Path::new("/host/base/logs/tenant/runner-fresh"));
+    pending
+        .claim(Path::new("/host/base/logs/tenant/runner-fresh"))
+        .await
+        .unwrap();
 
     let mounts = runtime
         .mounted_log_directories(std::slice::from_ref(&tenant))
@@ -1070,7 +1077,10 @@ async fn the_pending_registry_is_read_before_the_docker_inventory() {
     std::fs::create_dir_all(tree.path("logs/runner-fresh")).unwrap();
     let fresh = tree.path("logs/runner-fresh");
     let mut pending = PendingBinds::default();
-    pending.claim(Path::new("/host/base/logs/runner-fresh"));
+    pending
+        .claim(Path::new("/host/base/logs/runner-fresh"))
+        .await
+        .unwrap();
     let release = Arc::new(Mutex::new(Some(pending)));
     let on_list = Arc::clone(&release);
     let daemon = fake_daemon_hooked(json!([]), move || {
@@ -1103,7 +1113,10 @@ async fn a_pending_bind_does_not_rescue_an_unavailable_inventory() {
     let daemon = fake_daemon(json!([{"Id": "opaque", "Mounts": null}])).await;
     let runtime = runtime(daemon.address, tree.resolver());
     let mut pending = PendingBinds::default();
-    pending.claim(Path::new("/host/base/logs/runner-fresh"));
+    pending
+        .claim(Path::new("/host/base/logs/runner-fresh"))
+        .await
+        .unwrap();
 
     let error = runtime
         .mounted_log_directories(&[tree.path("logs/runner-fresh")])
@@ -1111,4 +1124,151 @@ async fn a_pending_bind_does_not_rescue_an_unavailable_inventory() {
         .unwrap_err();
 
     assert!(error.to_string().contains("no mount list"), "{error}");
+}
+
+// ─── 删除之前的最后一次确认 ──────────────────────────────────────────────────
+
+/// 回归（Codex 第四轮 P1）：创建方在清理器取完清单之后才登记了一个已过期的旧目录。清单里没有
+/// 它，但最后一次确认看得到：许可被拒，目录保留。
+///
+/// 真实序列：清理器读登记 → 创建方登记旧目录、删旧容器 → Docker 返回清单 → 新容器还没建出来。
+#[tokio::test]
+async fn a_directory_claimed_after_the_inventory_is_refused_the_reclaim() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/runner-a")).unwrap();
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+    let reused = tree.path("logs/runner-a");
+    let mut pending = PendingBinds::default();
+    pending
+        .claim(Path::new("/host/base/logs/runner-a"))
+        .await
+        .unwrap();
+
+    let refused = runtime.begin_log_directory_reclaim(&reused).await;
+
+    assert!(
+        matches!(refused, Err(ReclaimRefused::InUse(_))),
+        "a directory a starting container registered must not be deleted: {refused:?}"
+    );
+    // 别的目录照样能删
+    assert!(
+        runtime
+            .begin_log_directory_reclaim(&tree.path("logs/other"))
+            .await
+            .is_ok()
+    );
+}
+
+/// 拿到许可之后再登记同一个路径：创建方要等这次删除结束，不会绑到一个正在被删的目录上
+#[tokio::test]
+async fn a_claim_waits_once_the_reclaim_has_started() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/runner-a")).unwrap();
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+    let reused = tree.path("logs/runner-a");
+
+    let permit = runtime
+        .begin_log_directory_reclaim(&reused)
+        .await
+        .expect("an unclaimed directory may be reclaimed");
+
+    let waiting = tokio::spawn(async move {
+        let mut binds = PendingBinds::default();
+        binds.claim(Path::new("/host/base/logs/runner-a")).await
+    });
+    tokio::task::yield_now().await;
+    // 删了 20 毫秒：登记方等到许可释放
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(permit);
+
+    assert!(
+        waiting.await.unwrap().is_ok(),
+        "the creator proceeds once the deletion is done"
+    );
+}
+
+/// 许可只盖住它自己那一个目录：同一轮里别的候选不受影响
+#[tokio::test]
+async fn a_permit_covers_only_its_own_directory() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/runner-a")).unwrap();
+    std::fs::create_dir_all(tree.path("logs/runner-b")).unwrap();
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+
+    let _a = runtime
+        .begin_log_directory_reclaim(&tree.path("logs/runner-a"))
+        .await
+        .unwrap();
+    let _b = runtime
+        .begin_log_directory_reclaim(&tree.path("logs/runner-b"))
+        .await
+        .unwrap();
+
+    // 两个目录同时删：互不阻塞，也互不保护
+    assert!(
+        runtime
+            .begin_log_directory_reclaim(&tree.path("logs/runner-a"))
+            .await
+            .is_err(),
+        "the same directory cannot be reclaimed twice at once"
+    );
+}
+
+/// 候选换算不到宿主机：判不出来，许可被拒（和清单阶段的"无法确认"一致）
+#[tokio::test]
+async fn an_unmappable_candidate_is_refused_the_reclaim() {
+    let tree = Tree::new();
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+
+    let refused = runtime
+        .begin_log_directory_reclaim(Path::new("/elsewhere/runner-a"))
+        .await;
+
+    assert!(
+        matches!(refused, Err(ReclaimRefused::Unconfirmed(_))),
+        "{refused:?}"
+    );
+}
+
+/// 登记发生在清理器**取完清单之后**：这正是快照边界的形态，只有"先标记、后核对"才看得见。
+///
+/// 变异测试（把 `begin_reclaim` 改成只标记不核对）逃逸过一次，这个用例就是堵它的：登记晚于
+/// 清单，所以清单里没有它；删除之前的最后一次确认在标记之后读登记，才看得到。
+#[tokio::test]
+async fn a_claim_made_after_the_inventory_was_read_still_refuses_the_reclaim() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/runner-a")).unwrap();
+    // 清理器发清单请求的那一刻，创建方才登记这个旧目录。守卫留到测试结束
+    let claimed: Arc<Mutex<Option<PendingBinds>>> = Arc::new(Mutex::new(None));
+    let registered = Arc::clone(&claimed);
+    let daemon = fake_daemon_hooked(json!([]), move || {
+        let mut binds = PendingBinds::default();
+        binds.claim_blocking(Path::new("/host/base/logs/runner-a"));
+        *registered.lock().unwrap() = Some(binds);
+    })
+    .await;
+    let runtime = runtime(daemon.address, tree.resolver());
+    let reused = tree.path("logs/runner-a");
+
+    // 清单里没有它：登记发生在清单读之后
+    let mounts = runtime
+        .mounted_log_directories(std::slice::from_ref(&reused))
+        .await
+        .unwrap();
+    assert!(
+        mounts.mounted.is_empty(),
+        "the claim comes after the inventory, so the inventory does not see it"
+    );
+
+    // 删除之前的最后一次确认看得到
+    let refused = runtime.begin_log_directory_reclaim(&reused).await;
+
+    assert!(
+        matches!(refused, Err(ReclaimRefused::InUse(_))),
+        "a directory registered after the inventory must not be deleted: {refused:?}"
+    );
 }

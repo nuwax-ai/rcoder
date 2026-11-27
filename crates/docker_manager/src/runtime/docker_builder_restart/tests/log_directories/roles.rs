@@ -283,15 +283,16 @@ async fn data_under_the_log_root_is_registered_before_the_old_container_is_remov
     }
 }
 
-/// 取不到挂载表时读换源记录：判不出来不拦。记录里有一条名字不带 `container-logs` 的挂载
-/// （建替代容器的时候判它在日志根里，所以换了），续做照样认。
+/// 取不到挂载表时读换源记录：判不出来不拦。记录里有一条挂载点不带 `container-logs`、
+/// `CONTAINER_LOG_NAME` 也没记它的挂载——认它是因为它的源目录名就是日志目录名
+/// （`<容器名>-<时间戳>`，建替代容器的时候判它在日志根里，所以换了），续做照样认。
 #[cfg(not(feature = "deploy-host"))]
 #[tokio::test]
 async fn without_a_mount_table_a_recorded_swap_is_accepted_for_a_mount_without_a_log_name() {
     let mut restart = LoggedRestart::new();
-    let old_cache = restart.host_root().join("cache-old");
+    // 旧目录名就是日志目录名：归档里没有它的挂载点证据，认角色靠的是这个名字
+    let old_cache = new_log_directory(&restart, "rcoder-app-builder-265-20251026080000");
     std::fs::create_dir_all(&old_cache).unwrap();
-    let old_cache = old_cache.to_string_lossy().into_owned();
     restart
         .template
         .volumes
@@ -301,7 +302,7 @@ async fn without_a_mount_table_a_recorded_swap_is_accepted_for_a_mount_without_a
         .binds
         .push(format!("{old_cache}:/app/cache"));
     let fresh_log = new_log_directory(&restart, "rcoder-app-builder-265-20251026090000");
-    let fresh_cache = new_log_directory(&restart, "cache-new");
+    let fresh_cache = new_log_directory(&restart, "rcoder-app-builder-265-20251026091000");
     let daemon = scripted(vec![
         // 自检从 ping 开始；测试进程不在容器里，拿不到自己的容器 ID，等于取不到挂载表
         step("GET", "_ping", 200, json!("OK")),
@@ -348,5 +349,79 @@ async fn without_a_mount_table_a_recorded_swap_is_accepted_for_a_mount_without_a
     assert_eq!(
         replacement.expected_volumes,
         restart.expected_volumes(&[(LOG_TARGET, &fresh_log), ("/app/cache", &fresh_cache)])
+    );
+}
+
+/// 回归（Codex 第四轮 P1）：一条自定义的数据挂载落在日志根下面，源里有数据。只按源路径挑换源
+/// 对象的话，替代容器绑的是新建的空目录，数据就丢了。认角色：它不是日志目录（名字不带时间戳、
+/// 归档里也没有它的挂载点证据），永不换源——替代容器绑的还是原来那个目录，数据在。
+#[tokio::test]
+async fn a_custom_data_mount_under_the_log_root_keeps_its_directory() {
+    let mut restart = LoggedRestart::new();
+    let project_directory = restart.host_root().join("project");
+    std::fs::create_dir_all(&project_directory).unwrap();
+    std::fs::write(project_directory.join("keep.txt"), b"project data").unwrap();
+    let project = project_directory.to_string_lossy().into_owned();
+    restart
+        .template
+        .volumes
+        .push(host_path_volume("/mnt/project", &project));
+    restart.archive.binds.push(format!("{project}:/mnt/project"));
+    let seen_at_create = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen_at_create);
+    let daemon = scripted_with_hook(
+        creation_script(step("POST", "/containers/create", 200, created())),
+        Arc::new(move |request: &str| {
+            if request.starts_with("POST") && request.contains("/containers/create") {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .extend(crate::log_directory::pending_bind_sources());
+            }
+        }),
+    )
+    .await;
+
+    let replacement = restart.restore(&daemon).await.unwrap();
+
+    // 数据挂载原样重放：绑的还是原来那个目录
+    let binds = daemon.body(4)["HostConfig"]["Binds"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        binds.contains(&json!(format!("{project}:/mnt/project"))),
+        "the data mount must keep its source: {binds:?}"
+    );
+    // 换源记录里没有它
+    let recorded = daemon.body(4)["Labels"][RESTART_LOG_DIR]
+        .as_str()
+        .and_then(|label| serde_json::from_str::<Value>(label).ok());
+    assert!(
+        recorded
+            .as_ref()
+            .and_then(|label| label.get("/mnt/project"))
+            .is_none(),
+        "a data mount is never recorded as swapped: {recorded:?}"
+    );
+    assert!(
+        project_directory.join("keep.txt").is_file(),
+        "its data is untouched"
+    );
+    // 源登记到替代容器建出来
+    let seen = seen_at_create.lock().unwrap().clone();
+    assert!(
+        seen.contains(&PathBuf::from(&project)),
+        "the data mount is registered until the replacement exists: {seen:?}"
+    );
+    // 日志挂载照换
+    let fresh = restart
+        .host_root()
+        .join(restart.bound_log_name(&daemon, 4, LOG_TARGET))
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        replacement.expected_volumes,
+        restart.expected_volumes(&[(LOG_TARGET, &fresh)])
     );
 }

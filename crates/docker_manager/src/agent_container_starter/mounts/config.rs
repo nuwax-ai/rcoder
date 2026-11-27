@@ -176,7 +176,12 @@ pub(super) async fn add_config_mounts(
             resolved_container_path = resolve_container_path(&mount_variables);
         }
         if reclaimable || unclassified {
-            pending_binds.claim(Path::new(&resolved_host_path));
+            pending_binds
+                .claim(Path::new(&resolved_host_path))
+                .await
+                .map_err(|error| {
+                    DockerError::ContainerCreationError(error.to_string())
+                })?;
         }
 
         // 确保目录存在（仅对非只读挂载创建目录；日志域里的目录在上面已经新建）

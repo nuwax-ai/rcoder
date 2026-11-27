@@ -157,7 +157,9 @@ pub(super) async fn inject_workspace_mounts(
 
             let host_mount = workspace_host_path.join(&host_sub);
             if check_data_mount(admission, &container_mount, &host_mount).await? {
-                pending_binds.claim(&host_mount);
+                pending_binds.claim(&host_mount).await.map_err(|error| {
+                    DockerError::ContainerCreationError(error.to_string())
+                })?;
             }
 
             // 创建宿主机挂载目录。容器形态：经容器内路径创建（compose bind 双向
@@ -229,7 +231,9 @@ pub(super) async fn inject_workspace_mounts(
                     if check_data_mount(admission, std::path::Path::new(container_path), &hm)
                         .await?
                     {
-                        pending_binds.claim(&hm);
+                        pending_binds.claim(&hm).await.map_err(|error| {
+                            DockerError::ContainerCreationError(error.to_string())
+                        })?;
                     }
                     // 宿主目录预创建（rcoder 容器内经 bind 同步宿主; bind 源必须存在）
                     #[cfg(feature = "deploy-host")]

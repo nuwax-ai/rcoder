@@ -8,10 +8,11 @@
 //!
 //! - 归档里的一条 HostPath 挂载；
 //! - 不是持久数据（`/home/user` 下面的挂载永不换源）；
-//! - 旧目录的同级新目录：绝对路径、同一个上级、不是旧目录本身；
-//! - 不是"确定既不在可回收日志根里、又不是日志挂载"。判不出来不拦：这份记录是我们自己写在
-//!   带归档标记的替代容器上的，替代容器也已经绑着它记的目录；挂载表一时取不到就拒绝，续做
-//!   会一直卡在恢复里。
+//! - 是日志挂载（[`is_log_mount`]），和定换源计划时同一个判据；
+//! - 旧目录的同级新目录：绝对路径、同一个上级、不是旧目录本身。
+//!
+//! 这里不再问日志域（`LogDomainAdmission`）：角色认不出的挂载本来就不会被换源，记录里出现
+//! 它就是假的。认角色只看归档，不依赖挂载表——取不到挂载表就拒绝，续做会一直卡在恢复里。
 //!
 //! 没有这份记录的替代容器是旧版本建的，那时归档原样重放，它绑的就是归档里的目录。
 
@@ -26,7 +27,6 @@ use shared_types::{
 
 use super::log_directory::{is_log_mount, with_log_sources};
 use super::{Archive, DockerRuntime, RESTORE, conflict, inspect_absent};
-use crate::runtime::docker_runtime::host_path_space::{LogDomainAdmission, LogDomainVerdict};
 
 /// 替代容器拿到的日志目录（挂载点 → 宿主机路径的 JSON），记在它的 label 上
 pub(super) const RESTART_LOG_DIR: &str = "rcoder.io/restart-log-dir";
@@ -79,7 +79,6 @@ impl DockerRuntime {
         &self,
         template: &BuilderRestartTemplate,
         archive: &Archive,
-        admission: &LogDomainAdmission<'_>,
         existing: ContainerInspectResponse,
     ) -> Result<ResumedReplacement> {
         let labels = existing
@@ -97,7 +96,7 @@ impl DockerRuntime {
         // 没有换源记录的是旧版本建的，那时归档原样重放，它绑的就是归档里的目录
         let log_sources = match labels.get(RESTART_LOG_DIR) {
             None => HashMap::new(),
-            Some(label) => resumed_sources(label, template, archive, admission).await?,
+            Some(label) => resumed_sources(label, template, archive)?,
         };
         Ok(ResumedReplacement { id, log_sources })
     }
@@ -123,20 +122,18 @@ impl DockerRuntime {
             return Ok(None);
         };
         let archive = self.load_archive(template).await?;
-        let admission = self.log_domain().await;
         let resumed = self
-            .resumed_replacement(template, &archive, &admission, existing)
+            .resumed_replacement(template, &archive, existing)
             .await?;
         Ok(Some(resumed.witness(template)))
     }
 }
 
 /// 替代容器 label 里记的日志目录（挂载点 → 新目录），按记录自己核，见模块说明
-async fn resumed_sources(
+fn resumed_sources(
     label: &str,
     template: &BuilderRestartTemplate,
     archive: &Archive,
-    admission: &LogDomainAdmission<'_>,
 ) -> Result<HashMap<String, String>> {
     let sources: HashMap<String, String> = serde_json::from_str(label).map_err(|error| {
         conflict(format!(
@@ -159,14 +156,10 @@ async fn resumed_sources(
             )));
         }
         ensure_fresh_sibling(volume, source)?;
-        match admission.classify(name, &volume.uid).await {
-            LogDomainVerdict::Inside | LogDomainVerdict::Unknown(_) => {}
-            LogDomainVerdict::Outside if is_log_mount(name, archive) => {}
-            LogDomainVerdict::Outside => {
-                return Err(conflict(format!(
-                    "Restart target's log directory label names mount {name}, which is not a log mount"
-                )));
-            }
+        if !is_log_mount(name, &volume.uid, archive) {
+            return Err(conflict(format!(
+                "Restart target's log directory label names mount {name}, which is not a log mount"
+            )));
         }
     }
     Ok(sources)

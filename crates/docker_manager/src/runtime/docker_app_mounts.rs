@@ -26,7 +26,7 @@ use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
 
 use super::docker_runtime::DockerRuntime;
 use super::docker_runtime::host_path_space::{LogDomainAdmission, LogDomainVerdict, bind_source};
-use crate::log_directory::PendingBinds;
+use crate::log_directory::{DirectoryBeingReclaimed, PendingBinds};
 
 /// 组装 prod 四目录 bind 挂载（含宿主目录预创建）。
 ///
@@ -107,7 +107,10 @@ pub(super) async fn app_mount_guard(
     refuse_prod_mounts_in_log_domain(runtime, &sources, &targets).await?;
     let mut pending = PendingBinds::default();
     for source in sources {
-        pending.claim(&source);
+        pending
+            .claim(&source)
+            .await
+            .map_err(DirectoryBeingReclaimed::into_container_creation_error)?;
     }
     Ok(pending)
 }
