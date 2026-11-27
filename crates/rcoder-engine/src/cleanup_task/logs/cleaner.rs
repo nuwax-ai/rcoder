@@ -44,6 +44,11 @@
 //! 记一轮，连续 [`RECHECK_TIMEOUT_QUARANTINE_SWEEPS`] 轮之后就**隔离**：保留目录、告警、
 //! 不再参与后面的轮次，其余目录照常回收。预算本来就快用完时的超时只是没轮到它，不记。
 //!
+//! 初次扫描里也有同类的事：一个条目的 metadata（或删一个过期文件）一直不回来。只靠扫描的
+//! 总时限的话，每次扫描都卡在它身上、整次作废，回收要等扫描完成才开始，整棵日志树就不再
+//! 回收，每轮还多搭进去一个阻塞线程。所以单个条目也有时限（[`SCAN_ENTRY_TIMEOUT`]）：
+//! 超时就记一轮（和复查超时同一张表）、跳过它，继续扫后面的；连续几轮之后同样隔离。
+//!
 //! 超时记录带过期时间（[`RECHECK_TIMEOUT_MEMORY`]），不长期占着内存：隔离中的目录过了这段
 //! 时间，后面的日志清理会再试一次；文件系统恢复了它就被正常回收，仍然卡住就再隔离一轮。
 //! 隔离不触发重试，所以"再试一次"是下一次日志清理（默认一天之后）。
@@ -54,8 +59,9 @@
 //! # 扫描的时限
 //!
 //! 初次扫描整体限时（[`SCAN_TIMEOUT`]）：读目录、读每个条目的 metadata 都没有逐项的截止
-//! 时间，整个日志目录卡住时不设上限会把这个任务永远停在这里。时限只管扫描。已经发起的
-//! 目录删除照旧等到结束：中途放弃的话底层可能还在删，这个任务不能同时再起一轮。
+//! 时间。总时限只在日志根自身卡住时才会触发（读根目录的 metadata、列目录）：不设上限会
+//! 把这个任务永远停在这里。时限只管扫描，已经发起的目录删除照旧等到结束：中途放弃的话
+//! 底层可能还在删，这个任务不能同时再起一轮。单个条目卡住由逐项的时限处理，见下文。
 //!
 //! 一轮的统计见 [`LogCleanupStats`]。
 
@@ -112,6 +118,11 @@ const RECHECK_TIMEOUT_MAX_ENTRIES: u64 = 10_000;
 /// 初次扫描一轮的时间上限，见 [`LogCleaner::cleanup_once`]。正常一轮远用不了这么久
 const SCAN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+/// 初次扫描里读一个条目（或删一个过期文件）的时限。超过了就当它卡住：记一轮超时、跳过
+/// 它，继续扫后面的。被跳过的条目计入 [`LogCleanupStats::entries_stuck_in_scan`]，下一轮
+/// 清扫（不是下一个完整周期）会再试；连续 [`RECHECK_TIMEOUT_QUARANTINE_SWEEPS`] 轮之后隔离
+const SCAN_ENTRY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 日志清理器
 pub struct LogCleaner {
     /// 日志目录路径
@@ -128,6 +139,14 @@ pub struct LogCleaner {
     fair_recheck_window: Duration,
     /// 初次扫描一轮的时间上限，见 [`SCAN_TIMEOUT`]
     scan_timeout: Duration,
+    /// 初次扫描里读单个条目的时限，见 [`SCAN_ENTRY_TIMEOUT`]
+    scan_entry_timeout: Duration,
+    /// 测试用：让扫描卡在这几个条目上（读 metadata 一直不返回）
+    #[cfg(test)]
+    scan_stalled: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    /// 测试用：让删这几个过期文件一直不返回
+    #[cfg(test)]
+    removal_stalled: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     /// 每个候选连续复查超时的轮数，带过期时间。见模块说明"卡住的候选"
     recheck_timeouts: moka::sync::Cache<PathBuf, u32>,
     /// 让每一次目录删除都失败而不真的删除。测试用：验证失败的删除同样占用每轮的名额
@@ -165,6 +184,11 @@ impl LogCleaner {
             reclaim_batch: DIR_RECLAIM_BATCH,
             fair_recheck_window: FAIR_RECHECK_WINDOW,
             scan_timeout: SCAN_TIMEOUT,
+            scan_entry_timeout: SCAN_ENTRY_TIMEOUT,
+            #[cfg(test)]
+            scan_stalled: std::sync::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            removal_stalled: std::sync::Mutex::new(std::collections::HashSet::new()),
             recheck_timeouts: Self::recheck_timeouts(RECHECK_TIMEOUT_MEMORY),
             #[cfg(test)]
             fail_deletions: false,
@@ -221,6 +245,43 @@ impl LogCleaner {
         self.scan_timeout = timeout;
     }
 
+    /// 测试用：缩短扫描里单个条目的时限
+    #[cfg(test)]
+    pub(in crate::cleanup_task) fn set_scan_entry_timeout(&mut self, timeout: Duration) {
+        self.scan_entry_timeout = timeout;
+    }
+
+    /// 测试用：让扫描卡在 `path` 上——读它的 metadata 一直不返回
+    #[cfg(test)]
+    pub(in crate::cleanup_task) fn stall_scan_of(&self, path: &Path) {
+        self.scan_stalled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf());
+    }
+
+    /// 测试用：让删过期文件 `path` 一直不返回
+    #[cfg(test)]
+    pub(in crate::cleanup_task) fn stall_scan_removal_of(&self, path: &Path) {
+        self.removal_stalled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf());
+    }
+
+    /// 测试用：文件系统恢复，扫描和删除不再卡住
+    #[cfg(test)]
+    pub(in crate::cleanup_task) fn unstall_scan(&self) {
+        self.scan_stalled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.removal_stalled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// 测试用：发起目录删除之前先等 `delay`，模拟很慢的删除
     #[cfg(test)]
     pub(in crate::cleanup_task) fn set_delete_delay(&self, delay: Duration) {
@@ -274,9 +335,9 @@ impl LogCleaner {
             .as_secs();
         let cutoff_time = cutoff_time.saturating_sub(self.retention_duration.as_secs());
 
-        // 扫描整体限时：读目录、读每个条目的 metadata 都没有逐项的截止时间，整个日志目录
-        // 卡住时不设上限会把清扫任务一起停掉。只管扫描——已经发起的目录删除在
-        // reclaim_expired_dirs 里，照旧等到它结束（见那里的说明）
+        // 扫描整体限时：日志根自身卡住（读根目录的 metadata、列目录）时不设上限会把清扫任务
+        // 一起停掉。单个条目卡住由 SCAN_ENTRY_TIMEOUT 处理，见 inspect_entry。只管扫描——
+        // 已经发起的目录删除在 reclaim_expired_dirs 里，照旧等到它结束（见那里的说明）
         let scanned = tokio::time::timeout(self.scan_timeout, async {
         match fs::metadata(log_path).await {
             Ok(metadata) if metadata.is_dir() => {}
@@ -318,19 +379,16 @@ impl LogCleaner {
                 quarantined.push(path);
                 continue;
             }
-            #[cfg(test)]
-            {
-                let delay_ms = self.scan_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
-                if delay_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-            }
-            let metadata = match entry.metadata().await {
-                Ok(m) => m,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
+            let metadata = match self.inspect_entry(&entry).await {
+                Ok(Ok(m)) => m,
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(Err(e)) => {
                     stats.entry_inspection_errors += 1;
                     debug!("[log_cleaner] get file failed: {:?} - {}", path, e);
+                    continue;
+                }
+                Err(_elapsed) => {
+                    self.note_scan_stuck(&path, &mut stats);
                     continue;
                 }
             };
@@ -360,8 +418,8 @@ impl LogCleaner {
                     // 删除过期文件
                     let file_size = metadata.len();
 
-                    match fs::remove_file(&path).await {
-                        Ok(_) => {
+                    match self.remove_expired_file(&path).await {
+                        Ok(Ok(_)) => {
                             stats.files_deleted += 1;
                             stats.bytes_freed += file_size;
                             debug!(
@@ -370,10 +428,11 @@ impl LogCleaner {
                                 file_size as f64 / 1024.0 / 1024.0
                             );
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             stats.failed_deletions += 1;
                             warn!("[log_cleaner] Failed to delete file: {:?} - {}", path, e);
                         }
+                        Err(_elapsed) => self.note_scan_stuck(&path, &mut stats),
                     }
                 } else if metadata.is_dir() {
                     expired_dirs.push(path);
@@ -567,6 +626,67 @@ impl LogCleaner {
                     warn!(?path, %error, "[log_cleaner] Failed to delete directory");
                 }
             }
+        }
+    }
+
+    /// 读一个条目的 metadata，带逐项的时限。测试里先等 `scan_delay`，并且卡在登记过的条目上
+    async fn inspect_entry(
+        &self,
+        entry: &fs::DirEntry,
+    ) -> Result<std::io::Result<std::fs::Metadata>, tokio::time::error::Elapsed> {
+        tokio::time::timeout(self.scan_entry_timeout, async {
+            #[cfg(test)]
+            {
+                let delay_ms = self.scan_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                if self
+                    .scan_stalled
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&entry.path())
+                {
+                    std::future::pending::<()>().await;
+                }
+            }
+            entry.metadata().await
+        })
+        .await
+    }
+
+    /// 删一个过期文件，带逐项的时限
+    async fn remove_expired_file(
+        &self,
+        path: &Path,
+    ) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
+        tokio::time::timeout(self.scan_entry_timeout, async {
+            #[cfg(test)]
+            if self
+                .removal_stalled
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(path)
+            {
+                std::future::pending::<()>().await;
+            }
+            fs::remove_file(path).await
+        })
+        .await
+    }
+
+    /// 初次扫描里一个条目一直读不回来（或删不回来）：记一轮超时（和复查超时同一张表），
+    /// 本轮跳过它
+    fn note_scan_stuck(&self, path: &Path, stats: &mut LogCleanupStats) {
+        stats.entries_stuck_in_scan += 1;
+        stats.note_deferred(Some(path));
+        if let Some(sweeps) = self.note_recheck_timeout(path) {
+            warn!(
+                path = %path.display(),
+                sweeps,
+                "[log_cleaner] Reading this entry of the log directory timed out on {} consecutive sweeps; keeping it and quarantining it until its timeout record expires",
+                sweeps
+            );
         }
     }
 

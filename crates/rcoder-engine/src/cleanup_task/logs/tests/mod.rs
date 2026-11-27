@@ -1,12 +1,13 @@
 //! 日志清理器的单元测试：用临时目录和假的挂载判定，不依赖 Docker / K8s。
 //!
-//! 按主题分在几个文件里：预算与批次、挂载判定、保留期、卡住候选的隔离、统计摘要；这里是最
-//! 基本的几个。夹具在 [`super::testing`]。
+//! 按主题分在几个文件里：预算与批次、挂载判定、保留期、卡住候选的隔离、扫描里卡住的条目、
+//! 统计摘要；这里是最基本的几个。夹具在 [`super::testing`]。
 
 mod budget;
 mod mounts;
 mod quarantine;
 mod retention;
+mod scan;
 mod stats;
 
 use std::path::{Path, PathBuf};

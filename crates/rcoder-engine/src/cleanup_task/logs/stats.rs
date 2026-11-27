@@ -27,6 +27,9 @@ pub struct LogCleanupStats {
     pub recheck_errors: u64,
     /// 初次扫描时无法读取条目或修改时间的数量
     pub entry_inspection_errors: u64,
+    /// 初次扫描时读不回来（卡住）而跳过的条目数量（需要关注）。连续几轮后会隔离；下一轮
+    /// 清扫会再试
+    pub entries_stuck_in_scan: u64,
     /// 连续复查超时而被隔离、本轮不再处理的目录数量（需要关注）
     pub dirs_quarantined: u64,
     /// 本轮第一个被顺延的目录（预算用完，或复查超时），告警时用来定位
@@ -38,6 +41,7 @@ impl LogCleanupStats {
         self.dirs_skipped_unconfirmed > 0
             || self.failed_deletions > 0
             || self.entry_inspection_errors > 0
+            || self.entries_stuck_in_scan > 0
             || self.dirs_quarantined > 0
     }
 
@@ -51,7 +55,7 @@ impl LogCleanupStats {
     }
 
     /// 这一轮有没有"本该做完却没做完"、值得下一轮清扫接着做的事：清单拿不到、复查出错、
-    /// 删除失败、条目读取失败、批次或时间预算顺延。
+    /// 删除失败、条目读取失败或卡在扫描里、批次或时间预算顺延。
     ///
     /// 不含"挂载源无法确认指向哪里"和"目录在扫描后变了"：前者是持续状态（只要那个容器还在，
     /// 每轮都会得到同样的结论，重试不会变得可确认），后者是正常竞态。它们只计数、照常保留，
@@ -61,6 +65,7 @@ impl LogCleanupStats {
             || self.recheck_errors > 0
             || self.failed_deletions > 0
             || self.entry_inspection_errors > 0
+            || self.entries_stuck_in_scan > 0
             || self.dirs_deferred_by_budget > 0
     }
 
@@ -105,6 +110,12 @@ impl LogCleanupStats {
                 parts.push(format!(
                     "uninspected: {} entries",
                     self.entry_inspection_errors
+                ));
+            }
+            if self.entries_stuck_in_scan > 0 {
+                parts.push(format!(
+                    "stuck in scan: {} entries",
+                    self.entries_stuck_in_scan
                 ));
             }
             if self.dirs_quarantined > 0 {
