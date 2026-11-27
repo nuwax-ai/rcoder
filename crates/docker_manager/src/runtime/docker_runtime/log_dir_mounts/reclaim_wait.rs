@@ -20,7 +20,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{LocalFileSystem, Location, LogDirMount, RealLocations, classify, observe};
+use super::{LocalFileSystem, LogDirMount, classify, observe};
 use crate::log_directory::{DirectoryBeingReclaimed, reclaim_marks, reclaim_released};
 use crate::runtime::docker_runtime::host_path_space::HostPathSpace;
 
@@ -88,7 +88,8 @@ pub(crate) async fn wait_while_reclaiming(
         if tokio::time::Instant::now() >= deadline {
             return Err(DirectoryBeingReclaimed::conflict(reclaiming));
         }
-        let _ = tokio::time::timeout(RECLAIM_POLL_INTERVAL, reclaim_released()).await;
+        let poll_at = (tokio::time::Instant::now() + RECLAIM_POLL_INTERVAL).min(deadline);
+        let _ = tokio::time::timeout_at(poll_at, reclaim_released()).await;
     }
 }
 
@@ -97,7 +98,7 @@ async fn first_reclaim_holding(claim: &Path, space: Option<&HostPathSpace<'_>>) 
     for (host, process) in reclaim_marks() {
         let holds = match space {
             None => true,
-            Some(space) => holds_bind(space, &host, &process, claim).await != Some(false),
+            Some(space) => holds_bind(space, &process, claim).await,
         };
         if holds {
             return Some(host);
@@ -106,52 +107,12 @@ async fn first_reclaim_holding(claim: &Path, space: Option<&HostPathSpace<'_>>) 
     None
 }
 
-/// `directory`（RCoder 进程里的路径，宿主机写法是 `host`）自己就是 `bind`（宿主机路径）指向的
-/// 目录，或者装得下它——包括 `bind` 还没建出来的情形。`None` 是判不出来
-async fn holds_bind(
-    space: &HostPathSpace<'_>,
-    host: &Path,
-    directory: &Path,
-    bind: &Path,
-) -> Option<bool> {
+/// The same pending-bind observation is used before granting a reclaim permit
+/// and when a creator finds a permit already held. An unknown match must wait.
+async fn holds_bind(space: &HostPathSpace<'_>, directory: &Path, bind: &Path) -> bool {
     let fs = LocalFileSystem;
-    let observations = observe(space, std::slice::from_ref(&bind.to_path_buf()), &fs).await;
-    match classify(directory, space, &observations, &fs).await {
-        LogDirMount::Mounted => return Some(true),
-        LogDirMount::Unconfirmed(_) => return None,
-        LogDirMount::Unmounted => {}
-    }
-    // 到这里 `bind` 和被删目录不相干——除非它还不存在，没有身份可比。创建方常常是先登记、稍后
-    // 才在下面建目录，那时看它会建在哪一级已存在的祖先下面
-    let mut locations = RealLocations::new(space, &fs);
-    let absent = match locations.locate(bind).await {
-        Ok(Location::Absent { path }) => path,
-        // 已经在了，或者中间有一级是文件、或者整条路径在 RCoder 的挂载之外：上面的判定说了不算，就是不算
-        Ok(_) => return Some(false),
-        Err(_) => return None,
-    };
-    let marked = crate::normalize_path(&locations.real_location(host).await.ok()?);
-    for ancestor in absent.ancestors().skip(1) {
-        match locations.locate(ancestor).await {
-            // 最近一级已存在的目录：`bind` 将来就建在它下面
-            Ok(Location::Present {
-                path: real,
-                directory: true,
-            }) => {
-                return Some(crate::normalize_path(&real).starts_with(&marked));
-            }
-            Ok(Location::Absent { .. }) => continue,
-            // 中间有一级是文件：这下面建不出目录来
-            Ok(Location::Present {
-                directory: false, ..
-            }) => return Some(false),
-            // 整条路径都在 RCoder 的挂载之外：被删目录在挂载之内，装不下它
-            Ok(Location::Outside) => return Some(false),
-            Ok(Location::Unconfirmed(_)) | Err(_) => return None,
-        }
-    }
-    // 走到根为止一定有一级存在，到不了这里；真到了就是判不出来
-    None
+    let observations = observe(space, &[], &[bind.to_path_buf()], &fs).await;
+    classify(directory, space, &observations, &fs).await != LogDirMount::Unmounted
 }
 
 /// 探测超时的时候报错点名哪个目录：不知道卡在哪一个标记上，取第一个；一个标记都没有就报

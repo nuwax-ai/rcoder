@@ -25,9 +25,8 @@ pub(crate) use log_domain::{
 };
 #[cfg(test)]
 pub(super) use real_location::Entry;
-pub(super) use real_location::{
-    DirectoryId, FileSystemView, LocalFileSystem, Location, RealLocations, is_absent,
-};
+pub(super) use real_location::{DirectoryId, FileSystemView, is_absent};
+pub(in crate::runtime) use real_location::{LocalFileSystem, Location, RealLocations};
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

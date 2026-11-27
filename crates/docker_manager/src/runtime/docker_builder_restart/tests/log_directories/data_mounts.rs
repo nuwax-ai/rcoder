@@ -12,6 +12,7 @@ async fn a_workspace_under_the_log_root_keeps_its_directory() {
     restart.move_workspace_under_log_root();
     std::fs::write(restart.workspace.path().join("keep"), b"data").unwrap();
     let workspace = restart.workspace.path().to_string_lossy().into_owned();
+    restart.expose_bind_source(&workspace);
     let seen_at_create = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&seen_at_create);
     let daemon = scripted_with_hook(
@@ -77,6 +78,7 @@ async fn data_under_the_log_root_is_registered_before_the_old_container_is_remov
         .volumes
         .sort_by(|a, b| (&a.name, &a.uid).cmp(&(&b.name, &b.uid)));
     let workspace = restart.workspace.path().to_string_lossy().into_owned();
+    restart.expose_bind_source(&workspace);
     crate::runtime::docker_compute_receipt::save_stop(&restart.template.source)
         .await
         .unwrap();
@@ -148,6 +150,7 @@ async fn a_data_directory_keeps_its_source(recorded: bool) {
     let mut restart = LoggedRestart::new();
     let project_directory = restart.host_root().join("customer-data-20251026080000");
     std::fs::create_dir_all(&project_directory).unwrap();
+    restart.expose_bind_source(project_directory.to_str().unwrap());
     std::fs::write(project_directory.join("keep.txt"), b"project data").unwrap();
     let project = project_directory.to_string_lossy().into_owned();
     restart
@@ -231,6 +234,7 @@ async fn a_data_mount_whose_target_mentions_container_logs_is_not_a_log_mount() 
     restart.archive.log_mounts = None;
     let backup_directory = restart.host_root().join("project");
     std::fs::create_dir_all(&backup_directory).unwrap();
+    restart.expose_bind_source(backup_directory.to_str().unwrap());
     std::fs::write(backup_directory.join("keep.txt"), b"backup").unwrap();
     let backup = backup_directory.to_string_lossy().into_owned();
     restart
@@ -283,6 +287,7 @@ async fn a_bind_whose_source_differs_from_the_record_is_not_a_log_mount() {
     // 记录说的是 `old_directory`；归档里实际绑的是另一个带数据的目录
     let replaced_directory = restart.host_root().join("project");
     std::fs::create_dir_all(&replaced_directory).unwrap();
+    restart.expose_bind_source(replaced_directory.to_str().unwrap());
     std::fs::write(replaced_directory.join("keep.txt"), b"data").unwrap();
     let replaced = replaced_directory.to_string_lossy().into_owned();
     for volume in &mut restart.template.volumes {

@@ -237,30 +237,40 @@ struct MountObservations {
 
 async fn observe(
     space: &HostPathSpace<'_>,
-    sources: &[PathBuf],
+    mounted_sources: &[PathBuf],
+    pending_sources: &[PathBuf],
     fs: &dyn FileSystemView,
 ) -> MountObservations {
     let mut observations = MountObservations {
-        registered: with_ancestors(sources.iter().cloned()),
+        registered: with_ancestors(mounted_sources.iter().chain(pending_sources).cloned()),
         mounted: HashSet::new(),
         unidentifiable: None,
     };
     let mut locations = RealLocations::new(space, fs);
     let mut identities = HashMap::new();
-    for source in sources {
-        let unconfirmed = match locations.locate(source).await {
-            Err(error) => Some(format!(
+    let sources = pending_sources
+        .iter()
+        .map(|source| (source, true))
+        .chain(mounted_sources.iter().map(|source| (source, false)));
+    for (source, pending) in sources {
+        let start = match locations.locate(source).await {
+            Err(error) => Err(format!(
                 "mount source {} cannot be identified from inside RCoder: {error}",
                 source.display()
             )),
-            Ok(Location::Unconfirmed(reason)) => Some(reason),
-            Ok(Location::Absent { .. } | Location::Outside) => None,
-            Ok(Location::Present { path, directory }) => {
-                let start = if directory {
-                    path
-                } else {
-                    path.parent().map(Path::to_path_buf).unwrap_or(path)
-                };
+            Ok(Location::Unconfirmed(reason)) => Err(reason),
+            Ok(Location::Absent { path }) if pending => {
+                pending_directory_ancestor(&mut locations, &path).await
+            }
+            Ok(Location::Absent { .. } | Location::Outside) => Ok(None),
+            Ok(Location::Present { path, directory }) => Ok(Some(if directory {
+                path
+            } else {
+                path.parent().map(Path::to_path_buf).unwrap_or(path)
+            })),
+        };
+        let occupied = match start {
+            Ok(Some(start)) => {
                 occupy_ancestors(
                     space,
                     fs,
@@ -269,15 +279,49 @@ async fn observe(
                     &mut observations.mounted,
                 )
                 .await
-                .err()
             }
+            Ok(None) => Ok(()),
+            Err(reason) => Err(reason),
         };
-        if let Some(reason) = unconfirmed {
+        if let Err(reason) = occupied {
             observations.unidentifiable = Some(reason);
             break;
         }
     }
     observations
+}
+
+/// A pending bind can create a missing source before Docker sees it. Protect
+/// its existing directory ancestors by identity, even across different views.
+async fn pending_directory_ancestor(
+    locations: &mut RealLocations<'_>,
+    source: &Path,
+) -> Result<Option<PathBuf>, String> {
+    for ancestor in source.ancestors().skip(1) {
+        match locations.locate(ancestor).await {
+            Ok(Location::Present {
+                path,
+                directory: true,
+            }) => return Ok(Some(path)),
+            Ok(Location::Absent { .. }) => continue,
+            // A file cannot acquire children. An ancestor outside every
+            // view has no directory identity we can compare.
+            Ok(
+                Location::Present {
+                    directory: false, ..
+                }
+                | Location::Outside,
+            ) => return Ok(None),
+            Ok(Location::Unconfirmed(reason)) => return Err(reason),
+            Err(error) => {
+                return Err(format!(
+                    "the ancestor {} of a pending mount cannot be identified: {error}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// 一个候选日志目录的判定，规则见模块说明
@@ -346,21 +390,17 @@ pub(super) async fn mounted_log_directories(
     // 一个目录要么此刻登记着，要么注销时容器已经登记进 Docker、会出现在之后取的清单里。反过来
     // 先取清单再读登记会两头落空
     let registry = crate::log_directory::registry_view();
-    let sources: Vec<PathBuf> = registry
-        .sources
+    let mounted_sources: Vec<PathBuf> = runtime
+        .inner
+        .mounted_host_paths()
+        .await
+        .map_err(list_error)?
         .into_iter()
-        .chain(
-            runtime
-                .inner
-                .mounted_host_paths()
-                .await
-                .map_err(list_error)?,
-        )
         .collect();
 
     let space = path_space(&runtime.inner, &runtime.log_path_resolver).await?;
     let fs = LocalFileSystem;
-    let observations = Arc::new(observe(&space, &sources, &fs).await);
+    let observations = Arc::new(observe(&space, &mounted_sources, &registry.sources, &fs).await);
     runtime.remember_log_directory_view(registry.generation, Arc::clone(&observations));
 
     let mut mounts = LogDirectoryMounts::default();
@@ -408,15 +448,17 @@ pub(super) async fn begin_reclaim(
     let observations = match still_current {
         Some(observations) => observations,
         None => {
-            let fresh = runtime
+            let mounted_sources: Vec<PathBuf> = runtime
                 .inner
                 .mounted_host_paths()
                 .await
-                .map_err(|error| ReclaimRefused::Unconfirmed(list_error(error).to_string()))?;
-            let mut sources = registry.sources;
-            sources.extend(crate::log_directory::unresolved_sources());
-            sources.extend(fresh);
-            let observations = Arc::new(observe(&space, &sources, &fs).await);
+                .map_err(|error| ReclaimRefused::Unconfirmed(list_error(error).to_string()))?
+                .into_iter()
+                .collect();
+            let mut pending_sources = registry.sources;
+            pending_sources.extend(crate::log_directory::unresolved_sources());
+            let observations =
+                Arc::new(observe(&space, &mounted_sources, &pending_sources, &fs).await);
             runtime.remember_log_directory_view(registry.generation, Arc::clone(&observations));
             observations
         }

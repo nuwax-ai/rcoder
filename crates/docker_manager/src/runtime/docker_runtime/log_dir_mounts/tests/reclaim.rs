@@ -325,3 +325,32 @@ async fn an_unmappable_candidate_is_refused_the_reclaim() {
         "{refused:?}"
     );
 }
+
+#[tokio::test]
+async fn a_claim_on_an_absent_aliased_child_blocks_a_later_reclaim() {
+    use crate::runtime::docker_runtime::host_path_space::HostPathSpace;
+    let tree = Tree::new();
+    let candidate = tree.path("logs/runner-a");
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+    let resolver = tree.resolver();
+    let space = HostPathSpace::Container(&resolver);
+    let initial = runtime
+        .mounted_log_directories(std::slice::from_ref(&candidate))
+        .await
+        .unwrap();
+    assert!(initial.mounted.is_empty());
+    let mut claimed = PendingBinds::default();
+    claimed
+        .claim(
+            Path::new("/host/base/alias/runner-a/not-created"),
+            Some(&space),
+        )
+        .await
+        .unwrap();
+    let result = runtime.begin_log_directory_reclaim(&candidate).await;
+    assert!(
+        result.is_err(),
+        "the deletion permit ignores a previous live claim for an absent descendant reached through a known symlink: {result:?}"
+    );
+}

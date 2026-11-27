@@ -41,6 +41,7 @@ async fn a_legacy_archive_is_recognised_by_the_log_env_it_was_created_with() {
 #[tokio::test]
 async fn a_legacy_archive_without_any_evidence_keeps_its_log_bind() {
     let restart = LoggedRestart::new();
+    restart.expose_bind_source(&restart.old_directory);
     let mut archive = restart.archive.clone();
     archive.log_mounts = None;
     archive.env[0] = "CONTAINER_LOGS_DIR=/app/container-logs/{timestamp}".into();
@@ -97,6 +98,7 @@ async fn a_legacy_archive_without_any_evidence_keeps_its_log_bind() {
 #[tokio::test]
 async fn an_explicitly_empty_record_disables_the_log_env_fallback() {
     let mut restart = LoggedRestart::new();
+    restart.expose_bind_source(&restart.old_directory);
     restart.archive.log_mounts = Some(Vec::new());
     let seen_at_create = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&seen_at_create);
@@ -152,6 +154,7 @@ async fn a_same_named_data_directory_in_a_legacy_archive_is_not_mistaken_for_the
     restart.archive.log_mounts = None;
     let data_directory = restart.host_root().join("project").join(&restart.old_name);
     std::fs::create_dir_all(&data_directory).unwrap();
+    restart.expose_bind_source(data_directory.to_str().unwrap());
     std::fs::write(data_directory.join("keep.txt"), b"project data").unwrap();
     let data = data_directory.to_string_lossy().into_owned();
     restart
@@ -221,6 +224,7 @@ async fn a_legacy_log_mount_whose_directory_has_another_name_is_kept() {
     restart.archive.log_mounts = None;
     let old_style_directory = restart.host_root().join("project-logs");
     std::fs::create_dir_all(&old_style_directory).unwrap();
+    restart.expose_bind_source(old_style_directory.to_str().unwrap());
     let old_style = old_style_directory.to_string_lossy().into_owned();
     for volume in &mut restart.template.volumes {
         if volume.name == LOG_TARGET {

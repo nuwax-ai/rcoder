@@ -26,6 +26,7 @@ async fn a_log_mount_outside_the_log_root_keeps_its_directory() {
         .join(&restart.old_name)
         .to_string_lossy()
         .into_owned();
+    restart.expose_bind_source(&old_directory);
     for volume in &mut restart.template.volumes {
         if volume.name == LOG_TARGET {
             volume.uid = old_directory.clone();
@@ -365,4 +366,65 @@ async fn without_a_mount_table_a_swap_of_an_unrecorded_mount_is_refused() {
         "{result:?}"
     );
     daemon.assert_followed(3);
+}
+
+#[tokio::test]
+async fn an_outside_log_visible_through_the_mount_table_can_be_replayed_in_compose() {
+    use crate::runtime::docker_runtime::host_path_space::{LogDomainVerdict, viewing};
+    let mut restart = LoggedRestart::new();
+    let daemon_source = restart
+        .root
+        .path()
+        .join("host/other")
+        .join(&restart.old_name);
+    let process_source = restart
+        .root
+        .path()
+        .join("visible/logs/other")
+        .join(&restart.old_name);
+    std::fs::create_dir_all(&process_source).unwrap();
+    std::fs::write(process_source.join("previous.log"), b"kept").unwrap();
+    assert!(
+        !daemon_source.exists(),
+        "the host's pathname must not be present in the RCoder container"
+    );
+    let old = daemon_source.to_str().unwrap();
+    restart
+        .template
+        .volumes
+        .iter_mut()
+        .find(|volume| volume.name == LOG_TARGET)
+        .unwrap()
+        .uid = old.to_owned();
+    restart.archive.binds[0] = format!("{old}:{LOG_TARGET}:rw,z");
+    restart.re_record(LOG_TARGET, old);
+    let daemon = scripted(creation_script(step(
+        "POST",
+        "/containers/create",
+        200,
+        created(),
+    )))
+    .await;
+    let runtime = restart.runtime(daemon.address);
+    let admission = runtime.log_domain().await;
+    assert_eq!(
+        admission.classify(LOG_TARGET, old).await,
+        LogDomainVerdict::Outside
+    );
+    assert_eq!(
+        viewing(admission.space().unwrap(), &daemon_source)
+            .visible_path()
+            .as_deref(),
+        Some(process_source.as_path())
+    );
+    restart
+        .restore(&daemon)
+        .await
+        .expect("the archived log still exists through RCoder's mount table");
+    assert!(
+        daemon.body(4)["HostConfig"]["Binds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(format!("{old}:{LOG_TARGET}:rw,z")))
+    );
 }

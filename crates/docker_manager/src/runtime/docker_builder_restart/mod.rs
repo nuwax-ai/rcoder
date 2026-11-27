@@ -17,9 +17,12 @@
 //!
 //! The log mount is the one bind that is not replayed verbatim: the replacement
 //! gets a new log directory instead, see [`log_directory`].
-use super::docker_runtime::DockerRuntime;
+use super::docker_runtime::{
+    DockerRuntime,
+    host_path_space::{HostPathSpace, LocalFileSystem, Location, RealLocations},
+};
 use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
-use log_directory::{FreshLogDirectories, plan, replacement_log_mounts};
+use log_directory::{FreshLogDirectories, LogBinds, plan, replacement_log_mounts};
 use log_label::{LOG_MOUNTS_LABEL, RESTART_LOG_DIR};
 
 use crate::log_directory::{
@@ -257,30 +260,71 @@ async fn read_archive(path: PathBuf) -> Result<Option<Vec<u8>>> {
     .map_err(|error| fail(format!("Archive reader worker: {error}")))?
 }
 
-/// Bind witnesses record the daemon-reported HOST path, but this process may
-/// itself run in a container where that path is mounted elsewhere. Rewrite
-/// through the stable `userapp-workspace` anchor onto this process's own
-/// workspace root; fall back to the raw path (host-side rcoder).
-fn bind_source_exists(host_path: &str) -> Result<bool> {
-    let raw = std::path::Path::new(host_path);
-    if raw.is_dir() {
-        return Ok(true);
+/// Check the daemon's bind source through the same mount view used to plan
+/// the restart. Retained binds must exist: legacy Docker Binds can otherwise
+/// create an empty directory in place of missing app data.
+async fn verify_replayed_bind_sources(
+    template: &BuilderRestartTemplate,
+    binds: &LogBinds<'_>,
+    space: Option<&HostPathSpace<'_>>,
+) -> Result<()> {
+    let mut locations = space.map(|space| RealLocations::new(space, &LocalFileSystem));
+    for volume in &template.volumes {
+        if binds.plans.iter().any(|plan| plan.volume() == volume) {
+            continue;
+        }
+        let source = std::path::Path::new(&volume.uid);
+        let exists = match &mut locations {
+            Some(locations) => match locations.locate(source).await {
+                Ok(Location::Present { directory, .. }) => directory,
+                Ok(Location::Absent { .. }) => false,
+                Ok(Location::Outside) => legacy_bind_source_exists(source).await,
+                Ok(Location::Unconfirmed(reason)) => {
+                    return Err(conflict(format!(
+                        "Cannot confirm restart bind source {}: {reason}",
+                        source.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(fail(format!(
+                        "Inspect restart bind source {}: {error}",
+                        source.display()
+                    )));
+                }
+            },
+            None => legacy_bind_source_exists(source).await,
+        };
+        if !exists {
+            return Err(conflict(format!(
+                "Restart bind source is missing: {}",
+                source.display()
+            )));
+        }
     }
-    let components: Vec<std::ffi::OsString> = raw
+    Ok(())
+}
+
+/// Older layouts can expose a bind directly or through the workspace anchor
+/// when the runtime cannot project that source from its mount table.
+async fn legacy_bind_source_exists(source: &std::path::Path) -> bool {
+    if tokio::fs::metadata(source).await.is_ok_and(|m| m.is_dir()) {
+        return true;
+    }
+    let components: Vec<_> = source
         .components()
-        .map(|component| component.as_os_str().to_os_string())
+        .map(|component| component.as_os_str())
         .collect();
     let Some(anchor) = components
         .iter()
-        .position(|component| component == "userapp-workspace")
+        .position(|component| *component == "userapp-workspace")
     else {
-        return Ok(false);
+        return false;
     };
     let mut visible = PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
     for component in &components[anchor + 1..] {
         visible.push(component);
     }
-    Ok(visible.is_dir())
+    tokio::fs::metadata(visible).await.is_ok_and(|m| m.is_dir())
 }
 
 fn inspect_absent(
@@ -663,6 +707,7 @@ impl DockerRuntime {
                     "Original builder stop or volume identity is not confirmed",
                 ));
             }
+            verify_replayed_bind_sources(template, &binds, admission.space()).await?;
             let image = archive
                 .source
                 .restart_image
@@ -713,19 +758,7 @@ impl DockerRuntime {
                 expected_volumes,
             });
         }
-        // 先定下要换哪些日志目录，再核对其它 bind 源：核对不过就不建
-        for volume in &template.volumes {
-            // 日志目录换成新建的，旧的可能早已被清理器回收，不要求它还在
-            if binds.plans.iter().any(|plan| plan.volume() == volume) {
-                continue;
-            }
-            if !bind_source_exists(&volume.uid)? {
-                return Err(conflict(format!(
-                    "Restart bind source is missing: {}",
-                    volume.uid
-                )));
-            }
-        }
+        verify_replayed_bind_sources(template, &binds, admission.space()).await?;
         let image = archive
             .source
             .restart_image

@@ -190,7 +190,7 @@ impl Tree {
         fs: &dyn FileSystemView,
     ) -> LogDirMount {
         let sources: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
-        let observations = observe(space, &sources, fs).await;
+        let observations = observe(space, &sources, &[], fs).await;
         classify(candidate, space, &observations, fs).await
     }
 }

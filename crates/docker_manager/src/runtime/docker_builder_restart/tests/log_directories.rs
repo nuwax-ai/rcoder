@@ -116,6 +116,15 @@ impl LoggedRestart {
         self.root.path().join("host/container")
     }
 
+    /// The fixture has separate host and process trees in place of a real bind
+    /// mount. Make an existing host directory visible in the process tree.
+    fn expose_bind_source(&self, host: &str) {
+        let host = std::path::Path::new(host);
+        assert!(host.is_dir());
+        let relative = host.strip_prefix(self.root.path().join("host")).unwrap();
+        std::fs::create_dir_all(self.root.path().join("visible/logs").join(relative)).unwrap();
+    }
+
     /// 日志根的配置盖住了工作区（旧容器、改过日志根的部署）：把工作区挪到宿主机那棵日志树
     /// 下面，归档里记的也跟着换
     fn move_workspace_under_log_root(&mut self) {

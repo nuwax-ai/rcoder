@@ -79,6 +79,7 @@ async fn an_empty_record_survives_the_capture_and_still_disables_the_log_env_fal
         std::env::set_var("RCODER_OPERATION_RECEIPT_ROOT", receipts.path());
     }
     let restart = LoggedRestart::new();
+    restart.expose_bind_source(&restart.old_directory);
     let template = &restart.template;
     let workspace = restart.workspace.path().to_string_lossy().into_owned();
     let mut inspect = inspectable(

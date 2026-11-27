@@ -340,3 +340,37 @@ async fn without_a_path_space_a_claim_waits_for_every_deletion() {
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn missing_child_of_the_same_physical_directory_via_another_mount_waits() {
+    bound_the_wait();
+    let tree = Tree::new();
+    let direct = tree.path("logs");
+    let mirrored_parent = tree.path("mirrored-parent");
+    std::os::unix::fs::symlink(&tree.base, &mirrored_parent).unwrap();
+    let mirror = mirrored_parent.join("logs");
+    assert_eq!(
+        direct.canonicalize().unwrap(),
+        mirror.canonicalize().unwrap()
+    );
+    let resolver = HostPathResolver::from_mount_table(vec![
+        (direct.clone(), PathBuf::from("/host/actual")),
+        (mirror, PathBuf::from("/host/another-mount")),
+    ])
+    .unwrap();
+    let space = HostPathSpace::Container(&resolver);
+    let deleted = "/host/actual/runner-a";
+    let _held = mark_reclaim(Path::new(deleted), &direct.join("runner-a")).unwrap();
+    let mut binds = PendingBinds::default();
+    let result = binds
+        .claim(
+            Path::new("/host/another-mount/runner-a/new-dir"),
+            Some(&space),
+        )
+        .await;
+    assert_waited_out(
+        result,
+        deleted,
+        "both views of the existing ancestor have the same filesystem identity",
+    );
+}
