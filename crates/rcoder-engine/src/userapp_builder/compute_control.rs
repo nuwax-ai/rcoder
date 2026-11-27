@@ -1209,8 +1209,8 @@ async fn execute_claimed(
         crate::userapp_forward::invalidate_probe_cache(&record.app_id);
     }
     if policy::is_restart(record.action) {
-        // 本次重启允许换 bind 源的挂载点，由运行时点名；没有走归档重放时为空
-        let mut replaced: Vec<String> = Vec::new();
+        // 替代容器自己记下的换源见证；没有走归档重放时为空
+        let mut mount_witness: Option<BuilderRestartMountWitness> = None;
         // Scale-down changed resourceVersion. Refresh only the SAME physical UID.
         let mut fresh = if builder_scope {
             let old: BuilderControlTarget = serde_json::from_value(target.clone())?;
@@ -1258,10 +1258,10 @@ async fn execute_claimed(
                 ensure!(template.source == old, "Restart archive source differs");
                 state.userapp_store.check_compute_executor(identity).await?;
                 *settled = false;
-                // 运行时重建替代容器时，会把它点名的那几条挂载（可回收日志根下的日志目录）
-                // 换成新目录；其余挂载重启前后必须一致
-                replaced = replaced_restart_mounts(state, &template).await?;
                 fresh = state.runtime().restore_builder_restart(&template).await?;
+                // 换源见证从替代容器自己身上读：只放行它实际换过的那几条，而且认的就是这一个
+                // 容器
+                mount_witness = restart_mount_witness(state, &template).await?;
                 fresh.restart_image = old.restart_image.clone();
                 fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
                 fresh.builder_startup_mode = old.builder_startup_mode;
@@ -1273,7 +1273,15 @@ async fn execute_claimed(
             } else if let Some(template) = target.get("builder_restart_template") {
                 prepared["builder_restart_template"] = template.clone();
             }
-            verify_builder_volume_witness(&target, &prepared, &replaced)?;
+            verify_builder_volume_witness(
+                &target,
+                &prepared,
+                mount_witness.as_ref(),
+                fresh
+                    .workload
+                    .as_ref()
+                    .map(|workload| workload.uid.as_str()),
+            )?;
             prepared
         } else {
             let prior: UserAppComputeStartTarget = serde_json::from_value(target.clone())?;
@@ -2655,7 +2663,7 @@ async fn resume_builder_start_with_guard(
             );
             // 没有 bind 被换：缺失的 builder 由保留下来的卷重建，不是归档重放
             let prepared = builder_compute_checkpoint(state, &current, true).await?;
-            verify_builder_volume_witness(&snapshot.checkpoint, &prepared, &[])?;
+            verify_builder_volume_witness(&snapshot.checkpoint, &prepared, None, None)?;
             RestartContinuation::Dev(old.clone())
         };
         ensure!(
@@ -2668,8 +2676,8 @@ async fn resume_builder_start_with_guard(
             .await?;
         return run_restart_continuation_with_guard(state, record, prepared, held_guard).await;
     }
-    // 本次重启允许换 bind 源的挂载点，由运行时点名；没有走归档重放时为空
-    let mut replaced: Vec<String> = Vec::new();
+    // 替代容器自己记下的换源见证；没有走归档重放时为空
+    let mut mount_witness: Option<BuilderRestartMountWitness> = None;
     let target = if snapshot.stage == ComputeControlStage::Starting.as_str() {
         if state
             .runtime()
@@ -2734,8 +2742,8 @@ async fn resume_builder_start_with_guard(
             // The durable stopped boundary already confirms old compute exited.
             // Restore only a zero-replica controller; the CAS below must succeed
             // before any new business instance can start.
-            replaced = replaced_restart_mounts(state, &template).await?;
             let mut restored = state.runtime().restore_builder_restart(&template).await?;
+            mount_witness = restart_mount_witness(state, &template).await?;
             restored.restart_image = old.restart_image.clone();
             restored.restart_runtime_workspace = old.restart_runtime_workspace.clone();
             restored.builder_startup_mode = old.builder_startup_mode;
@@ -2762,7 +2770,15 @@ async fn resume_builder_start_with_guard(
         "Builder lease changed before continuation claim"
     );
     let prepared = builder_compute_checkpoint(state, &target, true).await?;
-    verify_builder_volume_witness(&continuing.checkpoint, &prepared, &replaced)?;
+    verify_builder_volume_witness(
+        &continuing.checkpoint,
+        &prepared,
+        mount_witness.as_ref(),
+        target
+            .workload
+            .as_ref()
+            .map(|workload| workload.uid.as_str()),
+    )?;
     // 见证写替代容器实际有的挂载：换过源的日志目录从此以它为准
     let volumes = prepared["builder_volumes"].clone();
     let record = state
@@ -2890,30 +2906,34 @@ async fn confirmed_missing_builder_checkpoint(
     Ok(prepared)
 }
 
-/// The mounts a restart may change for `template`, reported by the runtime: only
-/// the reclaimable log directories under it are replaced with fresh ones. An
-/// error means the runtime cannot tell, which fails the restart.
-async fn replaced_restart_mounts(
+/// The mounts this restart's replacement actually had changed, read by the
+/// runtime from the replacement itself. `None` when no replacement of the
+/// archive exists, or the runtime never swaps mounts.
+async fn restart_mount_witness(
     state: &AppState,
     template: &BuilderRestartTemplate,
-) -> Result<Vec<String>> {
+) -> Result<Option<BuilderRestartMountWitness>> {
     Ok(state
         .runtime()
-        .builder_restart_replaced_mounts(template)
+        .builder_restart_mount_witness(template)
         .await?)
 }
 
 /// The builder's mounts must come back from a restart exactly as they were, with
-/// one exception: at the mount targets in `replaced` (container paths, named by
-/// the runtime) the bind source (`uid`) may differ, because the runtime hands the
-/// replacement a fresh log directory there. Every other field of a named mount,
-/// and every field of any other mount, must be unchanged, and so must the count
-/// and the order: a replaced mount cannot stand in for another one. The runtime
-/// itself checks the replacement's actual mounts against the sources it handed out.
+/// one exception, and only for the container the runtime recorded: at a mount the
+/// witness names, the bind source (`uid`) may be the one source the witness
+/// records for it. Every other field of a replaced mount, and every field of any
+/// other mount, must be unchanged, and so must the count and the order.
+///
+/// A witness counts only for its own container: `replacement_id` is the ID the
+/// recaptured mounts (`prepared`) came from, and it must equal the witness's.
+/// Persistent data (the builder's `/home/user` tree) is never swapped, whoever
+/// reports it.
 fn verify_builder_volume_witness(
     original: &serde_json::Value,
     prepared: &serde_json::Value,
-    replaced: &[String],
+    witness: Option<&BuilderRestartMountWitness>,
+    replacement_id: Option<&str>,
 ) -> Result<()> {
     let old = original
         .get("builder_volumes")
@@ -2927,14 +2947,36 @@ fn verify_builder_volume_witness(
         old.len() == new.len(),
         "Builder workspace volume identity changed during restart"
     );
+    if let Some(witness) = witness {
+        ensure!(
+            replacement_id == Some(witness.container_id.as_str()),
+            "Restart target was replaced before its mounts could be verified"
+        );
+    }
+    let mut replaced = 0usize;
     for (old, new) in old.iter().zip(&new) {
         let mut expected = old.clone();
-        if replaced.contains(&old.name) {
-            expected.uid = new.uid.clone();
+        if let Some(mount) = witness.and_then(|witness| witness.replaced(&old.name)) {
+            ensure!(
+                old.kind == AppResourceKind::HostPath
+                    && mount.previous_source == old.uid
+                    && !is_builder_persistent_data_mount(&old.name),
+                "Builder restart recorded an unexpected mount swap for {}",
+                old.name
+            );
+            expected.uid = mount.source.clone();
+            replaced += 1;
         }
         ensure!(
             expected == *new,
             "Builder workspace volume identity changed during restart"
+        );
+    }
+    if let Some(witness) = witness {
+        // 点名的每一条都要对上一条归档里的挂载；同一条挂载不能被点名两次
+        ensure!(
+            replaced == witness.replaced.len(),
+            "Builder restart recorded a mount swap that matches no archived mount"
         );
     }
     if prepared

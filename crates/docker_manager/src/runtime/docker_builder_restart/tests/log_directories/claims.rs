@@ -4,6 +4,91 @@
 
 use super::*;
 
+/// 日志挂载的源判不出在不在日志根里（它经过一个指到 RCoder 挂载之外的符号链接），但归档能核实
+/// 它是日志挂载：照样换新目录。日志目录是一次性的，旧的那个可能早已过期、清理器正在回收。
+#[tokio::test]
+async fn a_log_mount_that_cannot_be_classified_gets_a_new_directory() {
+    let mut restart = LoggedRestart::new();
+    // RCoder 进程里的 `visible/logs` 是真实目录；里面的 `alias` 指到挂载表之外的一个位置
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(restart.root.path().join("visible")).unwrap();
+    std::fs::create_dir(restart.root.path().join("visible/logs")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path(),
+        restart.root.path().join("visible/logs/alias"),
+    )
+    .unwrap();
+    // 归档里记的 bind 源是宿主机树里的 `alias/<旧目录>`，Docker 解析这个链接
+    let alias = restart
+        .root
+        .path()
+        .join("host/alias")
+        .to_string_lossy()
+        .into_owned();
+    let old_directory = format!("{}/{}", alias, restart.old_name);
+    std::fs::create_dir_all(outside.path().join(&restart.old_name)).unwrap();
+    std::fs::write(
+        outside.path().join(&restart.old_name).join("old.log"),
+        b"old",
+    )
+    .unwrap();
+    for volume in &mut restart.template.volumes {
+        if volume.name == LOG_TARGET {
+            volume.uid = old_directory.clone();
+        }
+    }
+    restart.archive.binds[0] = format!("{old_directory}:{LOG_TARGET}:rw,z");
+    let daemon = scripted(creation_script(step(
+        "POST",
+        "/containers/create",
+        200,
+        created(),
+    )))
+    .await;
+
+    let replacement = restart.restore(&daemon).await.unwrap();
+
+    // 绑的是 alias 下的新目录，不是旧目录
+    let binds = daemon.body(4)["HostConfig"]["Binds"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let bound = binds
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(|bind| {
+            bind.split_once(&format!(":{LOG_TARGET}"))
+                .map(|(source, _)| source.to_owned())
+        })
+        .unwrap_or_default();
+    let name = std::path::Path::new(&bound)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        bound.starts_with(&alias),
+        "a log mount is swapped even when it cannot be classified: {binds:?}"
+    );
+    assert!(
+        name.starts_with("rcoder-app-builder-265-") && name != restart.old_name,
+        "{bound}"
+    );
+    assert!(
+        outside.path().join(&name).is_dir(),
+        "the new directory is created next to the old one"
+    );
+    assert_eq!(
+        std::fs::read_dir(outside.path()).unwrap().count(),
+        2,
+        "the old directory is left alone; only a new one is added"
+    );
+    assert_eq!(
+        replacement.expected_volumes,
+        restart.expected_volumes(&[(LOG_TARGET, &bound)])
+    );
+}
+
 /// 日志目录建好之后、创建请求得到应答之前，一直登记为正在准备挂载。
 #[tokio::test]
 async fn a_fresh_log_directory_stays_claimed_while_the_create_request_is_in_flight() {
@@ -99,14 +184,13 @@ async fn a_bind_that_cannot_be_classified_is_replayed_and_registered() {
         replacement.expected_volumes,
         restart.expected_volumes(&[(LOG_TARGET, &new_directory)])
     );
-    // 它的源不变，所以不在运行时点名的"会换源"的挂载里
+    // 换源记录里只有日志挂载
     assert_eq!(
-        restart
-            .runtime(daemon.address)
-            .restart_replaced_mounts(&restart.template)
-            .await
-            .unwrap(),
-        [LOG_TARGET.to_owned()]
+        restart.bound_sources(&daemon, 4),
+        json!({ LOG_TARGET: new_directory })
+            .as_object()
+            .cloned()
+            .unwrap()
     );
     // 创建请求在途时，新目录和判不出来的那条源都登记着
     let mut seen = seen_at_create.lock().unwrap().clone();

@@ -1,12 +1,13 @@
 //! 替代 builder 的日志目录：哪些 bind 换成新目录、label 怎么记。
 //!
-//! 这里放夹具和换目录、核对 label 的用例。登记与创建结果（`claims`）、重启协议
-//! （`replacement`）各有自己的文件。
+//! 这里放夹具和换目录的用例。哪些挂载换、换源记录怎么核（`roles`）、登记与创建结果
+//! （`claims`）、重启协议（`replacement`）各有自己的文件。
 
 use super::*;
 
 mod claims;
 mod replacement;
+mod roles;
 
 // ─── 带日志挂载的重启 ───────────────────────────────────────────────────────
 
@@ -101,6 +102,49 @@ impl LoggedRestart {
 
     fn host_root(&self) -> PathBuf {
         self.root.path().join("host/container")
+    }
+
+    /// 日志根的配置盖住了工作区（旧容器、改过日志根的部署）：把工作区挪到宿主机那棵日志树
+    /// 下面，归档里记的也跟着换
+    fn move_workspace_under_log_root(&mut self) {
+        let workspace = tempfile::tempdir_in(self.host_root()).unwrap();
+        self.replace_workspace(&workspace.path().to_string_lossy());
+        drop(std::mem::replace(&mut self.workspace, workspace));
+    }
+
+    /// 把日志挂载挪到日志根下更深处（`host/container/<directories>/<旧目录>`）
+    fn nest_log_mount(&mut self, directories: &str) {
+        let nested = self.host_root().join(directories);
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::rename(&self.old_directory, nested.join(&self.old_name)).unwrap();
+        let previous = std::mem::replace(
+            &mut self.old_directory,
+            nested.join(&self.old_name).to_string_lossy().into_owned(),
+        );
+        for volume in &mut self.template.volumes {
+            if volume.name == LOG_TARGET {
+                volume.uid = self.old_directory.clone();
+            }
+        }
+        let archived = format!("{previous}:{LOG_TARGET}");
+        for bind in &mut self.archive.binds {
+            if bind.starts_with(&archived) {
+                *bind = format!("{}:{LOG_TARGET}:rw,z", self.old_directory);
+            }
+        }
+    }
+
+    fn replace_workspace(&mut self, target: &str) {
+        for volume in &mut self.template.volumes {
+            if volume.name == WORKSPACE_TARGET {
+                volume.uid = target.to_owned();
+            }
+        }
+        for bind in &mut self.archive.binds {
+            if bind.ends_with(&format!(":{WORKSPACE_TARGET}")) {
+                *bind = format!("{target}:{WORKSPACE_TARGET}");
+            }
+        }
     }
 
     /// 创建请求里各条日志挂载绑定的源：挂载点 → 宿主机路径
@@ -523,77 +567,4 @@ async fn a_resumed_label_that_is_not_a_fresh_sibling_is_refused() {
         );
         daemon.assert_followed(2);
     }
-}
-
-/// label 里缺了某条日志挂载：对不上账，拒绝。
-#[tokio::test]
-async fn a_resumed_label_that_misses_a_log_mount_is_refused() {
-    let restart = LoggedRestart::with_audit_log();
-    let daemon = scripted(vec![
-        step("GET", ORIGINAL_UID, 404, no_such_container()),
-        step(
-            "GET",
-            "rcoder-app-builder-",
-            200,
-            retained_replacement(
-                &restart.template,
-                json!({
-                    RESTORE: restart.template.archive.uid.clone(),
-                    RESTART_LOG_DIR: json!({
-                        LOG_TARGET: new_log_directory(
-                            &restart,
-                            "rcoder-app-builder-265-20251026090000"
-                        )
-                    })
-                    .to_string(),
-                }),
-            ),
-        ),
-    ])
-    .await;
-
-    let result = restart.restore(&daemon).await;
-
-    assert!(
-        matches!(&result, Err(Error::Conflict(message)) if message.contains("records no log directory")),
-        "{result:?}"
-    );
-    daemon.assert_followed(2);
-}
-
-/// label 里不能出现换源计划之外的挂载点：多出来的键会改写那条挂载（比如工作区）的期望值。
-#[tokio::test]
-async fn a_resumed_label_that_names_a_mount_outside_the_plan_is_refused() {
-    let restart = LoggedRestart::new();
-    let daemon = scripted(vec![
-        step("GET", ORIGINAL_UID, 404, no_such_container()),
-        step(
-            "GET",
-            "rcoder-app-builder-",
-            200,
-            retained_replacement(
-                &restart.template,
-                json!({
-                    RESTORE: restart.template.archive.uid.clone(),
-                    RESTART_LOG_DIR: json!({
-                        LOG_TARGET: new_log_directory(
-                            &restart,
-                            "rcoder-app-builder-265-20251026090000"
-                        ),
-                        WORKSPACE_TARGET: "/srv/elsewhere/workspace"
-                    })
-                    .to_string(),
-                }),
-            ),
-        ),
-    ])
-    .await;
-
-    let result = restart.restore(&daemon).await;
-
-    assert!(
-        matches!(&result, Err(Error::Conflict(message)) if message.contains("which the restart does not replace")),
-        "{result:?}"
-    );
-    daemon.assert_followed(2);
 }

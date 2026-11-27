@@ -1,5 +1,5 @@
-//! 重启协议：换源计划在动旧容器之前定下；运行时向引擎点名会换源的挂载；经公开恢复入口时，
-//! 最终核验的必须是读到 label 的那一个替代容器。
+//! 重启协议：换源计划在动旧容器之前定下；换源见证从替代容器自己的 label 读出来交给引擎；经
+//! 公开恢复入口时，最终核验的必须是读到 label 的那一个替代容器。
 
 use super::*;
 
@@ -21,33 +21,168 @@ async fn a_refused_plan_leaves_the_retained_original_in_place() {
     assert!(std::path::Path::new(&restart.old_directory).is_dir());
 }
 
-/// 引擎重启后重新采集挂载时只放行运行时点名的这几条：源落在日志根下面的挂载，别的没有。
+/// 引擎放行的是替代容器自己记下的那几条：旧目录、新目录、是哪一个容器，都从它的 label 读。
+/// 日志挂载之外的挂载不在其中。
 #[tokio::test]
-async fn replaced_mounts_are_exactly_the_ones_bound_into_the_log_root() {
+#[allow(unsafe_code)] // 测试内设置进程环境变量；nextest 每个用例独立进程
+async fn the_witness_is_read_from_the_replacement_itself() {
+    let receipts = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("RCODER_OPERATION_RECEIPT_ROOT", receipts.path());
+    }
     let restart = LoggedRestart::with_audit_log();
-    let daemon = scripted(vec![]).await;
-    let log_runtime = restart.runtime(daemon.address);
+    let template = archived(receipts.path(), &restart);
+    let fresh_log = new_log_directory(&restart, "rcoder-app-builder-265-20251026090000");
+    let fresh_audit = new_log_directory(&restart, "rcoder-app-builder-265-audit-20251026090000");
+    let daemon = scripted(vec![step(
+        "GET",
+        "rcoder-app-builder-",
+        200,
+        retained_replacement(
+            &restart.template,
+            json!({
+                RESTORE: template.archive.uid.clone(),
+                RESTART_LOG_DIR: json!({
+                    LOG_TARGET: fresh_log,
+                    AUDIT_TARGET: fresh_audit,
+                })
+                .to_string(),
+            }),
+        ),
+    )])
+    .await;
 
-    let replaced = log_runtime
-        .restart_replaced_mounts(&restart.template)
+    let witness = restart
+        .runtime(daemon.address)
+        .restart_mount_witness(&template)
+        .await
+        .unwrap()
+        .unwrap();
+
+    daemon.assert_followed(1);
+    assert_eq!(witness.container_id, REPLACEMENT_UID);
+    let mut replaced = witness.replaced;
+    replaced.sort_by(|a, b| a.target.cmp(&b.target));
+    assert_eq!(
+        replaced,
+        [
+            shared_types::ReplacedBuilderMount {
+                target: AUDIT_TARGET.into(),
+                previous_source: new_log_directory(
+                    &restart,
+                    "rcoder-app-builder-265-audit-20251026080000"
+                ),
+                source: fresh_audit,
+            },
+            shared_types::ReplacedBuilderMount {
+                target: LOG_TARGET.into(),
+                previous_source: restart.old_directory.clone(),
+                source: fresh_log,
+            },
+        ]
+    );
+}
+
+/// 还没有替代容器：没有见证，引擎什么都不放行
+#[tokio::test]
+#[allow(unsafe_code)] // 测试内设置进程环境变量；nextest 每个用例独立进程
+async fn without_a_replacement_there_is_no_witness() {
+    let receipts = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("RCODER_OPERATION_RECEIPT_ROOT", receipts.path());
+    }
+    let restart = LoggedRestart::new();
+    let template = archived(receipts.path(), &restart);
+    let daemon = scripted(vec![step(
+        "GET",
+        "rcoder-app-builder-",
+        404,
+        no_such_container(),
+    )])
+    .await;
+
+    let witness = restart
+        .runtime(daemon.address)
+        .restart_mount_witness(&template)
         .await
         .unwrap();
 
-    let mut replaced = replaced;
-    replaced.sort();
-    assert_eq!(replaced, [AUDIT_TARGET, LOG_TARGET]);
-    daemon.assert_followed(0);
+    assert_eq!(witness, None);
+    daemon.assert_followed(1);
+}
 
-    // 没有日志挂载的 builder：一条都不放行
-    let workspace = tempfile::tempdir().unwrap();
-    let template = restart_template(workspace.path());
-    let daemon = scripted(vec![]).await;
+/// 旧版本建的替代容器没有换源记录：见证是空的，引擎按原归档严格核对
+#[tokio::test]
+#[allow(unsafe_code)] // 测试内设置进程环境变量；nextest 每个用例独立进程
+async fn a_replacement_without_a_record_has_an_empty_witness() {
+    let receipts = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("RCODER_OPERATION_RECEIPT_ROOT", receipts.path());
+    }
+    let restart = LoggedRestart::new();
+    let template = archived(receipts.path(), &restart);
+    let daemon = scripted(vec![step(
+        "GET",
+        "rcoder-app-builder-",
+        200,
+        retained_replacement(
+            &restart.template,
+            json!({ RESTORE: template.archive.uid.clone() }),
+        ),
+    )])
+    .await;
+
+    let witness = restart
+        .runtime(daemon.address)
+        .restart_mount_witness(&template)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(witness.container_id, REPLACEMENT_UID);
+    assert!(witness.replaced.is_empty());
+}
+
+/// 换源记录写了工作区：读见证的时候就拒绝，引擎根本拿不到这份记录
+#[tokio::test]
+#[allow(unsafe_code)] // 测试内设置进程环境变量；nextest 每个用例独立进程
+async fn a_record_that_names_the_workspace_yields_no_witness() {
+    let receipts = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("RCODER_OPERATION_RECEIPT_ROOT", receipts.path());
+    }
+    let restart = LoggedRestart::new();
+    let template = archived(receipts.path(), &restart);
+    let elsewhere = restart
+        .workspace
+        .path()
+        .with_file_name("workspace-elsewhere")
+        .to_string_lossy()
+        .into_owned();
+    let daemon = scripted(vec![step(
+        "GET",
+        "rcoder-app-builder-",
+        200,
+        retained_replacement(
+            &restart.template,
+            json!({
+                RESTORE: template.archive.uid.clone(),
+                RESTART_LOG_DIR: json!({
+                    LOG_TARGET: new_log_directory(&restart, "rcoder-app-builder-265-20251026090000"),
+                    WORKSPACE_TARGET: elsewhere,
+                })
+                .to_string(),
+            }),
+        ),
+    )])
+    .await;
+    let runtime = restart.runtime(daemon.address);
+
+    let witness = runtime.restart_mount_witness(&template).await;
+
     assert!(
-        runtime(daemon.address)
-            .restart_replaced_mounts(&template)
-            .await
-            .unwrap()
-            .is_empty()
+        matches!(&witness, Err(Error::Conflict(message)) if message.contains("which holds persistent data and is never replaced")),
+        "{witness:?}"
     );
 }
 

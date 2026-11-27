@@ -22,7 +22,10 @@
 //!
 //! 登记的不只是新建的日志目录：创建方判不出在不在日志根里的 bind 源也登记进来（靠的是同一个
 //! 路径空间，`runtime::docker_runtime::host_path_space`）。判不出来不拒绝创建容器——清理器对这条
-//! 源同样判不出来，登记着它就整轮不删。
+//! 源同样判不出来，登记着它就整轮不删。登记自身的边界见 [`pending`]。
+//!
+//! 新建目录落在日志根下面更深处时，要刷新上一级候选的修改时间，见
+//! [`refresh_candidate_ancestor`]。
 
 mod pending;
 
@@ -97,6 +100,42 @@ pub(crate) async fn create_fresh_directory(
         }
     }
     Err(FreshDirectoryError::Exhausted)
+}
+
+/// 新建目录落在日志根下面第 2 层或更深时，把它在日志根下的第一级目录的修改时间刷新到现在。
+///
+/// 清理器只扫日志根的第一层，过期的是那第一级目录。在它下面更深处新建目录不会改它的修改
+/// 时间，它一直是过期候选。登记能护住它，但清理器要先读到登记才看得见；刷新之后，清理器删
+/// 之前那一次复查（看目录还在、仍然过期）就会看到"变了"，这一轮不动它。
+///
+/// 只在新建目录按词法就在日志根下面时做。刷新失败只记日志：登记照样有效
+pub(crate) async fn refresh_candidate_ancestor(created: &Path, reclaim_root: &Path) {
+    let Some(ancestor) = candidate_ancestor(created, reclaim_root) else {
+        return;
+    };
+    let refreshed = async {
+        let file = tokio::fs::File::open(&ancestor).await?;
+        file.set_modified(std::time::SystemTime::now()).await
+    }
+    .await;
+    if let Err(error) = refreshed {
+        warn!(
+            directory = %ancestor.display(),
+            %error,
+            "Cannot refresh the modification time of the directory holding a new log directory; the log cleaner may see it as expired until its next scan"
+        );
+    }
+}
+
+/// `created` 在日志根下面第 2 层或更深时，它在日志根下的第一级目录
+fn candidate_ancestor(created: &Path, reclaim_root: &Path) -> Option<PathBuf> {
+    let created = crate::normalize_path(created);
+    let reclaim_root = crate::normalize_path(reclaim_root);
+    let mut below = created.strip_prefix(&reclaim_root).ok()?.components();
+    let first = below.next()?;
+    // 第二层往下才有"上层候选"：第一层的新建目录自己是新目录，不会是过期候选
+    below.next()?;
+    Some(reclaim_root.join(first))
 }
 
 /// 新建日志目录失败的原因

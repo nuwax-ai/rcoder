@@ -594,6 +594,38 @@ async fn workspace_data_cannot_live_in_the_log_root() {
     );
 }
 
+/// 模板在日志根下面有两层以上：新目录建在更深处，日志根下那第一级目录的修改时间不会自己变，
+/// 它会一直是清理器的过期候选。创建时把它刷新到现在，清理器删前那一次复查才看得出"刚被用过"。
+#[tokio::test]
+async fn a_nested_log_directory_refreshes_the_directory_the_cleaner_scans() {
+    let layout = Layout::new();
+    std::fs::create_dir_all(layout.host_log_root().join("tenant/logs")).unwrap();
+    let scanned = layout.host_log_root().join("tenant");
+    let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+    std::fs::File::open(&scanned)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    let nested = mount(
+        "/app/container-logs",
+        "{resolved_path}/tenant/logs/{log_dir_name}",
+        false,
+        Some(&layout.log_resolve_from()),
+    );
+
+    let (config, _pending) = apply(&layout, vec![nested]).await.unwrap();
+
+    let name = file_name(&only_mount(&config).host_path);
+    assert!(scanned.join("logs").join(name).is_dir());
+    let refreshed = std::fs::metadata(&scanned).unwrap().modified().unwrap();
+    assert!(
+        refreshed
+            .duration_since(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .is_ok(),
+        "the directory the cleaner scans must look recently used, not expired since {long_ago:?}: {refreshed:?}"
+    );
+}
+
 /// 容器形态：目录经 RCoder 进程里的路径建出来——它和宿主机路径不是同一个字符串；bind 用
 /// 的是宿主机路径。
 #[cfg(not(feature = "deploy-host"))]

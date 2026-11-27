@@ -19,9 +19,8 @@
 //! gets a new log directory instead, see [`log_directory`].
 use super::docker_runtime::DockerRuntime;
 use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
-use log_directory::{
-    FreshLogDirectories, RESTART_LOG_DIR, plan, resumed_sources, with_log_sources,
-};
+use log_directory::{FreshLogDirectories, plan};
+use log_label::RESTART_LOG_DIR;
 
 /// 这次恢复给出的替代容器：按名称找到或刚创建的那一个，以及它应当有的挂载
 #[derive(Debug, PartialEq)]
@@ -514,10 +513,8 @@ impl DockerRuntime {
         Ok(())
     }
 
-    pub(super) async fn restore_builder_template(
-        &self,
-        template: &BuilderRestartTemplate,
-    ) -> Result<BuilderControlTarget> {
+    /// 读出这次恢复的归档并核验：引用完整，内容和模板记的摘要一致
+    async fn load_archive(&self, template: &BuilderRestartTemplate) -> Result<Archive> {
         template
             .source
             .validate()
@@ -540,6 +537,14 @@ impl DockerRuntime {
         if archive.source != template.source || archive.image.is_empty() {
             return Err(conflict("Restart archive does not match checkpoint"));
         }
+        Ok(archive)
+    }
+
+    pub(super) async fn restore_builder_template(
+        &self,
+        template: &BuilderRestartTemplate,
+    ) -> Result<BuilderControlTarget> {
+        let archive = self.load_archive(template).await?;
         let original = template
             .source
             .workload
@@ -653,42 +658,16 @@ impl DockerRuntime {
         // Idempotent re-entry: an interrupted restore may have created the
         // replacement already. Accept only this archive's marker, never a
         // running occupant or a different container under the same name.
-        let mut resumed: Option<(String, Option<String>)> = None;
-        match inspect_absent(
+        if let Some(existing) = inspect_absent(
             client.inspect_container(&original.name, None).await,
             "Inspect restart target",
         )? {
-            None => {}
-            Some(existing) => {
-                let labels = existing
-                    .config
-                    .as_ref()
-                    .and_then(|config| config.labels.clone())
-                    .unwrap_or_default();
-                let id = existing.id.clone().filter(|id| !id.is_empty());
-                if labels.get(RESTORE) != Some(&template.archive.uid)
-                    || existing.state.as_ref().and_then(|state| state.running) == Some(true)
-                {
-                    return Err(conflict("Another builder occupies restart target"));
-                }
-                // 上一次中断前建好的替代容器。它拿到的日志目录记在 RESTART_LOG_DIR 上；没有
-                // 这个 label 的是旧版本建的，那时归档原样重放，它绑的就是归档里的目录
-                resumed = Some((
-                    id.ok_or_else(|| conflict("Restart target has no physical ID"))?,
-                    labels.get(RESTART_LOG_DIR).cloned(),
-                ));
-            }
-        }
-        if let Some((id, label)) = resumed {
-            let expected_volumes = match label {
-                None => template.volumes.clone(),
-                Some(label) => with_log_sources(
-                    &template.volumes,
-                    &resumed_sources(&label, template, &binds.plans, admission.space().is_none())?,
-                ),
-            };
+            let resumed = self
+                .resumed_replacement(template, archive, &admission, existing)
+                .await?;
+            let expected_volumes = resumed.expected_volumes(template);
             return Ok(Replacement {
-                id,
+                id: resumed.id,
                 expected_volumes,
             });
         }
@@ -716,7 +695,12 @@ impl DockerRuntime {
             .map_err(|error| {
                 Error::DockerError(format!("Prepare restart image {image}: {error}"))
             })?;
-        let mut fresh = FreshLogDirectories::create(admission.space(), &binds).await?;
+        let mut fresh = FreshLogDirectories::create(
+            admission.space(),
+            &binds,
+            &self.inner.config.log_reclaim_root,
+        )
+        .await?;
         fresh.apply(&mut replay, &binds.plans);
         let log_label = (!binds.plans.is_empty()).then(|| fresh.label());
         // 创建请求马上发出。之后拿不到确切结果——包括这个 future 等应答时被取消——登记都会
@@ -1024,6 +1008,7 @@ fn restore_body(
 }
 
 mod log_directory;
+mod log_label;
 
 #[cfg(test)]
 mod tests;

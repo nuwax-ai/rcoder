@@ -107,3 +107,24 @@ async fn every_taken_name_is_reported_instead_of_reusing_one() {
 
     assert!(matches!(error, FreshDirectoryError::Exhausted));
 }
+
+#[test]
+fn only_a_directory_at_least_two_levels_below_the_log_root_has_a_candidate_above_it() {
+    let root = Path::new("/srv/logs/container");
+    let ancestor = |created: &str| candidate_ancestor(Path::new(created), root);
+
+    // 第一层：新建目录自己是新目录，上面没有候选
+    assert_eq!(ancestor("/srv/logs/container/runner-a"), None);
+    // 第二层往下：它在日志根下的第一级目录
+    assert_eq!(
+        ancestor("/srv/logs/container/page-logs/runner-a"),
+        Some(PathBuf::from("/srv/logs/container/page-logs"))
+    );
+    assert_eq!(
+        ancestor("/srv/logs/container/tenant/logs/runner-a"),
+        Some(PathBuf::from("/srv/logs/container/tenant"))
+    );
+    // 不在日志根下面：没有
+    assert_eq!(ancestor("/srv/workspace/runner-a"), None);
+    assert_eq!(ancestor("/srv/logs/container-other/runner-a"), None);
+}

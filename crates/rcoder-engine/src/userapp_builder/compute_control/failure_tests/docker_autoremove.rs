@@ -23,13 +23,15 @@ pub(super) struct Mode {
     corrupt_archive: AtomicBool,
     restore_snapshots: Mutex<Vec<ComputeControlRecord>>,
     start_snapshots: Mutex<Vec<ComputeControlRecord>>,
+    workspace_declared: bool,
+    other_container: bool,
 }
 
 /// 一条会被换源的日志挂载
 pub(super) struct LogSwap {
     before: AppResourceIdentity,
     after: AppResourceIdentity,
-    /// 运行时有没有把这条挂载报给引擎（`builder_restart_replaced_mounts`）
+    /// 替代容器有没有把这条换源记在自己的 label 上（引擎据此放行）
     declared: bool,
 }
 
@@ -38,10 +40,16 @@ pub(super) struct LogSwap {
 pub(super) struct Swaps {
     /// 日志目录换源：`Some((旧目录, 新目录))`
     pub(super) log: Option<(std::path::PathBuf, std::path::PathBuf)>,
-    /// 运行时把日志挂载报给引擎
+    /// 替代容器把日志挂载的换源记了下来
     pub(super) declared: bool,
     /// 工作区的 bind 源也被换了
     pub(super) workspace_swap: bool,
+    /// 运行时的换源记录里居然写了工作区也换了
+    pub(super) workspace_declared: bool,
+    /// 运行时的换源记录记的是另一个容器
+    pub(super) other_container: bool,
+    /// 归档里的工作区本身就落在日志根下面（旧容器、改过日志根的部署）
+    pub(super) workspace_under_log_root: bool,
 }
 
 pub(super) fn receipt(context: &UserAppExecutionContext) -> UserAppOperationLeaseReceipt {
@@ -114,13 +122,34 @@ impl Mode {
         volumes
     }
 
-    /// 运行时报给引擎的"重启会换 bind 源的挂载点"
-    pub(super) fn replaced_mounts(&self) -> Vec<String> {
-        self.log
-            .as_ref()
-            .filter(|log| log.declared)
-            .map(|log| vec![log.before.name.clone()])
-            .unwrap_or_default()
+    /// 替代容器自己记下的换源见证；还没恢复、没有替代容器时为 `None`
+    pub(super) fn mount_witness(&self) -> Option<BuilderRestartMountWitness> {
+        if !self.restored.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut replaced = Vec::new();
+        if let Some(log) = self.log.as_ref().filter(|log| log.declared) {
+            replaced.push(ReplacedBuilderMount {
+                target: log.before.name.clone(),
+                previous_source: log.before.uid.clone(),
+                source: log.after.uid.clone(),
+            });
+        }
+        if self.workspace_swap && self.workspace_declared {
+            replaced.push(ReplacedBuilderMount {
+                target: self.volume.name.clone(),
+                previous_source: self.volume.uid.clone(),
+                source: self.volume.uid.clone() + "-swapped",
+            });
+        }
+        Some(BuilderRestartMountWitness {
+            container_id: if self.other_container {
+                "another-container".into()
+            } else {
+                NEW_UID.into()
+            },
+            replaced,
+        })
     }
 
     async fn snapshot(&self, context: &UserAppExecutionContext) -> ComputeControlRecord {
@@ -255,8 +284,11 @@ async fn fixture_with(
     tempfile::TempDir,
 ) {
     let (state, runtime, pending, directory) = super::fixture().await;
-    let workspace = directory.path().join("retained-workspace");
-    std::fs::create_dir(&workspace).unwrap();
+    let workspace = match (&swaps.log, swaps.workspace_under_log_root) {
+        (Some((before, _)), true) => before.parent().unwrap().join("runner-workspace"),
+        _ => directory.path().join("retained-workspace"),
+    };
+    std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("sentinel"), "retained-original-data").unwrap();
     let log = swaps.log.map(|(before, after)| {
         for directory in [&before, &after] {
@@ -288,6 +320,8 @@ async fn fixture_with(
         },
         log,
         workspace_swap: swaps.workspace_swap,
+        workspace_declared: swaps.workspace_declared,
+        other_container: swaps.other_container,
         reject_with: Mutex::new(None),
         saved: Default::default(),
         restored: AtomicBool::new(false),

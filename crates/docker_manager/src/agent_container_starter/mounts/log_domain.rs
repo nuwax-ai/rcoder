@@ -40,9 +40,14 @@ pub(super) fn sets_log_env(mount_config: &ServiceMountConfig) -> bool {
 /// 这条挂载指向可回收日志域里的一个目录：给本容器独占新建它，返回最终用上的日志目录名。
 ///
 /// 建不出来就报错。只读的挂载也报错：RCoder 不给它建目录，它绑到的只能是已有的目录。
+///
+/// `reclaim_root` 是可回收的日志根（RCoder 进程里的路径）：新目录建在它下面更深处时，要把
+/// 它在日志根下的第一级目录的修改时间刷新到现在，见
+/// `crate::log_directory::refresh_candidate_ancestor`。
 pub(super) async fn create_reclaimable_directory(
     mount_config: &ServiceMountConfig,
     variables: &HashMap<String, String>,
+    reclaim_root: &Path,
 ) -> crate::DockerResult<String> {
     let mount = &mount_config.container_path;
     if mount_config.read_only {
@@ -82,14 +87,17 @@ pub(super) async fn create_reclaimable_directory(
             "Mount {mount} has no log directory to create: {create_path:?}"
         )));
     };
-    match create_fresh_directory(parent, preferred).await {
-        Ok(created) => Ok(created
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| preferred.to_owned())),
-        Err(error) => Err(DockerError::ContainerCreationError(format!(
-            "Cannot create a new log directory for mount {mount}: {error} ({})",
-            parent.display()
-        ))),
-    }
+    let created = create_fresh_directory(parent, preferred)
+        .await
+        .map_err(|error| {
+            DockerError::ContainerCreationError(format!(
+                "Cannot create a new log directory for mount {mount}: {error} ({})",
+                parent.display()
+            ))
+        })?;
+    crate::log_directory::refresh_candidate_ancestor(&created, reclaim_root).await;
+    Ok(created
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| preferred.to_owned()))
 }

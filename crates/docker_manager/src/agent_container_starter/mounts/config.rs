@@ -168,7 +168,9 @@ pub(super) async fn add_config_mounts(
         let unclassified = matches!(verdict, LogDomainVerdict::Unknown(_));
         let mut log_dir_name = log_dir_name.clone();
         if reclaimable {
-            log_dir_name = create_reclaimable_directory(mount_config, &mount_variables).await?;
+            log_dir_name =
+                create_reclaimable_directory(mount_config, &mount_variables, ctx.log_reclaim_root)
+                    .await?;
             mount_variables.insert("log_dir_name".to_string(), log_dir_name.clone());
             resolved_host_path = resolve_host_path(&mount_variables);
             resolved_container_path = resolve_container_path(&mount_variables);

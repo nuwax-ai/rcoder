@@ -1,7 +1,10 @@
-//! 重启时运行时把可回收日志根下的日志挂载换成新目录，并点名给引擎：引擎只放行被点名的换源，
-//! 新见证写进完成记录；工作区换了、或者运行时没点名的换源，一律拒绝。
+//! 重启时运行时把可回收日志根下的日志挂载换成新目录，记在替代容器上：引擎按这份记录放行，
+//! 新挂载写进完成记录；工作区换了（运行时报不报都一样）、记录的是别的容器、或者运行时没记
+//! 的换源，一律拒绝。
 
 use super::*;
+
+const IDENTITY_CHANGED: &str = "Builder workspace volume identity changed during restart";
 
 /// 原容器在可回收日志根下有一条日志挂载：重启时运行时把它换成新目录，并点名给引擎。引擎
 /// 只放行这一条换源，重启照常收敛，新见证写进完成记录。
@@ -15,6 +18,7 @@ async fn docker_autoremove_restart_allows_the_log_directory_the_runtime_replaces
         )),
         declared: true,
         workspace_swap: false,
+        ..Default::default()
     })
     .await;
     let result = execute_pending(&state, pending.clone()).await;
@@ -47,6 +51,7 @@ async fn docker_autoremove_resume_allows_the_log_directory_the_runtime_replaces(
         )),
         declared: true,
         workspace_swap: false,
+        ..Default::default()
     })
     .await;
     runtime.fail_stopped_capture.store(true, Ordering::SeqCst);
@@ -75,13 +80,11 @@ async fn docker_autoremove_restart_refuses_a_changed_workspace_volume() {
         )),
         declared: true,
         workspace_swap: true,
+        ..Default::default()
     })
     .await;
     let error = execute_pending(&state, pending.clone()).await.unwrap_err();
-    assert!(
-        format!("{error:#}").contains("Builder workspace volume identity changed during restart"),
-        "{error:#}"
-    );
+    assert!(format!("{error:#}").contains(IDENTITY_CHANGED), "{error:#}");
     let failure = read(&state, &pending).await;
     assert!(
         failure
@@ -106,11 +109,106 @@ async fn docker_autoremove_restart_refuses_a_swap_the_runtime_did_not_report() {
         )),
         declared: false,
         workspace_swap: false,
+        ..Default::default()
     })
     .await;
     let error = execute_pending(&state, pending.clone()).await.unwrap_err();
+    assert!(format!("{error:#}").contains(IDENTITY_CHANGED), "{error:#}");
+    assert_eq!(runtime.calls.starts.load(Ordering::SeqCst), 0);
+    state.userapp_store_control.shutdown().await.unwrap();
+}
+
+/// 归档里的工作区碰巧落在日志根下面（旧容器、改过日志根的部署）：运行时不换它，重启前后是
+/// 同一个目录。引擎按原源核对，重启照常收敛。
+#[tokio::test]
+async fn docker_autoremove_restart_keeps_a_workspace_that_lies_under_the_log_root() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, runtime, mode, pending, _directory) = fixture_with(Swaps {
+        log: Some((
+            root.path().join("logs/runner-old"),
+            root.path().join("logs/runner-new"),
+        )),
+        declared: true,
+        workspace_swap: false,
+        workspace_under_log_root: true,
+        ..Default::default()
+    })
+    .await;
+    let workspace = root.path().join("logs/runner-workspace");
+    assert!(std::fs::read_to_string(workspace.join("sentinel")).is_ok());
+
+    let result = execute_pending(&state, pending.clone()).await;
+
+    assert!(result.is_ok(), "{result:?}");
+    let completed = read(&state, &pending).await;
+    assert_completed(&runtime, &mode, &pending, &completed);
+    // Stopped 时的见证和完成记录里的，工作区都是原来那个目录；只有日志目录换了
+    assert_eq!(
+        mode.restore_snapshots.lock().unwrap()[0].checkpoint["builder_volumes"][0]["uid"],
+        serde_json::json!(workspace)
+    );
+    assert_eq!(
+        completed.checkpoint["builder_volumes"][0]["uid"],
+        serde_json::json!(workspace)
+    );
+    assert_eq!(
+        completed.checkpoint["builder_volumes"][1]["uid"],
+        serde_json::json!(root.path().join("logs/runner-new"))
+    );
     assert!(
-        format!("{error:#}").contains("Builder workspace volume identity changed during restart"),
+        std::fs::read_to_string(workspace.join("sentinel")).is_ok(),
+        "the workspace keeps its data"
+    );
+    state.userapp_store_control.shutdown().await.unwrap();
+}
+
+/// 工作区的 bind 源变了，运行时还把它写进了换源记录：`/home/user` 下面的挂载是持久数据，
+/// 谁报都不换。
+#[tokio::test]
+async fn docker_autoremove_restart_refuses_a_workspace_swap_however_it_is_reported() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, runtime, _mode, pending, _directory) = fixture_with(Swaps {
+        log: Some((
+            root.path().join("logs/runner-old"),
+            root.path().join("logs/runner-new"),
+        )),
+        declared: true,
+        workspace_swap: true,
+        workspace_declared: true,
+        ..Default::default()
+    })
+    .await;
+    let error = execute_pending(&state, pending.clone()).await.unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains(
+            "Builder restart recorded an unexpected mount swap for /home/user/failureapp"
+        ),
+        "{error:#}"
+    );
+    assert_eq!(runtime.calls.starts.load(Ordering::SeqCst), 0);
+    state.userapp_store_control.shutdown().await.unwrap();
+}
+
+/// 换源记录记的是另一个容器：重新采集到的挂载和它对不上号，记录不作数。
+#[tokio::test]
+async fn docker_autoremove_restart_refuses_a_witness_for_another_container() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, runtime, _mode, pending, _directory) = fixture_with(Swaps {
+        log: Some((
+            root.path().join("logs/runner-old"),
+            root.path().join("logs/runner-new"),
+        )),
+        declared: true,
+        other_container: true,
+        ..Default::default()
+    })
+    .await;
+    let error = execute_pending(&state, pending.clone()).await.unwrap_err();
+
+    assert!(
+        format!("{error:#}")
+            .contains("Restart target was replaced before its mounts could be verified"),
         "{error:#}"
     );
     assert_eq!(runtime.calls.starts.load(Ordering::SeqCst), 0);

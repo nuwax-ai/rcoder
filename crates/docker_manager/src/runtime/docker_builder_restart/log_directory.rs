@@ -1,19 +1,30 @@
 //! 替代 builder 的日志目录。
 //!
-//! 归档重放时，落在可回收日志根下面的 bind 不照原样重放：原容器绑定过的目录可能已经过期，
+//! 归档重放时，落在可回收日志根下面的日志 bind 不照原样重放：原容器绑定过的目录可能已经过期，
 //! 日志清理器随时在回收它。替代容器的每一条这样的 bind 都换成同级的新目录（独占新建，见
 //! `crate::log_directory`），并登记为正在准备挂载。
 //!
-//! 按**源路径**识别，不看容器内的挂载点叫什么，也不看环境变量：旧版本的归档里环境变量可能是
-//! 带变量的模板，一个容器也可以有几条这样的挂载。在不在日志根下面由
-//! `host_path_space::LogDomain` 判定，用的是清理器那个路径空间。
+//! # 哪些挂载换
 //!
-//! 新目录记在替代容器的 label `rcoder.io/restart-log-dir` 上（挂载点 → 新目录的 JSON）：恢复
-//! 中断后续做时据此核对。
+//! 两个条件都要看：
 //!
-//! 判不出一条 bind 在不在日志根里时（日志根定位不完整、这条源的真实位置求不出来、取不到路径
-//! 空间）不让恢复失败：这条 bind 照归档原样重放，它的源登记到替代容器建出来。清理器对它同样
-//! 判不出来，而它确认不了就不删。
+//! - **源路径**在可回收日志根下面。由 `host_path_space::LogDomain` 判定，用的是清理器那个路径
+//!   空间。不靠环境变量认日志挂载：旧版本的归档里它可能是带变量的模板，一个容器也可以有几条
+//!   日志挂载。
+//! - **挂载点**不是持久数据。builder 的 `/home/user` 整棵是工作区、data、logs、agent-store，
+//!   重启前后必须是同一个源。只看源路径的话，日志根的配置一旦盖住它们（旧容器、改过日志根的
+//!   部署），重启出来的 builder 就挂着一个空的工作区。
+//!
+//! # 判不出来的时候
+//!
+//! 判不出一条 bind 在不在日志根里，不让恢复失败：
+//!
+//! - 归档能核实它是日志挂载的（挂载点就是 `CONTAINER_LOGS_DIR`，或者带 `container-logs`），照样
+//!   换新目录。日志目录是一次性的，不该复用；旧的那个可能早已过期，清理器正在回收。
+//! - 其余的照归档原样重放，源登记到替代容器建出来。清理器对判不出来的源同样判不出来，而它
+//!   确认不了就不删。
+//!
+//! 换源记在替代容器的 label 上，续做和引擎都从那里读，见 `log_label`。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,8 +38,6 @@ use crate::runtime::docker_runtime::host_path_space::{
     HostPathSpace, LogDomainAdmission, LogDomainVerdict, bind_source, create_host_directory,
 };
 
-/// 替代容器拿到的日志目录（挂载点 → 宿主机路径的 JSON），记在它的 label 上
-pub(super) const RESTART_LOG_DIR: &str = "rcoder.io/restart-log-dir";
 const CONTAINER_LOGS_DIR_ENV: &str = "CONTAINER_LOGS_DIR";
 const CONTAINER_LOG_NAME_ENV: &str = "CONTAINER_LOG_NAME";
 
@@ -41,31 +50,6 @@ impl DockerRuntime {
             &self.inner.config.log_reclaim_root,
         )
         .await
-    }
-
-    /// 重启会更换 bind 源的挂载（容器内路径）：源落在可回收日志根下面的那几条。
-    ///
-    /// 引擎重启之后重新采集挂载、和重启前比较时，只放行这几条换源，其余挂载严格核对。判不
-    /// 出来的不在其中：它照归档原样重放，源不变。
-    pub(in crate::runtime) async fn restart_replaced_mounts(
-        &self,
-        template: &BuilderRestartTemplate,
-    ) -> Result<Vec<String>> {
-        let admission = self.log_domain().await;
-        let mut replaced = Vec::new();
-        for volume in template
-            .volumes
-            .iter()
-            .filter(|volume| volume.kind == AppResourceKind::HostPath)
-        {
-            let verdict = admission
-                .classify(&format!("Mount {}", volume.name), &volume.uid)
-                .await;
-            if verdict == LogDomainVerdict::Inside {
-                replaced.push(volume.name.clone());
-            }
-        }
-        Ok(replaced)
     }
 }
 
@@ -87,16 +71,17 @@ impl LogMountPlan<'_> {
     }
 }
 
-/// 归档里落在可回收日志根下面的 bind 怎么处置
+/// 归档里的 bind 怎么处置
+#[derive(Default)]
 pub(super) struct LogBinds<'a> {
     /// 要换成新目录的，每条一个换源计划
     pub(super) plans: Vec<LogMountPlan<'a>>,
-    /// 判不出在不在日志根里的 bind 的源：照归档原样重放，登记到替代容器建出来
-    pub(super) unclassified: Vec<PathBuf>,
+    /// 照归档原样重放、但源要登记到替代容器建出来的：判不出在不在日志根里的，和落在日志根
+    /// 里的持久数据
+    pub(super) replayed: Vec<PathBuf>,
 }
 
-/// 找出归档里所有落在可回收日志根下面的 bind，每条对应一个换源计划；判不出在不在的另记
-/// 它们的源。
+/// 定下归档里每条 bind 怎么处置：哪些换成新目录，哪些原样重放但要登记。
 ///
 /// 源在日志根下、却没有挂载见证（或者见证和 bind 对不上）的 bind 改不了它，原样重放又可能
 /// 绑到旧目录，遇到就拒绝。
@@ -105,10 +90,7 @@ pub(super) async fn plan<'a>(
     archive: &Archive,
     admission: &LogDomainAdmission<'_>,
 ) -> Result<LogBinds<'a>> {
-    let mut binds = LogBinds {
-        plans: Vec::new(),
-        unclassified: Vec::new(),
-    };
+    let mut binds = LogBinds::default();
     for volume in template
         .volumes
         .iter()
@@ -117,7 +99,30 @@ pub(super) async fn plan<'a>(
         let verdict = admission
             .classify(&format!("Mount {}", volume.name), &volume.uid)
             .await;
-        if verdict != LogDomainVerdict::Inside {
+        if shared_types::is_builder_persistent_data_mount(&volume.name) {
+            // 持久数据永不换源：重启前后必须是同一个目录。落在日志根里是配置错误：builder 停够
+            // 保留期之后，清理器会回收它。记 error，恢复照常——拒绝恢复救不了这份数据
+            if verdict != LogDomainVerdict::Outside {
+                if verdict == LogDomainVerdict::Inside {
+                    tracing::error!(
+                        mount = %volume.name,
+                        source = %volume.uid,
+                        "A persistent data directory of the builder lies under the reclaimable log root; the log cleaner will reclaim it once the builder has been stopped for longer than the retention. Move the data directory or cleanup_config.log_cleanup.log_dir"
+                    );
+                }
+                binds.replayed.push(PathBuf::from(&volume.uid));
+            }
+            continue;
+        }
+        let swap = match verdict {
+            LogDomainVerdict::Inside => true,
+            LogDomainVerdict::Outside => false,
+            // 判不出来、但归档能核实它是日志挂载的也换：旧目录是一次性的，可能早已过期
+            LogDomainVerdict::Unknown(_) => {
+                admission.space().is_some() && is_log_mount(&volume.name, archive)
+            }
+        };
+        if !swap {
             continue;
         }
         // 按见证（源加挂载点）整段前缀去找那条 bind，不按冒号切分：源路径里有 Windows 盘符时
@@ -161,6 +166,10 @@ pub(super) async fn plan<'a>(
         let Some(source) = bind_source(bind) else {
             continue;
         };
+        // 有见证的卷上面已经处置过（持久数据落进 replayed），不重复登记
+        if binds.replayed.iter().any(|replayed| replayed == source) {
+            continue;
+        }
         match admission.classify(bind, source).await {
             LogDomainVerdict::Inside => {
                 return Err(conflict(format!(
@@ -168,10 +177,16 @@ pub(super) async fn plan<'a>(
                 )));
             }
             LogDomainVerdict::Outside => {}
-            LogDomainVerdict::Unknown(_) => binds.unclassified.push(PathBuf::from(source)),
+            LogDomainVerdict::Unknown(_) => binds.replayed.push(PathBuf::from(source)),
         }
     }
     Ok(binds)
+}
+
+/// 归档能不能核实这条挂载是日志挂载：挂载点就是 `CONTAINER_LOGS_DIR`，或者带 `container-logs`。
+/// 创建容器时就是按后一条给挂载写 `CONTAINER_LOGS_DIR` 的，见 `agent_container_starter::mounts`
+pub(super) fn is_log_mount(target: &str, archive: &Archive) -> bool {
+    archive.log_target() == Some(target) || target.contains("container-logs")
 }
 
 /// 这次恢复给替代容器新建的日志目录
@@ -188,17 +203,19 @@ impl FreshLogDirectories {
     /// 逐条独占新建。任何一条建不出来都报错，并把已经建好的删掉——替代容器还没开始建，这些
     /// 目录没人用。不退回去绑定归档里的旧目录。
     ///
-    /// 判不出在不在日志根里的 bind 照原样重放，它们的源（`binds.unclassified`）一并登记。
+    /// 原样重放的那些 bind 的源（`binds.replayed`）一并登记。`reclaim_root` 是可回收的日志根
+    /// （RCoder 进程里的路径）：新目录建在它下面更深处时，要刷新上一级候选的修改时间。
     pub(super) async fn create(
         space: Option<&HostPathSpace<'_>>,
         binds: &LogBinds<'_>,
+        reclaim_root: &Path,
     ) -> Result<Self> {
         let mut fresh = Self {
             sources: HashMap::new(),
             created: Vec::new(),
             pending: PendingBinds::default(),
         };
-        for source in &binds.unclassified {
+        for source in &binds.replayed {
             fresh.pending.claim(source);
         }
         for plan in &binds.plans {
@@ -219,6 +236,7 @@ impl FreshLogDirectories {
                     )));
                 }
             };
+            crate::log_directory::refresh_candidate_ancestor(&created, reclaim_root).await;
             // 名字可能换过：被占用的名字不复用
             let name = created
                 .file_name()
@@ -311,81 +329,11 @@ impl FreshLogDirectories {
 
 impl Archive {
     /// 容器的日志挂载点：`apply_auto_mounts` 给容器内路径带 `container-logs` 的那条挂载写的
-    fn log_target(&self) -> Option<&str> {
+    pub(super) fn log_target(&self) -> Option<&str> {
         self.env
             .iter()
             .find_map(|entry| entry.strip_prefix(&format!("{CONTAINER_LOGS_DIR_ENV}=")))
     }
-}
-
-/// 续做时替代容器 label 里记的日志目录（挂载点 → 新目录）。
-///
-/// 定得出换源计划时（`plans`）：label 的键必须和计划一模一样——每条日志挂载都要有，也不能多。
-/// 多出来的键会改写计划之外的挂载（比如工作区）的期望值，那正是这份核验要拦的。
-///
-/// 定不出计划时（`blind`，取不到路径空间）：没有计划可比，只要求 label 的每一项都是归档里
-/// 某条 HostPath 挂载的新目录。不让恢复因为取不到路径空间而失败。
-///
-/// 两种情况下新目录都得是旧目录的同级新目录：绝对路径、同一个上级、不是旧目录本身。
-pub(super) fn resumed_sources(
-    label: &str,
-    template: &BuilderRestartTemplate,
-    plans: &[LogMountPlan<'_>],
-    blind: bool,
-) -> Result<HashMap<String, String>> {
-    let sources: HashMap<String, String> = serde_json::from_str(label).map_err(|error| {
-        conflict(format!(
-            "Restart target carries an unreadable log directory label: {error}"
-        ))
-    })?;
-    if blind {
-        for (name, source) in &sources {
-            let volume = template
-                .volumes
-                .iter()
-                .find(|volume| volume.kind == AppResourceKind::HostPath && volume.name == *name)
-                .ok_or_else(|| {
-                    conflict(format!(
-                        "Restart target's log directory label names mount {name}, which is not a bind of the archived builder"
-                    ))
-                })?;
-            ensure_fresh_sibling(volume, source)?;
-        }
-        return Ok(sources);
-    }
-    let unexpected = sources.keys().find(|key| {
-        !plans
-            .iter()
-            .any(|plan| plan.volume().name.as_str() == key.as_str())
-    });
-    if let Some(unexpected) = unexpected {
-        return Err(conflict(format!(
-            "Restart target's log directory label names mount {unexpected}, which the restart does not replace"
-        )));
-    }
-    for plan in plans {
-        let source = sources.get(&plan.volume().name).ok_or_else(|| {
-            conflict(format!(
-                "Restart target records no log directory for mount {}",
-                plan.volume().name
-            ))
-        })?;
-        ensure_fresh_sibling(plan.volume(), source)?;
-    }
-    Ok(sources)
-}
-
-/// `source` 得是 `volume`原来绑定的目录的同级新目录
-fn ensure_fresh_sibling(volume: &AppResourceIdentity, source: &str) -> Result<()> {
-    let previous = Path::new(&volume.uid);
-    let path = Path::new(source);
-    if !path.is_absolute() || path.parent() != previous.parent() || source == volume.uid {
-        return Err(conflict(format!(
-            "Restart target records an unexpected log directory for mount {}",
-            volume.name
-        )));
-    }
-    Ok(())
 }
 
 /// 模板里的卷，其中 `sources` 里有的挂载点换成对应的新目录
