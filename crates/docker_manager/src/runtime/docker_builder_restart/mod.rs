@@ -954,12 +954,11 @@ fn restore_body(
     if let Some(log_label) = &records.log_directories {
         labels.insert(RESTART_LOG_DIR.into(), log_label.to_owned());
     }
-    if !records.log_mounts.is_empty() {
-        labels.insert(
-            LOG_MOUNTS_LABEL.into(),
-            encode_log_mounts(&records.log_mounts),
-        );
-    }
+    // 空记录也写：替代容器是这个版本建的，之后重启它不再退回去看环境变量
+    labels.insert(
+        LOG_MOUNTS_LABEL.into(),
+        encode_log_mounts(&records.log_mounts),
+    );
     let (networking_config, network_mode) = if archive.network_mode == "host" {
         (None, "host".to_string())
     } else {

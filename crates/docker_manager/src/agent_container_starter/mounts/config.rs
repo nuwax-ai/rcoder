@@ -241,9 +241,9 @@ pub(super) async fn add_config_mounts(
             read_only: mount_config.read_only,
         });
     }
-    if !created_log_mounts.is_empty() {
-        builder = builder.label(LOG_MOUNTS_LABEL, encode_log_mounts(&created_log_mounts));
-    }
+    // 一条日志挂载都没有的也写（空记录）：把"这个容器没有 RCoder 独占新建的日志挂载"和"升级之前
+    // 建的容器、没有这份记录"区分开，后者重启时才退回去看环境变量
+    builder = builder.label(LOG_MOUNTS_LABEL, encode_log_mounts(&created_log_mounts));
 
     Ok(builder)
 }

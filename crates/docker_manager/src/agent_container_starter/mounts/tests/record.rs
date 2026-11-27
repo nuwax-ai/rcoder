@@ -56,7 +56,9 @@ async fn every_directory_rcoder_created_is_recorded_with_the_mount_it_serves() {
     }
 }
 
-/// 日志根之外的挂载不是 RCoder 新建的日志目录：不进记录，一条都没有时连 label 都不写
+/// 日志根之外的挂载不是 RCoder 新建的日志目录：不进记录。一条都没有时写一份**空记录**——把
+/// "这个容器没有 RCoder 独占新建的日志挂载"和"升级之前建的容器、没有这份记录"区分开，后者重启
+/// 时才退回去看环境变量
 #[tokio::test]
 async fn a_mount_outside_the_log_root_is_not_recorded() {
     let layout = Layout::new();
@@ -75,12 +77,13 @@ async fn a_mount_outside_the_log_root_is_not_recorded() {
     .unwrap();
 
     assert!(recorded(&config).is_empty());
-    assert!(
+    assert_eq!(
         config
             .labels
             .as_ref()
-            .is_none_or(|labels| !labels.contains_key(LOG_MOUNTS_LABEL)),
-        "no log mount, no label: {:?}",
-        config.labels
+            .and_then(|labels| labels.get(LOG_MOUNTS_LABEL))
+            .map(String::as_str),
+        Some("[]"),
+        "no log mount still leaves an explicit empty record"
     );
 }

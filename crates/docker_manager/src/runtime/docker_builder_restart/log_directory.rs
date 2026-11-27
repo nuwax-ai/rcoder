@@ -9,10 +9,11 @@
 //! 先看**角色**——这条挂载是不是 RCoder 为这个容器独占新建的日志目录，再看路径：
 //!
 //! - **角色**（[`is_log_mount`]）：归档带着原容器的日志挂载记录（容器 label
-//!   `rcoder.io/log-mounts`，创建容器时写的，每条是挂载点和 RCoder 新建的那个目录），挂载点和源
-//!   都对得上的才算。升级之前建的容器没有这份记录，只认创建时写进环境变量的那两个值：挂载点
-//!   就是 `CONTAINER_LOGS_DIR`，或者源的文件名就是 `CONTAINER_LOG_NAME`。挂载点落在 `/home/user`
-//!   整棵里的不是（持久数据）。
+//!   `rcoder.io/log-mounts`，创建容器时写的，每条是挂载点和 RCoder 新建的那个目录；一条日志
+//!   挂载都没有的容器记的是空记录），挂载点和源都对得上的才算。只有升级之前建的容器才没有这份
+//!   记录，那时只认创建时写进环境变量的那两个值：挂载点就是 `CONTAINER_LOGS_DIR`，**并且**源的
+//!   文件名就是 `CONTAINER_LOG_NAME`——两个值一起对上同一条 bind。挂载点落在 `/home/user` 整棵
+//!   里的不是（持久数据）。
 //! - **路径**：源在可回收日志根下面（`host_path_space::LogDomain`，用的是清理器那个路径
 //!   空间），或者判不出来。
 //!
@@ -221,10 +222,11 @@ pub(super) async fn plan<'a>(
 ///
 /// 只认创建时的记录，见模块说明：
 ///
-/// - 归档带着日志挂载记录：挂载点和源都对得上才算。源和记录不一样，说明记录之外有人动过这条
-///   bind，不算；
-/// - 归档没有记录（升级之前建的容器）：只认创建时写进环境变量的那两个值——`CONTAINER_LOGS_DIR`
-///   就是这个挂载点，或者 `CONTAINER_LOG_NAME` 就是这个源目录的名字。
+/// - 归档带着日志挂载记录（空记录也算带着）：挂载点和源都对得上才算。源和记录不一样，说明记录
+///   之外有人动过这条 bind，不算；
+/// - 归档没有记录（升级之前建的容器）：创建时写进环境变量的那两个值要**一起**对上这一条 bind
+///   ——`CONTAINER_LOGS_DIR` 就是这个挂载点，并且 `CONTAINER_LOG_NAME` 就是这个源目录的名字。
+///   两个值说的是同一个日志目录，谁都不能单独作证：别的父目录下的数据目录可以和日志目录同名。
 ///
 /// 目录名的格式、挂载点的拼写都不是证据：带数据的目录也可以叫 `<什么>-<时间戳>`
 pub(super) fn is_log_mount(target: &str, source: &str, archive: &Archive) -> bool {
@@ -235,7 +237,7 @@ pub(super) fn is_log_mount(target: &str, source: &str, archive: &Archive) -> boo
         Some(record) => record
             .iter()
             .any(|mount| mount.target == target && mount.source == source),
-        None => archive.log_target() == Some(target) || archive.names_log_directory(source),
+        None => archive.log_target() == Some(target) && archive.names_log_directory(source),
     }
 }
 
@@ -244,12 +246,12 @@ fn file_name(path: &str) -> Option<&str> {
 }
 
 /// 归档里没有挂载见证的 bind（归档里有、模板的卷里没有）没有挂载点可用，只能按源认：记录里
-/// 就有这个源目录的，是日志挂载
+/// 就有这个源目录的，是日志挂载。旧归档没有记录，这里又没有挂载点去和 `CONTAINER_LOGS_DIR`
+/// 对——单凭源的文件名不够，证据不足
 fn is_recorded_log_source(source: &str, archive: &Archive) -> bool {
-    match archive.log_mounts() {
-        Some(record) => record.iter().any(|mount| mount.source == source),
-        None => archive.names_log_directory(source),
-    }
+    archive
+        .log_mounts()
+        .is_some_and(|record| record.iter().any(|mount| mount.source == source))
 }
 
 /// 替代容器的日志挂载记录：归档记录里没换过源的照抄，换过源的记新目录——它们是 RCoder 这一次

@@ -7,8 +7,11 @@
 //! RCoder 新建的那个目录）。
 //!
 //! builder 重启出替代容器时，只给记录里的挂载换新目录；替代容器带上自己的记录，换过源的记新
-//! 目录。归档把这个 label 一起存下来。升级之前建的容器没有这份记录，见
-//! `runtime::docker_builder_restart::log_directory`。
+//! 目录。归档把这个 label 一起存下来。
+//!
+//! 一条日志挂载都没有的容器也写这个 label，值是空记录 `[]`：把"这个版本建的、没有 RCoder 独占
+//! 新建的日志挂载"和"升级之前建的、没有这份记录"区分开。只有后者重启时才退回去看创建时写的
+//! 那两个环境变量，见 `runtime::docker_builder_restart::log_directory`。
 
 use serde::{Deserialize, Serialize};
 
