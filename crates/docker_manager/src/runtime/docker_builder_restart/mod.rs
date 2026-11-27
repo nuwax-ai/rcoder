@@ -260,9 +260,24 @@ async fn read_archive(path: PathBuf) -> Result<Option<Vec<u8>>> {
     .map_err(|error| fail(format!("Archive reader worker: {error}")))?
 }
 
-/// Check the daemon's bind source through the same mount view used to plan
-/// the restart. Retained binds must exist: legacy Docker Binds can otherwise
-/// create an empty directory in place of missing app data.
+/// 核对原样重放的 bind 源还在不在。要换新目录的（`binds.plans`）不查：旧目录可能早被清理器
+/// 回收了。
+///
+/// 先经这次恢复的挂载视图看——定换源计划用的是同一个视图，宿主机路径和 RCoder 容器内路径不
+/// 一样的部署（Compose）也只有它看得见。
+///
+/// - 在，是目录：放行；
+/// - 视图看得到它的位置，那里没有它（或者不是目录）：报缺失。不拿别的路径顶替——视图里的路径
+///   换算回宿主机就是这条源，别处同名的目录是另一份数据；
+/// - 整条路径在 RCoder 的挂载之外，或者没有路径空间：只有这个核验更早的那两处可看
+///   （[`legacy_bind_source_exists`]）——宿主机路径在本进程直接看得见（宿主机上跑的 rcoder），
+///   或者经 `userapp-workspace` 这一级接到 RCoder 自己的工作区根。看不见就是缺失；
+/// - 视图判不出它的真实位置（路径里有一级指到挂载之外的符号链接、被另一条挂载遮蔽）：
+///   **不拒绝**，同样退回上面两处。路径里带这种链接的部署，这个核验更早的时候恢复得了，现在
+///   也必须恢复得了；两处也看不见才报确认不了，不报缺失。
+///
+/// 拒绝的理由只有一个：legacy 形式的 Binds 源目录不在时 Docker 会补一个空目录，builder 带着
+/// 空的工作区起来，用户看到的是数据没了。
 async fn verify_replayed_bind_sources(
     template: &BuilderRestartTemplate,
     binds: &LogBinds<'_>,
@@ -274,27 +289,42 @@ async fn verify_replayed_bind_sources(
             continue;
         }
         let source = std::path::Path::new(&volume.uid);
-        let exists = match &mut locations {
+        let seen = match &mut locations {
+            None => legacy_bind_source_exists(source).await,
             Some(locations) => match locations.locate(source).await {
-                Ok(Location::Present { directory, .. }) => directory,
-                Ok(Location::Absent { .. }) => false,
+                Ok(Location::Present {
+                    directory: true, ..
+                }) => true,
+                Ok(
+                    Location::Present {
+                        directory: false, ..
+                    }
+                    | Location::Absent { .. },
+                ) => false,
                 Ok(Location::Outside) => legacy_bind_source_exists(source).await,
                 Ok(Location::Unconfirmed(reason)) => {
-                    return Err(conflict(format!(
-                        "Cannot confirm restart bind source {}: {reason}",
-                        source.display()
-                    )));
+                    if legacy_bind_source_exists(source).await {
+                        true
+                    } else {
+                        return Err(conflict(format!(
+                            "Cannot confirm restart bind source {}: {reason}",
+                            source.display()
+                        )));
+                    }
                 }
                 Err(error) => {
-                    return Err(fail(format!(
-                        "Inspect restart bind source {}: {error}",
-                        source.display()
-                    )));
+                    if legacy_bind_source_exists(source).await {
+                        true
+                    } else {
+                        return Err(fail(format!(
+                            "Inspect restart bind source {}: {error}",
+                            source.display()
+                        )));
+                    }
                 }
             },
-            None => legacy_bind_source_exists(source).await,
         };
-        if !exists {
+        if !seen {
             return Err(conflict(format!(
                 "Restart bind source is missing: {}",
                 source.display()
@@ -304,27 +334,36 @@ async fn verify_replayed_bind_sources(
     Ok(())
 }
 
-/// Older layouts can expose a bind directly or through the workspace anchor
-/// when the runtime cannot project that source from its mount table.
+/// 挂载视图说不上来时退回的两处，都是这个核验更早的样子：宿主机路径在本进程直接看得见（宿主
+/// 机上跑的 rcoder），或者经 `userapp-workspace` 这一级接到 RCoder 自己的工作区根
 async fn legacy_bind_source_exists(source: &std::path::Path) -> bool {
-    if tokio::fs::metadata(source).await.is_ok_and(|m| m.is_dir()) {
+    if tokio::fs::metadata(source)
+        .await
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
         return true;
     }
-    let components: Vec<_> = source
-        .components()
-        .map(|component| component.as_os_str())
-        .collect();
-    let Some(anchor) = components
-        .iter()
-        .position(|component| *component == "userapp-workspace")
-    else {
+    let Some(visible) = beneath_workspace_root(source) else {
         return false;
     };
+    tokio::fs::metadata(visible)
+        .await
+        .is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// 宿主机路径里 `userapp-workspace` 这一级之后的部分，原样接到 RCoder 的工作区根下面；没有这
+/// 一级就是 `None`。不止一级时认第一级
+fn beneath_workspace_root(source: &std::path::Path) -> Option<PathBuf> {
     let mut visible = PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
-    for component in &components[anchor + 1..] {
-        visible.push(component);
+    let mut anchored = false;
+    for component in source.components() {
+        if anchored {
+            visible.push(component.as_os_str());
+        } else if component.as_os_str() == "userapp-workspace" {
+            anchored = true;
+        }
     }
-    tokio::fs::metadata(visible).await.is_ok_and(|m| m.is_dir())
+    anchored.then_some(visible)
 }
 
 fn inspect_absent(
@@ -661,15 +700,18 @@ impl DockerRuntime {
         Ok(restored)
     }
 
-    /// 用归档重放出替代 builder：先定下要换哪些日志目录，必要时移除仍被保留的旧容器，
-    /// 核对其它 bind 源，再创建。
+    /// 用归档重放出替代 builder：先定下要换哪些日志目录、原样重放的 bind 源登记上，再移除仍被
+    /// 保留的旧容器，最后创建。原样重放的 bind 源在动旧容器之前核对一次，创建替代容器之前再
+    /// 核对一次：旧容器还在时核对不过，它原样留着。
     ///
     /// 落在可回收日志根下面的 bind 不照原样重放，换成同级的新目录：旧目录可能已经过期，
     /// 日志清理器正在回收它。新目录登记为正在准备挂载，清理器碰不到它，这一段不需要和
     /// 清理器互斥。
     ///
     /// 判不出在不在日志根里的 bind 照原样重放，源登记到替代容器建出来：清理器对它同样判不
-    /// 出来，登记着就不会删。日志根定位不完整、取不到路径空间都不让恢复失败，只告警。
+    /// 出来，登记着就不会删。日志根定位不完整、取不到路径空间都不让恢复失败，只告警。核对
+    /// 原样重放的 bind 源时挂载视图判不出来，同样不让恢复失败
+    /// （[`verify_replayed_bind_sources`]）。
     async fn replace_builder_container(
         &self,
         template: &BuilderRestartTemplate,

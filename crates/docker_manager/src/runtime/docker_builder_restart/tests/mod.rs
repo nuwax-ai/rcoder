@@ -315,6 +315,60 @@ async fn a_missing_bind_source_conflicts_before_anything_is_created() {
     daemon.assert_followed(2);
 }
 
+/// 工作区锚点：认宿主机路径里第一级 `userapp-workspace`，它之后的部分原样接到 RCoder 的工作
+/// 区根下面；没有这一级就不接
+#[test]
+fn the_workspace_anchor_maps_what_follows_the_first_userapp_workspace_component() {
+    let root = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+    let anchor = |source: &str| beneath_workspace_root(std::path::Path::new(source));
+    assert_eq!(
+        anchor("/srv/nuwax/userapp-workspace/app-1/workspace"),
+        Some(root.join("app-1/workspace"))
+    );
+    assert_eq!(
+        anchor("/srv/userapp-workspace/other/userapp-workspace/x"),
+        Some(root.join("other/userapp-workspace/x"))
+    );
+    assert_eq!(anchor("/srv/nuwax/data/app-1"), None);
+}
+
+/// 源目录不在了，旧容器还留着（已停止）：核验要在移除它**之前**。移除之后才发现，旧容器连同
+/// 它的配置一起没了，现场只剩一个报错
+#[tokio::test]
+#[allow(unsafe_code)] // 测试内设置进程环境变量；nextest 每个用例独立进程
+async fn a_missing_bind_source_keeps_the_stopped_original() {
+    let receipts = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("RCODER_OPERATION_RECEIPT_ROOT", receipts.path());
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let gone = workspace.path().join("workspace");
+    let template = restart_template(&gone);
+    let archive = restart_archive(&template);
+    super::super::docker_compute_receipt::save_stop(&template.source)
+        .await
+        .unwrap();
+    let daemon = scripted(vec![step(
+        "GET",
+        ORIGINAL_UID,
+        200,
+        retained_original(&template),
+    )])
+    .await;
+    let runtime = runtime(daemon.address);
+
+    let result = runtime
+        .replace_builder_container(&template, &archive, original(&template))
+        .await;
+
+    assert!(
+        matches!(&result, Err(Error::Conflict(message)) if message.contains("Restart bind source is missing")),
+        "{result:?}"
+    );
+    // 只查了原容器：没有移除它，也没有往下走
+    daemon.assert_followed(1);
+}
+
 /// 归档把原容器 label 上的日志挂载记录带下来。没有这个 label（升级之前建的容器）、或者它读不出来，
 /// 都按没有处理：换源只认记录，没有记录一条都不换
 #[test]

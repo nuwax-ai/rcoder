@@ -2,7 +2,7 @@
 //!
 //! 这里放夹具和换目录的用例。哪些挂载换、换源记录怎么核（`roles`），数据挂载（`data_mounts`），
 //! 升级之前建的容器的归档（`legacy`），归档怎么带下日志挂载记录（`record`），登记与创建结果
-//! （`claims`），重启协议（`replacement`）各有自己的文件。
+//! （`claims`），重启协议（`replacement`），原样重放的 bind 源核验（`sources`）各有自己的文件。
 
 use super::*;
 
@@ -12,6 +12,7 @@ mod legacy;
 mod record;
 mod replacement;
 mod roles;
+mod sources;
 
 // ─── 带日志挂载的重启 ───────────────────────────────────────────────────────
 
@@ -116,8 +117,8 @@ impl LoggedRestart {
         self.root.path().join("host/container")
     }
 
-    /// The fixture has separate host and process trees in place of a real bind
-    /// mount. Make an existing host directory visible in the process tree.
+    /// 夹具用两棵真实的目录树代替真正的 bind mount：`host` 是 daemon 看到的，`visible/logs`
+    /// 是同一个位置在 RCoder 进程里的样子。让一个已存在的宿主机目录在进程那一侧也"看得见"
     fn expose_bind_source(&self, host: &str) {
         let host = std::path::Path::new(host);
         assert!(host.is_dir());
