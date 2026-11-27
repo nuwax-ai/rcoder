@@ -142,10 +142,13 @@ impl WorkspaceSyncMode {
     }
 }
 
-/// 迁移 Job 默认排除规则（可重建数据不迁——与 k8s/migration 脚本同词表）。
-/// node_modules/.cache/dist 重建即可; core.* 是 agent_runner core dump。
-pub const WORKSPACE_MIGRATION_EXCLUDES: &[&str] =
-    &["node_modules/", ".cache/", "dist/", "core.[0-9]*"];
+/// 迁移 Job 的 rclone 过滤规则（有序，rclone 先匹配先生效）——与 k8s/migration 脚本同词表。
+///
+/// 只排除纯缓存：`.cache/`（任何层级）与 npm 的 `_npx/`。其余一律迁，包括 node_modules 与
+/// dist：它们不是无引用的"可重建数据"——工具链自己就靠它们（pnpm 只凭
+/// `.tools/pnpm/<版本>/bin` 目录存在就当已安装，node_modules 没迁过来就报
+/// `spawnSync …/bin/pnpm ENOENT`），项目也要靠它们才能直接跑起来。
+pub const WORKSPACE_MIGRATION_FILTERS: &[&str] = &["- .cache/", "- .npm/_npx/"];
 
 /// 迁移同步 Job 的 label（运维识别/清理用）。
 pub const WORKSPACE_MIGRATION_JOB_LABEL: &str = "rcoder.io/workspace-migration";

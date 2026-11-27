@@ -106,7 +106,9 @@ pub(crate) struct MigrationJobPlan {
     /// src 卷内该用户子目录（sync 的 source path 段）。
     pub src_subpath: String,
     pub bwlimit: Option<String>,
-    pub excludes: Vec<String>,
+    /// rclone 过滤规则：每条带 `+` / `-` 号，顺序即优先级（见
+    /// [`shared_types::WORKSPACE_MIGRATION_FILTERS`]）。
+    pub filters: Vec<String>,
     pub mode: WorkspaceSyncMode,
 }
 
@@ -132,10 +134,10 @@ impl MigrationJobPlan {
                 shared_types::shell::single_quote(limit)
             ));
         }
-        for exclude in &self.excludes {
+        for filter in &self.filters {
             args.push_str(&format!(
-                " --exclude {}",
-                shared_types::shell::single_quote(exclude)
+                " --filter {}",
+                shared_types::shell::single_quote(filter)
             ));
         }
         args.push_str(" --stats-one-line --stats 300s");
@@ -523,7 +525,7 @@ impl KubernetesRuntime {
                 WorkspaceSyncMode::Full => Some("150M".to_string()),
                 WorkspaceSyncMode::Incremental => None,
             },
-            excludes: shared_types::WORKSPACE_MIGRATION_EXCLUDES
+            filters: shared_types::WORKSPACE_MIGRATION_FILTERS
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -668,7 +670,7 @@ mod tests {
                 WorkspaceSyncMode::Full => Some("150M".to_string()),
                 WorkspaceSyncMode::Incremental => None,
             },
-            excludes: shared_types::WORKSPACE_MIGRATION_EXCLUDES
+            filters: shared_types::WORKSPACE_MIGRATION_FILTERS
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -677,19 +679,20 @@ mod tests {
     }
 
     #[test]
-    fn full_mode_args_carry_bwlimit_and_excludes() {
+    fn full_mode_args_carry_bwlimit_and_filters() {
         let args = plan(WorkspaceSyncMode::Full).rclone_args();
-        assert!(args.starts_with("sync '/src/u_1' /dst --links --metadata --create-empty-src-dirs"));
+        assert!(
+            args.starts_with("sync '/src/u_1' /dst --links --metadata --create-empty-src-dirs")
+        );
         assert!(args.contains("--bwlimit '150M'"));
-        assert!(args.contains("--exclude 'node_modules/'"));
-        assert!(args.contains("--exclude 'core.[0-9]*'"));
+        assert!(args.contains("--filter '- .cache/' --filter '- .npm/_npx/'"));
     }
 
     #[test]
     fn incremental_mode_omits_bwlimit() {
         let args = plan(WorkspaceSyncMode::Incremental).rclone_args();
         assert!(!args.contains("--bwlimit"));
-        assert!(args.contains("--exclude 'dist/'"));
+        assert!(args.contains("--filter '- .cache/' --filter '- .npm/_npx/'"));
     }
 
     #[test]
@@ -699,12 +702,12 @@ mod tests {
         let mut p = plan(WorkspaceSyncMode::Full);
         p.src_subpath = "u 1;rm -rf /".to_string();
         p.bwlimit = Some("150M".to_string());
-        p.excludes = vec!["a b".to_string(), "it's".to_string()];
+        p.filters = vec!["a b".to_string(), "it's".to_string()];
         let args = p.rclone_args();
         assert!(args.starts_with("sync '/src/u 1;rm -rf /' /dst"), "{args}");
-        assert!(args.contains("--exclude 'a b'"), "{args}");
+        assert!(args.contains("--filter 'a b'"), "{args}");
         // 内嵌单引号必须闭合-转义-重开，不能直接把引号断掉
-        assert!(args.contains("--exclude 'it'\\''s'"), "{args}");
+        assert!(args.contains("--filter 'it'\\''s'"), "{args}");
     }
 
     #[test]
@@ -789,35 +792,19 @@ mod tests {
         assert!(!download);
     }
 
-    /// 端到端：生成的脚本在**真实 bash** 下执行，rclone 收到的 argv 必须与
-    /// 逐参数的预期完全一致——数据里的空白 / 元字符 / 引号 / `$()` / glob
-    /// 既不得改变参数边界，也不得在 `exec` 之前被日志行提前解释。
-    /// 没有 bash 的环境跳过。
+    /// 在**真实 bash** 下执行生成的脚本，返回 rclone 实际收到的 argv 与脚本 stdout
+    /// （假 rclone 把每个参数打到 stdout）。没有 bash 的环境返回 `None`。
     #[cfg(unix)]
-    #[test]
-    fn job_script_delivers_each_argument_as_one_argv_element() {
-        let Ok(probe) = std::process::Command::new("bash")
+    fn argv_delivered_by_job_script(p: &MigrationJobPlan) -> Option<(Vec<String>, String)> {
+        let probe = std::process::Command::new("bash")
             .arg("--version")
             .stderr(std::process::Stdio::null())
             .output()
-        else {
-            eprintln!("skipping: bash not found");
-            return;
-        };
-        assert!(probe.status.success(), "bash --version 失败");
+            .ok()?;
+        if !probe.status.success() {
+            panic!("bash --version 失败");
+        }
 
-        let mut p = plan(WorkspaceSyncMode::Full);
-        p.src_subpath = "u 1;rm -rf /".to_string();
-        p.bwlimit = Some("1M".to_string());
-        p.excludes = vec![
-            "a b".to_string(),
-            "it's".to_string(),
-            "$(id)".to_string(),
-            "core.[0-9]*".to_string(),
-            "`id`".to_string(),
-        ];
-
-        // 假 rclone：把收到的 argv 逐行打到 stdout（`version` 子命令照常应答）
         let dir = std::env::temp_dir().join(format!("rcoder-migrate-argv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let stub = dir.join("rclone");
@@ -835,7 +822,7 @@ mod tests {
 
         let output = std::process::Command::new("bash")
             .arg("-c")
-            .arg(job_script(&p))
+            .arg(job_script(p))
             // PATH 只含我们的目录 + 系统默认：不继承测试进程可能被改过的 PATH
             .env(
                 "PATH",
@@ -850,12 +837,37 @@ mod tests {
             "脚本应以 rclone 的退出码结束；stderr 见上"
         );
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let argv: Vec<String> = stdout
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let argv = stdout
             .lines()
             .filter(|line| line.starts_with('<'))
             .map(|line| line.trim_matches(['<', '>']).to_string())
             .collect();
+        Some((argv, stdout))
+    }
+
+    /// 端到端：生成的脚本在**真实 bash** 下执行，rclone 收到的 argv 必须与
+    /// 逐参数的预期完全一致——数据里的空白 / 元字符 / 引号 / `$()` / glob
+    /// 既不得改变参数边界，也不得在 `exec` 之前被日志行提前解释。
+    /// 没有 bash 的环境跳过。
+    #[cfg(unix)]
+    #[test]
+    fn job_script_delivers_each_argument_as_one_argv_element() {
+        let mut p = plan(WorkspaceSyncMode::Full);
+        p.src_subpath = "u 1;rm -rf /".to_string();
+        p.bwlimit = Some("1M".to_string());
+        p.filters = vec![
+            "a b".to_string(),
+            "it's".to_string(),
+            "$(id)".to_string(),
+            "core.[0-9]*".to_string(),
+            "`id`".to_string(),
+        ];
+
+        let Some((argv, stdout)) = argv_delivered_by_job_script(&p) else {
+            eprintln!("skipping: bash not found");
+            return;
+        };
         assert_eq!(
             argv,
             vec![
@@ -871,15 +883,15 @@ mod tests {
                 "8",
                 "--bwlimit",
                 "1M",
-                "--exclude",
+                "--filter",
                 "a b",
-                "--exclude",
+                "--filter",
                 "it's",
-                "--exclude",
+                "--filter",
                 "$(id)",
-                "--exclude",
+                "--filter",
                 "core.[0-9]*",
-                "--exclude",
+                "--filter",
                 "`id`",
                 "--stats-one-line",
                 "--stats",
@@ -889,6 +901,35 @@ mod tests {
         );
         // 日志行照常打印了这条命令（不是静默执行）
         assert!(stdout.contains("[migrate] exec:"), "{stdout}");
+    }
+
+    /// 过滤规则的顺序就是优先级（rclone 先匹配先生效），每条规则是一个 argv 元素。
+    /// 这里逐条钉死词表的字面内容：只排除两类纯缓存，node_modules 之类一律迁
+    /// （按目录名排除它们曾把 pnpm 的版本切换目录迁坏）。k8s/migration 脚本的用例
+    /// 钉的是同一段文本。
+    #[cfg(unix)]
+    #[test]
+    fn job_script_passes_the_filter_vocabulary_in_order() {
+        let Some((argv, stdout)) = argv_delivered_by_job_script(&plan(WorkspaceSyncMode::Full))
+        else {
+            eprintln!("skipping: bash not found");
+            return;
+        };
+        let start = argv
+            .iter()
+            .position(|arg| arg == "--filter")
+            .unwrap_or_else(|| panic!("没有 --filter：{argv:?}"));
+        let end = start + 2 * shared_types::WORKSPACE_MIGRATION_FILTERS.len();
+        assert_eq!(
+            argv[start..end].chunks(2).collect::<Vec<_>>(),
+            [["--filter", "- .cache/"], ["--filter", "- .npm/_npx/"]],
+            "{stdout}"
+        );
+        assert_eq!(
+            argv[end..],
+            ["--stats-one-line", "--stats", "300s"],
+            "{stdout}"
+        );
     }
 
     /// Job 只跑 rclone，不访问 API server：不挂 ServiceAccount token（namespace 里
