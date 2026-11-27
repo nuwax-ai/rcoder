@@ -26,39 +26,39 @@
 //!
 //! 每个容器只登记自己用到的目录，互不影响：一次卡住的删除不会挡住别的容器启动。
 //!
-//! # 边界：登记要清理器读到才算
+//! # 删除之前的最后一次确认
 //!
 //! 登记是按路径的，清理器一轮只读一次。创建方在清理器读完登记**之后**才登记的，这一轮看不到；
-//! 它绑的如果是一个已经过期的旧目录（复用），清理器可能正好在删它。所以能换新目录的都换：
-//! 新建的目录年轻，不是候选；落在日志根里的日志挂载，判得出判不出（只要归档能核实是日志
-//! 挂载）都换。
+//! 它绑的如果是一个已经过期的旧目录（复用），清理器可能正好在删它。所以清理器删每个目录之前
+//! 还要回来确认一次：先给目录打上"正在删"的标记（[`mark_reclaim`]），再核对登记——标记之后
+//! 才登记的创建方一定看得到标记。核对和取清单用同一个判定，在
+//! `runtime::docker_runtime::log_dir_mounts`。
 //!
-//! 真会复用过期目录的只剩两类：落在日志根里的持久数据（配置错误，创建容器时就拒绝，这里只是
-//! 存量），和判不出来、又无法从归档核实角色的 bind。这个窗口是一轮回收的长度（预算 2 秒），
-//! 只在这两类布局里存在。登记不淘汰、按守卫计数，保证的是"读得到的登记不会丢"。
+//! 标记和登记在同一张表里（[`reclaim`]），谁先到谁说了算：
+//!
+//! - 创建方先登记：清理器放弃这次删除，留到下一轮；
+//! - 清理器先打标记：创建方等这次删除结束（[`PendingBinds::claim`]）。最多等 10 秒，超时报
+//!   错。这不是"判不出来就拒绝"：目录正在被删是确定的事，绑上去只会绑到一个正在消失的目录。
+//!
+//! 新建的日志目录不会等：清理器删的都是过期目录，新建的目录年轻，从来不是候选。会等的只有
+//! 复用旧目录的创建——落在日志根里的持久数据（配置错误，创建容器时就拒绝，这里只是存量）、
+//! 判不出来又换不了新目录的 bind。能换新目录的都换，所以这两类之外没有等待。
 
-use std::collections::{HashMap, HashSet};
+mod reclaim;
+
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use reclaim::DirectoryBeingReclaimed;
+
 /// 结果不明的登记保留多久。这是兜底，不是创建流程的正常寿命
 const UNRESOLVED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// 在途登记：宿主机路径 → 登记着它的守卫数。只在登记、注销、读取时短暂持有，里面不做任何 I/O
-static IN_FLIGHT: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-
-/// 在途登记的表。别的线程拿着锁时 panic 不影响表本身（里面只有路径和计数），照常使用
-fn in_flight() -> MutexGuard<'static, HashMap<PathBuf, usize>> {
-    IN_FLIGHT
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
 
 /// 结果不明的登记，带过期时间
 static UNRESOLVED: OnceLock<moka::sync::Cache<PathBuf, Instant>> = OnceLock::new();
@@ -80,6 +80,18 @@ fn unresolved() -> &'static moka::sync::Cache<PathBuf, Instant> {
     })
 }
 
+impl DirectoryBeingReclaimed {
+    /// 换算成运行时的错误。创建请求还没发出去，所以这是确定的失败，不是"结果不明"
+    ///
+    /// 不写 `From`：`ContainerRuntimeError` 一个 `From` 实现都没有，别处的 `?` 靠"只有一个候选
+    /// 实现"反推错误类型，多一个实现就让那处推断失败
+    pub(crate) fn into_container_creation_error(
+        self,
+    ) -> container_runtime_api::ContainerRuntimeError {
+        container_runtime_api::ContainerRuntimeError::ContainerCreationError(self.to_string())
+    }
+}
+
 /// 正在准备挂载的日志目录（宿主机路径）。
 ///
 /// 登记在 Docker 应答之前一直有效。调用方在发创建请求之前调 [`Self::request_sent`]，拿到确切
@@ -96,11 +108,25 @@ pub struct PendingBinds {
 
 impl PendingBinds {
     /// 登记一个宿主机路径，直到这次创建有了结果。同一条路径可以同时被几个守卫登记：各登
-    /// 各的，一个守卫退出不影响其余的
-    pub(crate) fn claim(&mut self, host_path: &Path) {
-        let path = crate::normalize_path(host_path);
-        *in_flight().entry(path.clone()).or_insert(0) += 1;
-        self.paths.push(path);
+    /// 各的，一个守卫退出不影响其余的。
+    ///
+    /// 这个路径正被清理器删除时，等这次删除结束；等不到就报错，见模块说明"删除之前的最后
+    /// 一次确认"。报错时登记已经生效，守卫 drop 时才注销
+    pub(crate) async fn claim(&mut self, host_path: &Path) -> Result<(), DirectoryBeingReclaimed> {
+        let path = reclaim::add_claim(host_path);
+        self.paths.push(path.clone());
+        reclaim::wait_until_released(&path).await
+    }
+
+    /// 只登记、不等待，返回登记用的键。
+    ///
+    /// 同步上下文用（假 daemon 的请求钩子）。它登记的路径必须没有被清理器标记：真在删的时候
+    /// 要用 [`Self::claim`]，那里会等到删除结束
+    #[cfg(test)]
+    pub(crate) fn claim_blocking(&mut self, host_path: &Path) -> PathBuf {
+        let path = reclaim::add_claim(host_path);
+        self.paths.push(path.clone());
+        path
     }
 
     /// 创建请求马上发出
@@ -151,28 +177,25 @@ impl Drop for PendingBinds {
         if self.request_sent {
             self.outcome_unknown();
         }
-        if !self.paths.is_empty() {
-            let mut in_flight = in_flight();
-            for path in &self.paths {
-                let Some(count) = in_flight.get_mut(path) else {
-                    continue;
-                };
-                if *count > 1 {
-                    *count -= 1;
-                } else {
-                    in_flight.remove(path);
-                }
-            }
+        for path in &self.paths {
+            reclaim::remove_claim(path);
         }
     }
+}
+
+/// 清理器删 `host_path`（宿主机路径）之前的许可：给它打上"正在删"的标记，之后登记它的创建方
+/// 会等这次删除结束。标记随返回值 drop 解除。
+///
+/// 它已经在删了就拒绝。有没有创建方先登记了它，由调用方拿到标记**之后**再核对
+pub(crate) fn mark_reclaim(host_path: &Path) -> Result<reclaim::ReclaimMark, String> {
+    reclaim::mark_reclaim(host_path)
 }
 
 /// 当前登记着的宿主机路径：在途的和结果不明的。同一条路径只列一次
 pub(crate) fn pending_bind_sources() -> Vec<PathBuf> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    in_flight()
-        .keys()
-        .cloned()
+    reclaim::claimed_sources()
+        .into_iter()
         .chain(
             unresolved()
                 .iter()

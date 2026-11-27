@@ -22,7 +22,11 @@
 //!
 //! 登记的不只是新建的日志目录：创建方判不出在不在日志根里的 bind 源也登记进来（靠的是同一个
 //! 路径空间，`runtime::docker_runtime::host_path_space`）。判不出来不拒绝创建容器——清理器对这条
-//! 源同样判不出来，登记着它就整轮不删。登记自身的边界见 [`pending`]。
+//! 源同样判不出来，登记着它就整轮不删。
+//!
+//! 清理器一轮只读一次登记，读不到它读完之后才登记的。所以删每个目录之前它还要回来确认一次
+//! （[`mark_reclaim`]）：有创建方登记着它或它下面的路径就留到下一轮；没有就打上"正在删"的
+//! 标记，这之后才登记它的创建方会等这次删除结束，最多 10 秒。见 [`pending`]。
 //!
 //! 新建目录落在日志根下面更深处时，要刷新上一级候选的修改时间，见
 //! [`refresh_candidate_ancestor`]。
@@ -37,15 +41,18 @@ use tracing::warn;
 /// 同名目录已存在时，名字最多试到 `<名字>-16`
 pub(crate) const NAME_ATTEMPTS: u32 = 16;
 
-pub use pending::PendingBinds;
-pub(crate) use pending::pending_bind_sources;
+pub use pending::{DirectoryBeingReclaimed, PendingBinds};
+pub(crate) use pending::{mark_reclaim, pending_bind_sources};
 
 /// 仅供其它 crate 的测试使用：登记一条正在准备挂载的宿主机路径，守卫 drop 时注销。需要启用
 /// `test-support` feature，生产构建里不存在。
 #[cfg(feature = "test-support")]
-pub fn claim_pending_bind_for_test(host_path: &Path) -> PendingBinds {
+pub async fn claim_pending_bind_for_test(host_path: &Path) -> PendingBinds {
     let mut binds = PendingBinds::default();
-    binds.claim(host_path);
+    binds
+        .claim(host_path)
+        .await
+        .expect("a test claim must not wait for a reclaim");
     binds
 }
 
@@ -67,6 +74,21 @@ pub(crate) fn replacement_log_directory_name(
 
 fn is_timestamp(text: &str) -> bool {
     text.len() == 14 && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// 这个名字是不是给某个容器一次性建的日志目录：`<容器名>-<UTC 时间>`，时间之后可能还跟着
+/// 一个重试序号（`-2` 到 `-16`，见 [`NAME_ATTEMPTS`]）。
+///
+/// 认的是**目录名**，不是路径：归档里没有挂载表，认不出这条 bind 是干什么用的，名字是唯一
+/// 还留着的证据。名字里带重试序号的也一样认——那说明首选名字被占过，是新建的目录
+pub(crate) fn is_log_directory_name(name: &str) -> bool {
+    match name.rsplit_once('-') {
+        Some((rest, last)) if (2..=16).contains(&last.parse::<u32>().unwrap_or(0)) => {
+            is_log_directory_name(rest)
+        }
+        Some((_, timestamp)) => is_timestamp(timestamp),
+        None => false,
+    }
 }
 
 /// 在 `parent` 下新建一个目录，名字优先用 `preferred`，返回新建目录的路径。
