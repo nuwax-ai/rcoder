@@ -142,17 +142,61 @@ impl Drop for ReclaimMark {
     }
 }
 
-/// 创建方要绑的目录正被清理器删除，等到了时限还没删完
+/// 创建方要绑的目录正被清理器删除，等到了时限还没删完；或者时限之内判不出来它和正在删的目录
+/// 不相干
 #[derive(Debug, Eq, PartialEq)]
-pub struct DirectoryBeingReclaimed(pub(crate) PathBuf);
+pub struct DirectoryBeingReclaimed {
+    /// 被删的目录（宿主机路径）。判不出来的时候是正在删的某一个
+    directory: PathBuf,
+    /// 不是确认了冲突，是探测没在时限内返回
+    unconfirmed: bool,
+}
+
+impl DirectoryBeingReclaimed {
+    /// `directory` 正被删，等过了时限还没删完
+    pub(crate) fn conflict(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            unconfirmed: false,
+        }
+    }
+
+    /// 时限之内没能确认正在删的 `directory` 和要绑的路径不相干
+    pub(crate) fn unconfirmed(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            unconfirmed: true,
+        }
+    }
+
+    /// 报错里点名的那个被删的目录（宿主机路径）
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// 是不是确认了"要绑的路径落在正在删的目录里"。`false` 是探测没在时限内返回
+    #[must_use]
+    pub fn is_conflict(&self) -> bool {
+        !self.unconfirmed
+    }
+}
 
 impl std::fmt::Display for DirectoryBeingReclaimed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the directory {} is still being reclaimed by the log cleaner; try again later",
-            self.0.display()
-        )
+        if self.unconfirmed {
+            write!(
+                f,
+                "cannot confirm within the wait limit that the directory a starting container binds is unrelated to the directory {} being reclaimed by the log cleaner; try again later",
+                self.directory.display()
+            )
+        } else {
+            write!(
+                f,
+                "the directory {} is still being reclaimed by the log cleaner; try again later",
+                self.directory.display()
+            )
+        }
     }
 }
 
